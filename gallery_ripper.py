@@ -105,14 +105,13 @@ class GalleryRipperApp(ThemedTk):
     def __init__(self):
         super().__init__(theme="equilux")
         self.title("Coppermine Gallery Ripper")
-        self.geometry("800x600")
-        self.minsize(550, 400)
+        self.geometry("900x700")
+        self.minsize(600, 450)
         self.resizable(True, True)
         self.albums = []
         self.selected_vars = []
         self.download_thread = None
 
-        # Set background colors everywhere for that true dark look
         dark_bg = "#292929"
         dark_fg = "#EEEEEE"
         accent_fg = "#CCCCCC"
@@ -128,12 +127,15 @@ class GalleryRipperApp(ThemedTk):
         style.configure("TLabelframe.Label", background=dark_bg, foreground=accent_fg)
         self['background'] = dark_bg
 
+        # Layout structure: use a parent frame for spacing and padding
+        content = ttk.Frame(self)
+        content.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
 
         # URL Entry
-        frm_url = ttk.Frame(self)
-        frm_url.grid(row=0, column=0, sticky="ew", pady=5, padx=10)
+        frm_url = ttk.Frame(content)
+        frm_url.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         frm_url.columnconfigure(1, weight=1)
         ttk.Label(frm_url, text="Gallery Root URL:").grid(row=0, column=0, sticky="w")
         self.url_entry = ttk.Entry(frm_url)
@@ -141,27 +143,29 @@ class GalleryRipperApp(ThemedTk):
         ttk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).grid(row=0, column=2, sticky="e")
 
         # Download Path
-        frm_path = ttk.Frame(self)
-        frm_path.grid(row=1, column=0, sticky="ew", pady=5, padx=10)
+        frm_path = ttk.Frame(content)
+        frm_path.grid(row=1, column=0, sticky="ew", pady=(0, 5))
         frm_path.columnconfigure(1, weight=1)
         ttk.Label(frm_path, text="Download Folder:").grid(row=0, column=0, sticky="w")
         self.path_var = tk.StringVar()
         ttk.Entry(frm_path, textvariable=self.path_var).grid(row=0, column=1, sticky="ew", padx=5)
         ttk.Button(frm_path, text="Browse...", command=self.select_folder).grid(row=0, column=2, sticky="e")
 
-        # Albums List (Scrollable)
-        self.chkfrm = ttk.LabelFrame(self, text="Select Albums to Download")
-        self.chkfrm.grid(row=2, column=0, sticky="nsew", padx=10, pady=(5,0))
+        # Albums List (Scrollable & fully resizable)
+        self.chkfrm = ttk.LabelFrame(content, text="Select Albums to Download")
+        self.chkfrm.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
+        content.rowconfigure(2, weight=4)
+        content.columnconfigure(0, weight=1)
         self.chkfrm.rowconfigure(0, weight=1)
         self.chkfrm.columnconfigure(0, weight=1)
+
+        # Canvas for scrolling
         self.canvas = tk.Canvas(self.chkfrm, borderwidth=0, highlightthickness=0, bg=dark_bg)
         self.scrollbar = ttk.Scrollbar(self.chkfrm, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = ttk.Frame(self.canvas)
         self.scrollable_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
-            )
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
@@ -171,19 +175,19 @@ class GalleryRipperApp(ThemedTk):
         self.chkfrm.columnconfigure(0, weight=1)
 
         # Select/Unselect All
-        frm_sel = ttk.Frame(self)
-        frm_sel.grid(row=3, column=0, sticky="ew", padx=10, pady=2)
+        frm_sel = ttk.Frame(content)
+        frm_sel.grid(row=3, column=0, sticky="ew", pady=(0, 5))
         ttk.Button(frm_sel, text="Select All", command=lambda: self.set_all_checks(True)).pack(side="left")
         ttk.Button(frm_sel, text="Unselect All", command=lambda: self.set_all_checks(False)).pack(side="left")
 
-        # Download Button
-        ttk.Button(self, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=5, column=0, pady=8)
+        # Download Button (sticks to bottom but above log)
+        ttk.Button(content, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=4, column=0, pady=5, sticky="ew")
 
-        # Info Log (dark bg/fg)
-        self.log_box = ScrolledText(self, height=7, state='disabled', font=("Consolas", 9),
+        # Info Log (fully resizable with window)
+        self.log_box = ScrolledText(content, height=7, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
-        self.log_box.grid(row=6, column=0, sticky="nsew", padx=10, pady=(2,10))
-        self.rowconfigure(6, weight=0)
+        self.log_box.grid(row=5, column=0, sticky="nsew")
+        content.rowconfigure(5, weight=2)
 
     def select_folder(self):
         folder = filedialog.askdirectory()
