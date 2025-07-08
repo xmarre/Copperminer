@@ -106,7 +106,8 @@ class GalleryRipperApp(ThemedTk):
         dark_themes = [th for th in self.get_themes() if "dark" in th or th in ("arc", "black", "equilux", "plastik", "radiance")]
         if not dark_themes:
             dark_themes = self.get_themes()
-        self.theme_var = tk.StringVar(value=self.get_theme())
+        # theme_use() gets the current theme in ttkthemes
+        self.theme_var = tk.StringVar(value=self.theme_use())
         frm_theme = tk.Frame(self)
         frm_theme.pack(fill="x", pady=5, padx=10)
         tk.Label(frm_theme, text="Theme:").pack(side="left")
