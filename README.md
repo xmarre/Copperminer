@@ -11,6 +11,7 @@ No thumbnails—just full images, organized by album.
 - Download progress and info log
 - Windows double-click support via `start_gallery_ripper.bat`
 - Compatible with Python 3.10+
+- Always-on Equilux dark theme
 
 ## Installation
 
