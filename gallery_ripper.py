@@ -4,7 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 from ttkthemes import ThemedTk
 
 BASE_URL = ""  # Will be set from GUI
@@ -107,50 +108,54 @@ class GalleryRipperApp(ThemedTk):
         if not dark_themes:
             dark_themes = self.get_themes()
         self.theme_var = tk.StringVar(value=self.current_theme)
-        frm_theme = tk.Frame(self)
+        frm_theme = ttk.Frame(self)
         frm_theme.pack(fill="x", pady=5, padx=10)
-        tk.Label(frm_theme, text="Theme:").pack(side="left")
+        ttk.Label(frm_theme, text="Theme:").pack(side="left")
         theme_menu = ttk.Combobox(frm_theme, textvariable=self.theme_var, values=dark_themes, state="readonly", width=20)
         theme_menu.pack(side="left", padx=5)
         theme_menu.bind("<<ComboboxSelected>>", lambda e: self.set_theme(self.theme_var.get()))
         self.title("Coppermine Gallery Ripper")
-        self.geometry("680x520")
+        self.geometry("700x570")
         self.resizable(False, False)
         self.albums = []
         self.selected_vars = []
         self.download_thread = None
 
         # URL Entry
-        frm_url = tk.Frame(self)
+        frm_url = ttk.Frame(self)
         frm_url.pack(fill="x", pady=5, padx=10)
-        tk.Label(frm_url, text="Gallery Root URL:").pack(side="left")
-        self.url_entry = tk.Entry(frm_url, width=60)
+        ttk.Label(frm_url, text="Gallery Root URL:").pack(side="left")
+        self.url_entry = ttk.Entry(frm_url, width=60)
         self.url_entry.pack(side="left", padx=5)
-        tk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).pack(side="left")
+        ttk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).pack(side="left")
 
         # Download Path
-        frm_path = tk.Frame(self)
+        frm_path = ttk.Frame(self)
         frm_path.pack(fill="x", pady=5, padx=10)
-        tk.Label(frm_path, text="Download Folder:").pack(side="left")
+        ttk.Label(frm_path, text="Download Folder:").pack(side="left")
         self.path_var = tk.StringVar()
-        tk.Entry(frm_path, textvariable=self.path_var, width=50).pack(side="left", padx=5)
-        tk.Button(frm_path, text="Browse...", command=self.select_folder).pack(side="left")
+        ttk.Entry(frm_path, textvariable=self.path_var, width=50).pack(side="left", padx=5)
+        ttk.Button(frm_path, text="Browse...", command=self.select_folder).pack(side="left")
 
-        # Albums List
-        self.chkfrm = tk.LabelFrame(self, text="Select Albums to Download")
+        # Albums List with dark background
+        self.chkfrm = ttk.LabelFrame(self, text="Select Albums to Download")
         self.chkfrm.pack(fill="both", expand=True, padx=10, pady=(5,0))
+        # Listbox for albums
+        style = ttk.Style()
+        style.configure("Dark.TFrame", background="#222", foreground="#eee")
+        self.chkfrm.configure(style="Dark.TFrame")
 
         # Select/Unselect All
-        frm_sel = tk.Frame(self)
+        frm_sel = ttk.Frame(self)
         frm_sel.pack(fill="x", padx=10, pady=2)
-        tk.Button(frm_sel, text="Select All", command=lambda: self.set_all_checks(True)).pack(side="left")
-        tk.Button(frm_sel, text="Unselect All", command=lambda: self.set_all_checks(False)).pack(side="left")
+        ttk.Button(frm_sel, text="Select All", command=lambda: self.set_all_checks(True)).pack(side="left")
+        ttk.Button(frm_sel, text="Unselect All", command=lambda: self.set_all_checks(False)).pack(side="left")
 
         # Download Button
-        tk.Button(self, text="Start Download", font=('Arial', 12, 'bold'), command=self.start_download).pack(pady=8)
+        ttk.Button(self, text="Start Download", command=self.start_download, style="Accent.TButton").pack(pady=8)
 
-        # Info Log
-        self.log_box = scrolledtext.ScrolledText(self, height=9, state='disabled', font=("Consolas", 9))
+        # Info Log (dark bg/fg)
+        self.log_box = ScrolledText(self, height=9, state='disabled', font=("Consolas", 9), background="#232323", foreground="#EEEEEE", insertbackground="#EEEEEE")
         self.log_box.pack(fill="both", padx=10, pady=(2,10))
 
     def select_folder(self):
@@ -187,7 +192,7 @@ class GalleryRipperApp(ThemedTk):
             self.albums = albums
             for i, (name, _) in enumerate(albums):
                 var = tk.BooleanVar(value=True)
-                cb = tk.Checkbutton(self.chkfrm, text=name, variable=var, anchor="w")
+                cb = ttk.Checkbutton(self.chkfrm, text=name, variable=var)
                 cb.pack(fill="x", anchor="w")
                 self.selected_vars.append(var)
             self.log(f"Found {len(albums)} albums.")
