@@ -29,9 +29,10 @@ def find_albums(url, visited=None):
     # Coppermine: Albums are usually "thumbnails.php?album=NN"
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if 'thumbnails.php?album=' in href and href not in visited:
+        name = a.text.strip()
+        if 'thumbnails.php?album=' in href and href not in visited and name:
             full_url = urljoin(url, href)
-            albums.append((a.text.strip(), full_url))
+            albums.append((name, full_url))
             visited.add(href)
     # Find deeper categories
     for a in soup.find_all('a', href=True):
@@ -104,8 +105,9 @@ class GalleryRipperApp(ThemedTk):
     def __init__(self):
         super().__init__(theme="equilux")
         self.title("Coppermine Gallery Ripper")
-        self.geometry("700x570")
-        self.resizable(False, False)
+        self.geometry("800x600")
+        self.minsize(550, 400)
+        self.resizable(True, True)
         self.albums = []
         self.selected_vars = []
         self.download_thread = None
@@ -124,45 +126,64 @@ class GalleryRipperApp(ThemedTk):
         style.configure("TButton", background="#323232", foreground=dark_fg)
         style.configure("Accent.TButton", background="#404060", foreground=dark_fg)
         style.configure("TLabelframe.Label", background=dark_bg, foreground=accent_fg)
+        self['background'] = dark_bg
 
-        self.configure(background=dark_bg)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(4, weight=1)
 
         # URL Entry
         frm_url = ttk.Frame(self)
-        frm_url.pack(fill="x", pady=5, padx=10)
-        ttk.Label(frm_url, text="Gallery Root URL:").pack(side="left")
-        self.url_entry = ttk.Entry(frm_url, width=60)
-        self.url_entry.pack(side="left", padx=5)
-        ttk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).pack(side="left")
+        frm_url.grid(row=0, column=0, sticky="ew", pady=5, padx=10)
+        frm_url.columnconfigure(1, weight=1)
+        ttk.Label(frm_url, text="Gallery Root URL:").grid(row=0, column=0, sticky="w")
+        self.url_entry = ttk.Entry(frm_url)
+        self.url_entry.grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).grid(row=0, column=2, sticky="e")
 
         # Download Path
         frm_path = ttk.Frame(self)
-        frm_path.pack(fill="x", pady=5, padx=10)
-        ttk.Label(frm_path, text="Download Folder:").pack(side="left")
+        frm_path.grid(row=1, column=0, sticky="ew", pady=5, padx=10)
+        frm_path.columnconfigure(1, weight=1)
+        ttk.Label(frm_path, text="Download Folder:").grid(row=0, column=0, sticky="w")
         self.path_var = tk.StringVar()
-        ttk.Entry(frm_path, textvariable=self.path_var, width=50).pack(side="left", padx=5)
-        ttk.Button(frm_path, text="Browse...", command=self.select_folder).pack(side="left")
+        ttk.Entry(frm_path, textvariable=self.path_var).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(frm_path, text="Browse...", command=self.select_folder).grid(row=0, column=2, sticky="e")
 
-        # Albums List with dark background
+        # Albums List (Scrollable)
         self.chkfrm = ttk.LabelFrame(self, text="Select Albums to Download")
-        self.chkfrm.pack(fill="both", expand=True, padx=10, pady=(5,0))
+        self.chkfrm.grid(row=2, column=0, sticky="nsew", padx=10, pady=(5,0))
+        self.chkfrm.rowconfigure(0, weight=1)
+        self.chkfrm.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self.chkfrm, borderwidth=0, highlightthickness=0, bg=dark_bg)
+        self.scrollbar = ttk.Scrollbar(self.chkfrm, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.chkfrm.rowconfigure(0, weight=1)
+        self.chkfrm.columnconfigure(0, weight=1)
 
         # Select/Unselect All
         frm_sel = ttk.Frame(self)
-        frm_sel.pack(fill="x", padx=10, pady=2)
+        frm_sel.grid(row=3, column=0, sticky="ew", padx=10, pady=2)
         ttk.Button(frm_sel, text="Select All", command=lambda: self.set_all_checks(True)).pack(side="left")
         ttk.Button(frm_sel, text="Unselect All", command=lambda: self.set_all_checks(False)).pack(side="left")
 
         # Download Button
-        ttk.Button(self, text="Start Download", command=self.start_download, style="Accent.TButton").pack(pady=8)
+        ttk.Button(self, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=5, column=0, pady=8)
 
         # Info Log (dark bg/fg)
-        self.log_box = ScrolledText(self, height=9, state='disabled', font=("Consolas", 9),
+        self.log_box = ScrolledText(self, height=7, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
-        self.log_box.pack(fill="both", padx=10, pady=(2,10))
-
-        # Make window background fully dark
-        self['background'] = dark_bg
+        self.log_box.grid(row=6, column=0, sticky="nsew", padx=10, pady=(2,10))
+        self.rowconfigure(6, weight=0)
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -177,7 +198,7 @@ class GalleryRipperApp(ThemedTk):
         self.update_idletasks()
 
     def clear_album_checks(self):
-        for widget in self.chkfrm.winfo_children():
+        for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.selected_vars = []
 
@@ -197,11 +218,13 @@ class GalleryRipperApp(ThemedTk):
                 return
             self.albums = albums
             for i, (name, _) in enumerate(albums):
+                if not name:
+                    continue
                 var = tk.BooleanVar(value=True)
-                cb = ttk.Checkbutton(self.chkfrm, text=name, variable=var)
-                cb.pack(fill="x", anchor="w")
+                cb = ttk.Checkbutton(self.scrollable_frame, text=name, variable=var)
+                cb.pack(fill="x", anchor="w", padx=2, pady=0)
                 self.selected_vars.append(var)
-            self.log(f"Found {len(albums)} albums.")
+            self.log(f"Found {len([a for a in albums if a[0]])} albums.")
         except Exception as e:
             self.log(f"Failed to discover albums: {e}")
 
