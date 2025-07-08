@@ -101,25 +101,31 @@ def rip_galleries(selected_albums, output_root, log):
 
 # ---------- GUI ----------
 class GalleryRipperApp(ThemedTk):
-    def __init__(self, theme="arc"):
-        super().__init__(theme=theme)
-        # Theme selector
-        dark_themes = [th for th in self.get_themes() if "dark" in th or th in ("arc", "black", "equilux", "plastik", "radiance")]
-        if not dark_themes:
-            dark_themes = self.get_themes()
-        self.theme_var = tk.StringVar(value=self.current_theme)
-        frm_theme = ttk.Frame(self)
-        frm_theme.pack(fill="x", pady=5, padx=10)
-        ttk.Label(frm_theme, text="Theme:").pack(side="left")
-        theme_menu = ttk.Combobox(frm_theme, textvariable=self.theme_var, values=dark_themes, state="readonly", width=20)
-        theme_menu.pack(side="left", padx=5)
-        theme_menu.bind("<<ComboboxSelected>>", lambda e: self.set_theme(self.theme_var.get()))
+    def __init__(self):
+        super().__init__(theme="equilux")
         self.title("Coppermine Gallery Ripper")
         self.geometry("700x570")
         self.resizable(False, False)
         self.albums = []
         self.selected_vars = []
         self.download_thread = None
+
+        # Set background colors everywhere for that true dark look
+        dark_bg = "#292929"
+        dark_fg = "#EEEEEE"
+        accent_fg = "#CCCCCC"
+
+        style = ttk.Style(self)
+        style.theme_use("equilux")
+        style.configure("TFrame", background=dark_bg)
+        style.configure("TLabel", background=dark_bg, foreground=dark_fg)
+        style.configure("TLabelFrame", background=dark_bg, foreground=accent_fg)
+        style.configure("TCheckbutton", background=dark_bg, foreground=dark_fg)
+        style.configure("TButton", background="#323232", foreground=dark_fg)
+        style.configure("Accent.TButton", background="#404060", foreground=dark_fg)
+        style.configure("TLabelframe.Label", background=dark_bg, foreground=accent_fg)
+
+        self.configure(background=dark_bg)
 
         # URL Entry
         frm_url = ttk.Frame(self)
@@ -140,10 +146,6 @@ class GalleryRipperApp(ThemedTk):
         # Albums List with dark background
         self.chkfrm = ttk.LabelFrame(self, text="Select Albums to Download")
         self.chkfrm.pack(fill="both", expand=True, padx=10, pady=(5,0))
-        # Listbox for albums
-        style = ttk.Style()
-        style.configure("Dark.TFrame", background="#222", foreground="#eee")
-        self.chkfrm.configure(style="Dark.TFrame")
 
         # Select/Unselect All
         frm_sel = ttk.Frame(self)
@@ -155,8 +157,12 @@ class GalleryRipperApp(ThemedTk):
         ttk.Button(self, text="Start Download", command=self.start_download, style="Accent.TButton").pack(pady=8)
 
         # Info Log (dark bg/fg)
-        self.log_box = ScrolledText(self, height=9, state='disabled', font=("Consolas", 9), background="#232323", foreground="#EEEEEE", insertbackground="#EEEEEE")
+        self.log_box = ScrolledText(self, height=9, state='disabled', font=("Consolas", 9),
+                                    background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
         self.log_box.pack(fill="both", padx=10, pady=(2,10))
+
+        # Make window background fully dark
+        self['background'] = dark_bg
 
     def select_folder(self):
         folder = filedialog.askdirectory()
