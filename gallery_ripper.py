@@ -5,9 +5,13 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+from ttkthemes import ThemedTk
 
 BASE_URL = ""  # Will be set from GUI
 session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+})
 
 def get_soup(url):
     resp = session.get(url)
@@ -95,9 +99,20 @@ def rip_galleries(selected_albums, output_root, log):
         log(f"Done with album: {album_name}")
 
 # ---------- GUI ----------
-class GalleryRipperApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
+class GalleryRipperApp(ThemedTk):
+    def __init__(self, theme="arc"):
+        super().__init__(theme=theme)
+        # Theme selector
+        dark_themes = [th for th in self.get_themes() if "dark" in th or th in ("arc", "black", "equilux", "plastik", "radiance")]
+        if not dark_themes:
+            dark_themes = self.get_themes()
+        self.theme_var = tk.StringVar(value=self.get_theme())
+        frm_theme = tk.Frame(self)
+        frm_theme.pack(fill="x", pady=5, padx=10)
+        tk.Label(frm_theme, text="Theme:").pack(side="left")
+        theme_menu = ttk.Combobox(frm_theme, textvariable=self.theme_var, values=dark_themes, state="readonly", width=20)
+        theme_menu.pack(side="left", padx=5)
+        theme_menu.bind("<<ComboboxSelected>>", lambda e: self.set_theme(self.theme_var.get()))
         self.title("Coppermine Gallery Ripper")
         self.geometry("680x520")
         self.resizable(False, False)
