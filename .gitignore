@@ -1,0 +1,15 @@
+# Ignore PyCharm project files
+*
+.idea/
+
+# Ignore Python virtual environments
+.venv/
+venv/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore OS junk files
+.DS_Store
+Thumbs.db
