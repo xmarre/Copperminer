@@ -9,6 +9,8 @@ from tkinter.scrolledtext import ScrolledText
 from ttkthemes import ThemedTk
 import re
 import json
+import time
+import random
 
 BASE_URL = ""  # Will be set from GUI
 session = requests.Session()
@@ -96,7 +98,7 @@ def download_image(img_url, output_dir, log):
     except Exception as e:
         log(f"Error downloading {img_url}: {e}")
 
-def rip_galleries(selected_albums, output_root, log):
+def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     for album_name, album_url in selected_albums:
         safe_name = "".join([c for c in album_name if c.isalnum() or c in " _-"]).strip() or "unnamed"
         outdir = os.path.join(output_root, safe_name)
@@ -104,8 +106,18 @@ def rip_galleries(selected_albums, output_root, log):
         log(f"Scraping album: {album_name}")
         image_links = get_image_links_from_js(album_url)
         log(f"  Found {len(image_links)} images in {album_name}.")
-        for img_url in image_links:
+
+        if mimic_human:
+            image_links = image_links.copy()
+            random.shuffle(image_links)
+
+        for idx, img_url in enumerate(image_links):
             download_image(img_url, outdir, log)
+            if mimic_human:
+                time.sleep(random.uniform(0.7, 2.5))
+                if (idx + 1) % random.randint(18, 28) == 0:
+                    log("...taking a longer break to mimic human behavior...")
+                    time.sleep(random.uniform(5, 8))
         log(f"Done with album: {album_name}")
 
 # ---------- GUI ----------
@@ -158,6 +170,32 @@ class GalleryRipperApp(ThemedTk):
         self.path_var = tk.StringVar()
         ttk.Entry(frm_path, textvariable=self.path_var).grid(row=0, column=1, sticky="ew", padx=5)
         ttk.Button(frm_path, text="Browse...", command=self.select_folder).grid(row=0, column=2, sticky="e")
+
+        # Human-like option with tooltip
+        self.mimic_var = tk.BooleanVar(value=True)
+        mimic_chk = ttk.Checkbutton(frm_path, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk.grid(row=0, column=3, sticky="w", padx=(10, 0))
+
+        def show_tip(event):
+            x, y, cx, cy = mimic_chk.bbox("insert")
+            x += mimic_chk.winfo_rootx() + 25
+            y += mimic_chk.winfo_rooty() + 20
+            self.tipwindow = tw = tk.Toplevel(mimic_chk)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(
+                tw, text="Slows downloads, randomizes timing/order, and\nadds pauses to look like a real visitor.\nPrevents bans/rate limits.",
+                justify='left', background="#232323", fg="#eee", relief='solid', borderwidth=1, font=("Consolas", 9)
+            )
+            label.pack(ipadx=1)
+
+        def hide_tip(event):
+            if hasattr(self, "tipwindow") and self.tipwindow:
+                self.tipwindow.destroy()
+                self.tipwindow = None
+
+        mimic_chk.bind("<Enter>", show_tip)
+        mimic_chk.bind("<Leave>", hide_tip)
 
         # Albums List (Scrollable & fully resizable)
         self.chkfrm = ttk.LabelFrame(content, text="Select Albums to Download")
@@ -273,7 +311,7 @@ class GalleryRipperApp(ThemedTk):
 
     def download_worker(self, selected, output_dir):
         try:
-            rip_galleries(selected, output_dir, self.log)
+            rip_galleries(selected, output_dir, self.log, mimic_human=self.mimic_var.get())
             self.log("All downloads finished!")
         except Exception as e:
             self.log(f"Download error: {e}")

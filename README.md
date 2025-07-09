@@ -12,6 +12,7 @@ No thumbnails—just full images, organized by album.
 - Windows double-click support via `start_gallery_ripper.bat`
 - Compatible with Python 3.10+
 - Always-on Equilux dark theme
+- Optional "Mimic human behavior" setting randomizes download order and timing
 
 ## Installation
 
@@ -23,6 +24,10 @@ No thumbnails—just full images, organized by album.
    ```
 
 3. **Run the application:**
+
+   On Windows, simply double-click `start_gallery_ripper.bat` to launch
+   the tool (the batch script activates the virtual environment if present).
+   On other platforms run:
 
    ```bash
    python gallery_ripper.py
