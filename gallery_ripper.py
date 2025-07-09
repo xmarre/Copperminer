@@ -47,19 +47,23 @@ def find_albums(url, visited=None):
     return albums
 
 def get_image_links_from_js(album_url):
-    """
-    Extracts image URLs from the Coppermine gallery's embedded fb_imagelist JavaScript object.
-    Returns a list of full image URLs.
-    """
+    """Extract image URLs from the fb_imagelist JavaScript variable."""
     soup = get_soup(album_url)
-    js_var_pattern = re.compile(r'var\s+js_vars\s*=\s*({.*?});', re.DOTALL)
-    match = js_var_pattern.search(soup.text)
+    html = str(soup)
+    js_var_pattern = re.compile(
+        r'var\s+js_vars\s*=\s*(\{.*?"fb_imagelist".*?\});',
+        re.DOTALL,
+    )
+    match = js_var_pattern.search(html)
     if not match:
+        print(f"[DEBUG] js_vars not found in {album_url}")
         return []
     js_vars_json = match.group(1)
     try:
-        js_vars_json = js_vars_json.replace('\n', '')
-        js_vars_json = re.sub(r'(\w+):', r'"\1":', js_vars_json)
+        if js_vars_json.endswith(";"):
+            js_vars_json = js_vars_json[:-1]
+        js_vars_json = js_vars_json.replace("'", '"')
+        js_vars_json = re.sub(r'([,{])(\w+):', r'\1"\2":', js_vars_json)
         js_vars = json.loads(js_vars_json)
         fb_imagelist = js_vars.get("fb_imagelist", [])
         base = album_url.split("/thumbnails.php")[0]
@@ -73,7 +77,7 @@ def get_image_links_from_js(album_url):
             image_urls.append(full_url)
         return image_urls
     except Exception as e:
-        print("Error parsing fb_imagelist:", e)
+        print(f"[DEBUG] Error parsing fb_imagelist: {e}")
         return []
 
 def download_image(img_url, output_dir, log):

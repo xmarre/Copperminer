@@ -20,6 +20,13 @@ No thumbnails—just full images, organized by album.
 
    ```bash
    pip install -r requirements.txt
+   ```
+
+3. **Run the application:**
+
+   ```bash
+   python gallery_ripper.py
+   ```
 
 ## License
 
