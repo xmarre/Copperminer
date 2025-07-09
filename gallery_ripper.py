@@ -270,24 +270,72 @@ def get_image_links_from_js(album_url):
         return []
 
 
-def get_main_image_from_displayimage(displayimage_url):
-    """Return the main image URL from a displayimage.php page."""
-    soup = get_soup(displayimage_url)
+def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
+    """Return every plausible original image URL from a displayimage.php page.
+
+    Parses fancybox links, <img> tags, onclick handlers and data-* attributes
+    to gather potential full-size image URLs.
+    """
+    try:
+        soup = get_soup(displayimage_url)
+    except Exception as e:
+        log(f"[DEBUG] Failed to load {displayimage_url}: {e}")
+        return []
+
+    candidates = []
+
+    # 1. <a class="fancybox" href="...">
+    for a in soup.find_all("a", href=True):
+        classes = a.get("class", [])
+        rels = a.get("rel", [])
+        if "fancybox" in classes or "fancybox-thumb" in classes or "fancybox-thumb" in rels:
+            href = a["href"]
+            if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+                candidates.append(urljoin(displayimage_url, href))
+
+    # 2. <img class="image" src="...">
     img = soup.find("img", class_="image")
     if img and img.get("src"):
-        return urljoin(displayimage_url, img["src"])
+        candidates.append(urljoin(displayimage_url, img["src"]))
 
+    # 3. Largest <img> on the page
     imgs = soup.find_all("img")
-    if not imgs:
-        return None
-    imgs = sorted(
-        imgs,
-        key=lambda i: int(i.get("width", 0)) * int(i.get("height", 0)),
-        reverse=True,
-    )
-    if imgs[0].get("src"):
-        return urljoin(displayimage_url, imgs[0]["src"])
-    return None
+    if imgs:
+        imgs = sorted(
+            imgs,
+            key=lambda i: int(i.get("width", 0)) * int(i.get("height", 0)),
+            reverse=True,
+        )
+        if imgs[0].get("src"):
+            candidates.append(urljoin(displayimage_url, imgs[0]["src"]))
+
+    # 4. Any <a href="..."> that points directly to an image
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+            candidates.append(urljoin(displayimage_url, href))
+
+    # 5. Look for URLs inside onclick handlers or data-* attributes
+    pattern = re.compile(r"['\"]([^'\"]+\.(?:jpe?g|png|gif|webp|bmp|tiff))['\"]", re.I)
+    for tag in soup.find_all(["a", "img"]):
+        oc = tag.get("onclick")
+        if oc:
+            for m in pattern.findall(oc):
+                candidates.append(urljoin(displayimage_url, m))
+        for attr, val in tag.attrs.items():
+            if attr.startswith("data") and isinstance(val, str) and re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", val, re.I):
+                candidates.append(urljoin(displayimage_url, val))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c not in seen:
+            unique_candidates.append(c)
+            seen.add(c)
+
+    log(f"[DEBUG] Candidates from {displayimage_url}: {unique_candidates}")
+    return unique_candidates
 
 
 def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
@@ -328,34 +376,11 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         log(f"[DEBUG] Found {len(display_links)} displayimage links")
 
     for idx, dlink in enumerate(display_links, 1):
-        try:
-            d_soup = get_soup(dlink)
-            # Try <img class="image" ...>
-            img = d_soup.find("img", class_="image")
-            candidates = []
-            if img and img.get("src"):
-                url = urljoin(dlink, img["src"])
-                if url and url not in unique_urls:
-                    candidates.append(url)
-                    unique_urls.add(url)
-            # Fallback: biggest image on page
-            imgs = d_soup.find_all("img")
-            if imgs:
-                imgs = sorted(
-                    imgs,
-                    key=lambda i: int(i.get("width", 0)) * int(i.get("height", 0)),
-                    reverse=True,
-                )
-                if imgs[0].get("src"):
-                    url = urljoin(dlink, imgs[0]["src"])
-                    if url and url not in unique_urls:
-                        candidates.append(url)
-                        unique_urls.add(url)
-            if candidates:
-                log(f"[DEBUG] displayimage {idx} -> {candidates}")
-                image_entries.append((f"Image (displayimage) {idx}", candidates))
-        except Exception as e:
-            log(f"[DEBUG] Error fetching images from {dlink}: {e}")
+        candidates = extract_all_displayimage_candidates(dlink, log)
+        good_candidates = [url for url in candidates if url not in unique_urls]
+        if good_candidates:
+            image_entries.append((f"Image (displayimage) {idx}", good_candidates))
+            unique_urls.update(good_candidates)
 
     # 3. Direct <img> links that aren't thumbnails
     for img in soup.find_all("img", src=True):
@@ -401,21 +426,20 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         log("No images found in album after all strategies.")
     return image_entries
 
-def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
-    """Try each candidate until one downloads successfully as an image, otherwise count as failed."""
-    for candidate in candidate_urls:
-        fname = os.path.basename(candidate.split("?")[0])
-        fpath = os.path.join(output_dir, fname)
-        if os.path.exists(fpath):
-            log(f"Already downloaded: {fname}")
-            if album_stats is not None:
-                album_stats['downloaded'] += 1
-            return True
-        for attempt in range(1, max_retries + 1):
+def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_attempts=3):
+    """Try every candidate once, then retry the whole block if all fail."""
+    for block_attempt in range(1, max_attempts + 1):
+        for candidate in candidate_urls:
+            fname = os.path.basename(candidate.split("?")[0])
+            fpath = os.path.join(output_dir, fname)
+            if os.path.exists(fpath):
+                log(f"Already downloaded: {fname}")
+                if album_stats is not None:
+                    album_stats['downloaded'] += 1
+                return True
             try:
                 r = session.get(candidate, stream=True, timeout=20)
                 r.raise_for_status()
-                # Only accept actual images!
                 if not r.headers.get("Content-Type", "").startswith("image"):
                     raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
                 total_bytes = 0
@@ -426,11 +450,9 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                             f.write(chunk)
                             total_bytes += len(chunk)
                 elapsed = time.time() - start_time
-                speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
+                speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
                 size_str = (
-                    f"{total_bytes / 1024 / 1024:.2f} MB"
-                    if total_bytes > 1024 * 1024
-                    else f"{total_bytes / 1024:.1f} KB"
+                    f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
                 )
                 speed_str = (
                     f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
@@ -445,14 +467,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     album_stats['downloaded'] += 1
                 return True
             except Exception as e:
-                if attempt < max_retries:
-                    log(f"Error downloading {candidate}: {e} (retry {attempt}/{max_retries})")
-                    time.sleep(1.0)
-                else:
-                    log(f"FAILED to download after {max_retries} tries: {candidate} ({e})")
-    # All candidates failed
-    if album_stats is not None:
-        album_stats['errors'] += 1
+                log(f"Error downloading {candidate}: {e}")
+        if block_attempt < max_attempts:
+            log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
+            time.sleep(1.0)
+        else:
+            log(f"FAILED to download after {max_attempts} attempts: {candidate_urls}")
+            if album_stats is not None:
+                album_stats['errors'] += 1
     return False
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag=None):
