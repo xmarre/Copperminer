@@ -98,6 +98,13 @@ DEFAULT_RULES = {
         "thumb_selector": "a[href^='pic-']",
         "detail_image_selector": ".big-photo-wrapper a[href]",
     },
+    "theplace-2com": {
+        "domains": ["theplace-2.com"],
+        "root_album_selector": "a[href^='/photos/'][href*='-pictures-'][href$='.htm']",
+        "pagination_selector": "div.pagination a[href]",
+        "thumb_selector": "a[href^='pic-']",
+        "detail_image_selector": ".big-photo-wrapper a[href]",
+    },
 }
 
 
