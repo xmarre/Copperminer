@@ -1182,6 +1182,15 @@ class GalleryRipperApp(tb.Window):
 
         self._all_albums = None
 
+        # Button for Coppermine/tree search
+        self.search_all_btn = ttk.Button(
+            search_frame,
+            text="Search All Albums in Tree",
+            command=self.search_all_albums_in_tree,
+        )
+        self.search_all_btn.pack(side="left", padx=5)
+        self.search_all_btn.pack_forget()
+
         paned = ttk.Panedwindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -1325,13 +1334,41 @@ class GalleryRipperApp(tb.Window):
     def on_search(self, *args):
         """Filter albums in the tree based on search."""
         term = self.search_var.get().strip().lower()
-        if self._all_albums is None:
-            return
-        if not term:
-            albums = self._all_albums
+        # Flat mode (universal adapter)
+        if self._all_albums is not None:
+            if not term:
+                albums = self._all_albums
+            else:
+                albums = [a for a in self._all_albums if term in a['name'].lower()]
+            self.insert_album_nodes(albums)
         else:
-            albums = [a for a in self._all_albums if term in a['name'].lower()]
-        self.insert_album_nodes(albums)
+            # Tree mode: restore tree when clearing search
+            if not term:
+                self.insert_tree_root_safe(self.albums_tree_data)
+
+    def search_all_albums_in_tree(self):
+        """Collect all albums in the current tree and list them for searching."""
+
+        def collect_albums(node):
+            albums = list(node.get("albums", []))
+            for child in node.get("children", []):
+                albums.extend(collect_albums(child))
+            return albums
+
+        if self.albums_tree_data:
+            all_albums = collect_albums(self.albums_tree_data)
+            self._search_tree_albums = all_albums
+            self.insert_album_nodes(all_albums)
+            self.search_var.trace_add("write", self.on_tree_album_search)
+
+    def on_tree_album_search(self, *args):
+        term = self.search_var.get().strip().lower()
+        albums = getattr(self, "_search_tree_albums", [])
+        if not term:
+            filtered = albums
+        else:
+            filtered = [a for a in albums if term in a['name'].lower()]
+        self.insert_album_nodes(filtered)
 
     def insert_tree_root_safe(self, tree_data):
         # Clear any previous items and related state before inserting a new tree
@@ -1341,12 +1378,15 @@ class GalleryRipperApp(tb.Window):
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self._prev_selection.clear()
-        if "albums" in tree_data:
+        if "albums" in tree_data and not tree_data.get("children") and not tree_data.get("specials"):
             self._all_albums = tree_data["albums"]
             self.insert_album_nodes(self._all_albums)
+            self.search_all_btn.pack_forget()
             return
+        # Tree mode
         self._all_albums = None
         self.insert_tree_node("", tree_data, [])
+        self.search_all_btn.pack(side="left", padx=5)
 
     def discover_albums(self):
         url = self.url_var.get().strip()
