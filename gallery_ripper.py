@@ -954,13 +954,16 @@ class GalleryRipperApp(tb.Window):
             return
         win = tk.Toplevel(self)
         win.title("Recent Galleries")
-        win.geometry("400x300")
-        listbox = tk.Listbox(win)
+        win.geometry("440x340")
+        listbox = tk.Listbox(win, activestyle="dotbox")
         for url, title in history:
             listbox.insert(tk.END, f"{title} | {url}")
         listbox.pack(fill="both", expand=True, padx=10, pady=10)
 
-        def on_select(event=None):
+        button_frame = ttk.Frame(win)
+        button_frame.pack(pady=5)
+
+        def do_select(event=None):
             selection = listbox.curselection()
             if selection:
                 idx = selection[0]
@@ -968,8 +971,52 @@ class GalleryRipperApp(tb.Window):
                 win.destroy()
                 self.discover_albums()
 
-        listbox.bind("<Double-1>", on_select)
-        ttk.Button(win, text="Select", command=on_select).pack(pady=5)
+        def do_delete():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showinfo("Delete", "No gallery selected to delete.")
+                return
+            idx = selection[0]
+            url, title = history[idx]
+            # Ask for confirmation
+            answer = messagebox.askyesno(
+                "Delete Gallery Cache",
+                f"Do you really want to delete the cached gallery:\n\n{title}\n{url}?"
+            )
+            if not answer:
+                return
+            # Remove the cache file
+            import hashlib, os
+            cache_file = os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".json")
+            deleted = False
+            if os.path.exists(cache_file):
+                try:
+                    os.remove(cache_file)
+                    deleted = True
+                except Exception as e:
+                    messagebox.showerror("Delete", f"Error deleting file:\n{e}")
+                    return
+            else:
+                messagebox.showinfo("Delete", "Cache file not found.")
+            # If currently loaded gallery matches, clear the tree
+            current = self.url_var.get().strip()
+            if deleted and current == url:
+                self.tree.delete(*self.tree.get_children())
+                self.albums_tree_data = None
+                self.selected_album_urls.clear()
+                self.item_to_album.clear()
+                self._prev_selection.clear()
+                self.log(f"Gallery cache for '{title}' deleted and main tree cleared.")
+            elif deleted:
+                self.log(f"Gallery cache for '{title}' deleted.")
+            # Refresh the list
+            win.destroy()
+            self.show_history()
+
+        listbox.bind("<Double-1>", do_select)
+        ttk.Button(button_frame, text="Select", command=do_select).pack(side="left", padx=(0, 8))
+        ttk.Button(button_frame, text="Delete Selected", command=do_delete).pack(side="left")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 5))
 
     def log(self, msg):
         self.log_box.configure(state='normal')
