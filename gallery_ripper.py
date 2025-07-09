@@ -88,6 +88,145 @@ def ensure_https_remote(repo_dir):
         pass
 
 
+# --- Universal gallery adapter ----------------------------------------------
+
+DEFAULT_RULES = {
+    "theplace2": {
+        "domains": ["theplace2.ru", "theplace2.com"],
+        "root_album_selector": "a[href^='/photos/']:not([href$='.html'])",
+        "pagination_selector": ".pagination a[href]",
+        "thumb_selector": "a[href^='pic-']",
+        "detail_image_selector": ".big-photo-wrapper a[href]",
+    },
+}
+
+
+def select_universal_rules(url: str):
+    """Return scraping rules for *url* if the domain is supported."""
+    domain = urlparse(url).netloc.lower()
+    for rules in DEFAULT_RULES.values():
+        for d in rules.get("domains", []):
+            if d in domain:
+                return rules
+    return None
+
+
+def select_adapter_for_url(url: str) -> str:
+    """Return the adapter key for *url* ("universal" or "coppermine")."""
+    if select_universal_rules(url):
+        return "universal"
+    return "coppermine"
+
+
+def universal_get_album_pages(album_url, rules, page_cache, log=lambda msg: None, quick_scan=False):
+    """Return all pagination URLs for a gallery using *rules*."""
+    html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    soup = BeautifulSoup(html, "html.parser")
+    pages = [album_url]
+    selector = rules.get("pagination_selector")
+    if selector:
+        for a in soup.select(selector):
+            purl = urljoin(album_url, a.get("href", ""))
+            if purl not in pages:
+                pages.append(purl)
+    return pages, soup
+
+
+def universal_get_album_image_count(album_url, rules, page_cache=None):
+    if page_cache is None:
+        page_cache = {}
+    pages, soup = universal_get_album_pages(album_url, rules, page_cache, quick_scan=False)
+    count = 0
+    thumb_sel = rules.get("thumb_selector")
+    for idx, page in enumerate(pages):
+        if idx == 0:
+            current_soup = soup
+        else:
+            html, _ = fetch_html_cached(page, page_cache, log=lambda m: None, quick_scan=False)
+            current_soup = BeautifulSoup(html, "html.parser")
+        if thumb_sel:
+            count += len(current_soup.select(thumb_sel))
+    return count
+
+
+def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=None, quick_scan=True, cached_nodes=None):
+    if page_cache is None:
+        page_cache = {}
+    html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan)
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("h1") or soup.find("title")
+    gallery_title = title_tag.text.strip() if title_tag else root_url
+    node = {
+        "type": "category",
+        "name": gallery_title,
+        "url": root_url,
+        "children": [],
+        "specials": [],
+        "albums": [],
+    }
+    albums = []
+    album_sel = rules.get("root_album_selector")
+    for a in soup.select(album_sel or ""):
+        href = a.get("href")
+        if not href:
+            continue
+        alb_url = urljoin(root_url, href)
+        name = a.text.strip() or a.get("title", "").strip()
+        if not name:
+            continue
+        if alb_url.endswith("/"):
+            alb_url = alb_url.rstrip("/")
+        if any(x["url"] == alb_url for x in albums):
+            continue
+        img_count = universal_get_album_image_count(alb_url, rules, page_cache)
+        albums.append({
+            "type": "album",
+            "name": name,
+            "url": alb_url,
+            "image_count": img_count,
+        })
+        log(f"Found gallery: {name} ({img_count} images)")
+
+    child_hash = compute_child_hash([], albums)
+    if root_url in page_cache:
+        page_cache[root_url]["child_hash"] = child_hash
+    node["albums"] = albums
+    node["child_hash"] = child_hash
+    return node
+
+
+def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda msg: None, page_cache=None, quick_scan=True):
+    if page_cache is None:
+        page_cache = {}
+    pages, soup = universal_get_album_pages(album_url, rules, page_cache, log=log, quick_scan=quick_scan)
+    image_entries = []
+    seen = set()
+    thumb_sel = rules.get("thumb_selector")
+    detail_sel = rules.get("detail_image_selector")
+    for idx, page in enumerate(pages):
+        if idx == 0:
+            current_soup = soup
+        else:
+            html, _ = fetch_html_cached(page, page_cache, log=log, quick_scan=quick_scan)
+            current_soup = BeautifulSoup(html, "html.parser")
+        for a in current_soup.select(thumb_sel or ""):
+            detail_url = urljoin(page, a.get("href", ""))
+            det_html, _ = fetch_html_cached(detail_url, page_cache, log=log, quick_scan=quick_scan)
+            det_soup = BeautifulSoup(det_html, "html.parser")
+            big = det_soup.select_one(detail_sel or "")
+            if big:
+                img_url = urljoin(detail_url, big.get("href", ""))
+                if img_url and img_url not in seen:
+                    seen.add(img_url)
+                    image_entries.append((os.path.basename(img_url), [img_url], detail_url))
+    entry_urls = [url for _, [url], _ in image_entries]
+    img_hash = compute_hash_from_list(entry_urls)
+    if album_url in page_cache:
+        page_cache[album_url]["images"] = image_entries
+        page_cache[album_url]["image_hash"] = img_hash
+    return image_entries
+
+
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
@@ -398,7 +537,25 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
     elif cached_tree:
         log("Cache found; using quick scan" if quick_scan else "Cache found.")
     cached_nodes = _build_url_map(cached_tree) if cached_tree else None
-    tree = discover_tree(root_url, log=log, page_cache=pages, quick_scan=quick_scan, cached_nodes=cached_nodes)
+    site_type = select_adapter_for_url(root_url)
+    if site_type == "universal":
+        rules = select_universal_rules(root_url)
+        tree = universal_discover_tree(
+            root_url,
+            rules,
+            log=log,
+            page_cache=pages,
+            quick_scan=quick_scan,
+            cached_nodes=cached_nodes,
+        )
+    else:
+        tree = discover_tree(
+            root_url,
+            log=log,
+            page_cache=pages,
+            quick_scan=quick_scan,
+            cached_nodes=cached_nodes,
+        )
     save_page_cache(root_url, tree, pages)
     return tree
 
@@ -797,15 +954,22 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
         )
     )
     pages, tree = load_page_cache(root_url)
+    site_type = select_adapter_for_url(root_url)
+    rules = select_universal_rules(root_url) if site_type == "universal" else None
     download_queue = []
     for album_name, album_url, album_path in selected_albums:
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
             return
         log(f"\nScraping album: {album_name}")
-        image_entries = get_all_candidate_images_from_album(
-            album_url, log=log, page_cache=pages, quick_scan=quick_scan
-        )
+        if site_type == "universal":
+            image_entries = universal_get_all_candidate_images_from_album(
+                album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
+            )
+        else:
+            image_entries = get_all_candidate_images_from_album(
+                album_url, log=log, page_cache=pages, quick_scan=quick_scan
+            )
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
             continue
