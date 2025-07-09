@@ -172,27 +172,69 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
         "albums": [],
     }
     albums = []
-    album_sel = rules.get("root_album_selector")
-    for a in soup.select(album_sel or ""):
-        href = a.get("href")
-        if not href:
-            continue
-        alb_url = urljoin(root_url, href)
-        name = a.text.strip() or a.get("title", "").strip()
-        if not name:
-            continue
-        if alb_url.endswith("/"):
-            alb_url = alb_url.rstrip("/")
-        if any(x["url"] == alb_url for x in albums):
-            continue
-        img_count = universal_get_album_image_count(alb_url, rules, page_cache)
+
+    # (1) If on /photos, get all A-Z letter pages
+    letter_links = []
+    box_photo_letters = soup.find("div", class_="box_photo_letters")
+    if box_photo_letters:
+        for a in box_photo_letters.select("a.letter-item[href]"):
+            l_url = urljoin(root_url, a['href'])
+            letter_links.append(l_url)
+
+    # (2) On main /photos also get the "Popular celebrities" directly
+    for card in soup.select(".model-card__body a.model-card__body__title[href]"):
+        alb_url = urljoin(root_url, card['href'])
+        name = card.text.strip()
+
+        count_str = None
+        card_parent = card.find_parent(class_="model-card__body")
+        if card_parent:
+            img_count_div = card_parent.select_one(".model-card__body__data span")
+            if img_count_div:
+                count_str = img_count_div.next_sibling or img_count_div.text
+        img_count = None
+        if count_str:
+            try:
+                img_count = int("".join(filter(str.isdigit, count_str)))
+            except Exception:
+                img_count = None
+
         albums.append({
             "type": "album",
             "name": name,
             "url": alb_url,
-            "image_count": img_count,
+            "image_count": img_count or "?",
         })
-        log(f"Found gallery: {name} ({img_count} images)")
+
+    # (3) For each letter page, fetch and add all celeb albums
+    for letter_url in letter_links:
+        l_html, _ = fetch_html_cached(letter_url, page_cache, log=log, quick_scan=quick_scan)
+        l_soup = BeautifulSoup(l_html, "html.parser")
+        for card in l_soup.select(".model-card__body a.model-card__body__title[href]"):
+            alb_url = urljoin(letter_url, card['href'])
+            name = card.text.strip()
+
+            count_str = None
+            card_parent = card.find_parent(class_="model-card__body")
+            if card_parent:
+                img_count_div = card_parent.select_one(".model-card__body__data span")
+                if img_count_div:
+                    count_str = img_count_div.next_sibling or img_count_div.text
+            img_count = None
+            if count_str:
+                try:
+                    img_count = int("".join(filter(str.isdigit, count_str)))
+                except Exception:
+                    img_count = None
+
+            if any(x["url"] == alb_url for x in albums):
+                continue
+            albums.append({
+                "type": "album",
+                "name": name,
+                "url": alb_url,
+                "image_count": img_count or "?",
+            })
 
     child_hash = compute_child_hash([], albums)
     if root_url in page_cache:
