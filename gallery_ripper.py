@@ -82,7 +82,7 @@ def get_image_links_from_js(album_url):
         print(f"[DEBUG] Error parsing fb_imagelist: {e}")
         return []
 
-def download_image(img_url, output_dir, log, index=None, total=None, album_stats=None):
+def download_image(img_url, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
     fname = os.path.basename(img_url.split("?")[0])
     fpath = os.path.join(output_dir, fname)
     if os.path.exists(fpath):
@@ -90,38 +90,44 @@ def download_image(img_url, output_dir, log, index=None, total=None, album_stats
         if album_stats is not None:
             album_stats['downloaded'] += 1
         return
-    try:
-        r = session.get(img_url, stream=True)
-        r.raise_for_status()
-        total_bytes = 0
-        start_time = time.time()
-        with open(fpath, "wb") as f:
-            for chunk in r.iter_content(1024 * 16):
-                if chunk:
-                    f.write(chunk)
-                    total_bytes += len(chunk)
-        elapsed = time.time() - start_time
-        speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
-        size_str = (
-            f"{total_bytes / 1024 / 1024:.2f} MB"
-            if total_bytes > 1024 * 1024
-            else f"{total_bytes / 1024:.1f} KB"
-        )
-        speed_str = (
-            f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
-        )
-        prefix = ""
-        if index is not None and total is not None:
-            prefix = f"File {index} of {total}: "
-        log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
-        if album_stats is not None:
-            album_stats['total_bytes'] += total_bytes
-            album_stats['total_time'] += elapsed
-            album_stats['downloaded'] += 1
-    except Exception as e:
-        log(f"Error downloading {img_url}: {e}")
-        if album_stats is not None:
-            album_stats['errors'] += 1
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = session.get(img_url, stream=True, timeout=20)
+            r.raise_for_status()
+            total_bytes = 0
+            start_time = time.time()
+            with open(fpath, "wb") as f:
+                for chunk in r.iter_content(1024 * 16):
+                    if chunk:
+                        f.write(chunk)
+                        total_bytes += len(chunk)
+            elapsed = time.time() - start_time
+            speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
+            size_str = (
+                f"{total_bytes / 1024 / 1024:.2f} MB"
+                if total_bytes > 1024 * 1024
+                else f"{total_bytes / 1024:.1f} KB"
+            )
+            speed_str = (
+                f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+            )
+            prefix = ""
+            if index is not None and total is not None:
+                prefix = f"File {index} of {total}: "
+            log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
+            if album_stats is not None:
+                album_stats['total_bytes'] += total_bytes
+                album_stats['total_time'] += elapsed
+                album_stats['downloaded'] += 1
+            return
+        except Exception as e:
+            if attempt < max_retries:
+                log(f"Error downloading {img_url}: {e} (retry {attempt}/{max_retries})")
+                time.sleep(1.0)
+            else:
+                log(f"FAILED to download after {max_retries} tries: {img_url} ({e})")
+                if album_stats is not None:
+                    album_stats['errors'] += 1
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     """Download all images from the selected albums with batch-wide progress."""
@@ -261,7 +267,11 @@ class GalleryRipperApp(ThemedTk):
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"+{x}+{y}")
             label = tk.Label(
-                tw, text="Slows downloads, randomizes timing/order, and\nadds pauses to look like a real visitor.\nPrevents bans/rate limits.",
+                tw, text=(
+                    "Adds random pauses between downloads, and occasionally a long pause,\n"
+                    "to mimic a real human visitor and avoid bans/rate limits.\n"
+                    "Does NOT limit your actual download speed."
+                ),
                 justify='left', background="#232323", fg="#eee", relief='solid', borderwidth=1, font=("Consolas", 9)
             )
             label.pack(ipadx=1)
