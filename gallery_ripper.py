@@ -2,7 +2,7 @@ import os
 import threading
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -270,6 +270,19 @@ def get_image_links_from_js(album_url):
         return []
 
 
+def get_base_for_relative_images(page_url):
+    """Return the base URL for resolving relative image paths.
+
+    Coppermine installs often live in subdirectories like ``/photos/`` or
+    ``/gallery/``. Pages such as ``displayimage.php`` then reference images
+    relative to that directory (e.g. ``albums/foo/bar.jpg``).  Without using
+    this base, ``urljoin`` would incorrectly resolve those paths against the
+    domain root and yield 404 errors.
+    """
+    # Example: https://example.com/photos/displayimage.php?id=1 -> https://example.com/photos/
+    return page_url.rsplit('/', 1)[0] + '/'
+
+
 def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     """Return every plausible original image URL from a displayimage.php page.
 
@@ -283,6 +296,7 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
         return []
 
     candidates = []
+    base = get_base_for_relative_images(displayimage_url)
 
     # 1. <a class="fancybox" href="...">
     for a in soup.find_all("a", href=True):
@@ -291,12 +305,12 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
         if "fancybox" in classes or "fancybox-thumb" in classes or "fancybox-thumb" in rels:
             href = a["href"]
             if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
-                candidates.append(urljoin(displayimage_url, href))
+                candidates.append(urljoin(base, href))
 
     # 2. <img class="image" src="...">
     img = soup.find("img", class_="image")
     if img and img.get("src"):
-        candidates.append(urljoin(displayimage_url, img["src"]))
+        candidates.append(urljoin(base, img["src"]))
 
     # 3. Largest <img> on the page
     imgs = soup.find_all("img")
@@ -307,13 +321,13 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
             reverse=True,
         )
         if imgs[0].get("src"):
-            candidates.append(urljoin(displayimage_url, imgs[0]["src"]))
+            candidates.append(urljoin(base, imgs[0]["src"]))
 
     # 4. Any <a href="..."> that points directly to an image
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
-            candidates.append(urljoin(displayimage_url, href))
+            candidates.append(urljoin(base, href))
 
     # 5. Look for URLs inside onclick handlers or data-* attributes
     pattern = re.compile(r"['\"]([^'\"]+\.(?:jpe?g|png|gif|webp|bmp|tiff))['\"]", re.I)
@@ -321,10 +335,10 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
         oc = tag.get("onclick")
         if oc:
             for m in pattern.findall(oc):
-                candidates.append(urljoin(displayimage_url, m))
+                candidates.append(urljoin(base, m))
         for attr, val in tag.attrs.items():
             if attr.startswith("data") and isinstance(val, str) and re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", val, re.I):
-                candidates.append(urljoin(displayimage_url, val))
+                candidates.append(urljoin(base, val))
 
     # Deduplicate while preserving order
     seen = set()
@@ -432,6 +446,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         for candidate in candidate_urls:
             fname = os.path.basename(candidate.split("?")[0])
             fpath = os.path.join(output_dir, fname)
+            log(f"[DEBUG] Attempting download: {candidate}")
             if os.path.exists(fpath):
                 log(f"Already downloaded: {fname}")
                 if album_stats is not None:
