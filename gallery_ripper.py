@@ -15,6 +15,7 @@ import random
 import hashlib
 import subprocess
 import sys
+import glob
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -302,8 +303,41 @@ def load_page_cache(root_url):
 
 def save_page_cache(root_url, tree, pages):
     path = site_cache_path(root_url)
+    gallery_title = tree.get("name") if tree else root_url
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"timestamp": time.time(), "tree": tree, "pages": pages}, f, indent=2)
+        json.dump({
+            "timestamp": time.time(),
+            "root_url": root_url,
+            "gallery_title": gallery_title,
+            "tree": tree,
+            "pages": pages,
+        }, f, indent=2)
+
+
+def list_cached_galleries():
+    """Return a list of cached galleries as (url, title) tuples."""
+    galleries = []
+    if not os.path.exists(CACHE_DIR):
+        return galleries
+    for filename in glob.glob(os.path.join(CACHE_DIR, "*.json")):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            url = data.get("root_url")
+            title = data.get("gallery_title", url)
+            ts = data.get("timestamp", 0)
+            if url:
+                galleries.append((ts, url, title))
+        except Exception:
+            continue
+    galleries.sort(key=lambda x: x[0], reverse=True)
+    seen = set()
+    ordered = []
+    for _, url, title in galleries:
+        if url not in seen:
+            ordered.append((url, title))
+            seen.add(url)
+    return ordered
 
 
 def _build_url_map(node, mapping=None):
@@ -824,6 +858,7 @@ class GalleryRipperApp(tb.Window):
         url_entry = ttk.Entry(urlf, textvariable=self.url_var, width=60)
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
+        ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
 
         pathf = ttk.Frame(control_frame)
         pathf.pack(fill="x", pady=(8, 0))
@@ -889,6 +924,30 @@ class GalleryRipperApp(tb.Window):
         folder = filedialog.askdirectory()
         if folder:
             self.path_var.set(folder)
+
+    def show_history(self):
+        history = list_cached_galleries()
+        if not history:
+            messagebox.showinfo("History", "No cached galleries found.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Recent Galleries")
+        win.geometry("400x300")
+        listbox = tk.Listbox(win)
+        for url, title in history:
+            listbox.insert(tk.END, f"{title} | {url}")
+        listbox.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def on_select(event=None):
+            selection = listbox.curselection()
+            if selection:
+                idx = selection[0]
+                self.url_var.set(history[idx][0])
+                win.destroy()
+                self.discover_albums()
+
+        listbox.bind("<Double-1>", on_select)
+        ttk.Button(win, text="Select", command=on_select).pack(pady=5)
 
     def log(self, msg):
         self.log_box.configure(state='normal')
