@@ -353,9 +353,12 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
 
 
 def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
-    """
-    Returns a list of (display_title, [image_url1, image_url2, ...]) for each image in the album,
-    trying all Coppermine extraction techniques, paginating if necessary, and only unique original images.
+    """Return all candidate image URLs from an album.
+
+    The return value is a list of tuples ``(display_title, [url1, url2, ...], referer)``
+    where ``referer`` is the page URL the candidates were extracted from. Some
+    galleries require that same page be supplied as the HTTP ``Referer`` when
+    fetching the direct image URLs.
     """
     if visited is None:
         visited = set()
@@ -375,7 +378,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         for idx, url in enumerate(js_links, 1):
             if url and url not in unique_urls:
                 log(f"[DEBUG] fb_imagelist -> {url}")
-                image_entries.append((f"Image {idx}", [url]))
+                image_entries.append((f"Image {idx}", [url], album_url))
                 unique_urls.add(url)
 
     # 2. Try all displayimage.php pages (these are "original" image pages)
@@ -393,7 +396,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         candidates = extract_all_displayimage_candidates(dlink, log)
         good_candidates = [url for url in candidates if url not in unique_urls]
         if good_candidates:
-            image_entries.append((f"Image (displayimage) {idx}", good_candidates))
+            image_entries.append((f"Image (displayimage) {idx}", good_candidates, dlink))
             unique_urls.update(good_candidates)
 
     # 3. Direct <img> links that aren't thumbnails
@@ -412,7 +415,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         url = urljoin(album_url, src)
         if url and url not in unique_urls:
             log(f"[DEBUG] img tag -> {url}")
-            image_entries.append((f"Image (img tag)", [url]))
+            image_entries.append((f"Image (img tag)", [url], album_url))
             unique_urls.add(url)
 
     # 4. Direct <a> links to image files
@@ -422,7 +425,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             url = urljoin(album_url, href)
             if url and url not in unique_urls:
                 log(f"[DEBUG] a tag -> {url}")
-                image_entries.append((f"Image (a tag)", [url]))
+                image_entries.append((f"Image (a tag)", [url], album_url))
                 unique_urls.add(url)
 
     # 5. Pagination support (recurse for all "page=" links)
@@ -440,20 +443,43 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         log("No images found in album after all strategies.")
     return image_entries
 
-def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_attempts=3):
-    """Try every candidate once, then retry the whole block if all fail."""
+def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
+                             album_stats=None, max_attempts=3, referer=None):
+    """Try every candidate once, then retry the whole block if all fail.
+
+    Parameters
+    ----------
+    candidate_urls : list[str]
+        Possible URLs for the same image (largest first).
+    output_dir : str
+        Folder where the file should be saved.
+    log : callable
+        Logging function.
+    index : int | None
+        Index of the current file within the batch (for progress messages).
+    total : int | None
+        Total number of files in the batch.
+    album_stats : dict | None
+        Dictionary used to accumulate statistics across an album.
+    max_attempts : int
+        How many times to retry the whole block of URLs if all fail.
+    referer : str | None
+        Optional Referer header value to send with the request. Some galleries
+        require a valid Referer to allow direct image downloads.
+    """
     for block_attempt in range(1, max_attempts + 1):
         for candidate in candidate_urls:
             fname = os.path.basename(candidate.split("?")[0])
             fpath = os.path.join(output_dir, fname)
-            log(f"[DEBUG] Attempting download: {candidate}")
             if os.path.exists(fpath):
                 log(f"Already downloaded: {fname}")
                 if album_stats is not None:
                     album_stats['downloaded'] += 1
                 return True
             try:
-                r = session.get(candidate, stream=True, timeout=20)
+                headers = {'Referer': referer} if referer else {}
+                log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
+                r = session.get(candidate, headers=headers, stream=True, timeout=20)
                 r.raise_for_status()
                 if not r.headers.get("Content-Type", "").startswith("image"):
                     raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
@@ -505,8 +531,8 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
             continue
-        for entry_name, candidates in image_entries:
-            download_queue.append((album_name, album_url, candidates))
+        for entry_name, candidates, referer in image_entries:
+            download_queue.append((album_name, album_url, candidates, referer))
 
     total_images = len(download_queue)
     if total_images == 0:
@@ -523,7 +549,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
 
     log(f"Total images in queue: {total_images}")
 
-    for idx, (album_name, _, candidate_urls) in enumerate(download_queue, 1):
+    for idx, (album_name, _, candidate_urls, referer) in enumerate(download_queue, 1):
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
             return
@@ -549,6 +575,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
             index=idx,
             total=total_images,
             album_stats=stats,
+            referer=referer,
         )
 
         if mimic_human:
