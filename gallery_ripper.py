@@ -14,6 +14,70 @@ import time
 import random
 import hashlib
 
+def compute_child_hash(subcats, albums):
+    """Return a stable hash for the discovered subcats/albums list."""
+    h = hashlib.sha1()
+    for name, url in sorted(subcats):
+        h.update(name.encode("utf-8", errors="ignore"))
+        h.update(url.encode("utf-8", errors="ignore"))
+    for alb in sorted(albums, key=lambda a: a["url"]):
+        h.update(alb["name"].encode("utf-8", errors="ignore"))
+        h.update(alb["url"].encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def compute_hash_from_list(items):
+    """Return a SHA1 hash for the given list of strings."""
+    h = hashlib.sha1()
+    for it in sorted(items):
+        h.update(it.encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
+    """Return HTML for *url* using the cache and indicate if it changed."""
+    entry = page_cache.get(url)
+    if entry and quick_scan:
+        headers = {}
+        if entry.get("etag"):
+            headers["If-None-Match"] = entry["etag"]
+        if entry.get("last_modified"):
+            headers["If-Modified-Since"] = entry["last_modified"]
+        try:
+            r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
+            if r.status_code == 304:
+                entry["timestamp"] = time.time()
+                log(f"{indent}Using cached page (304): {url}")
+                return entry["html"], False
+            if r.status_code == 200:
+                et = r.headers.get("ETag")
+                lm = r.headers.get("Last-Modified")
+                if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
+                    entry["timestamp"] = time.time()
+                    log(f"{indent}Using cached page (headers match): {url}")
+                    return entry["html"], False
+        except Exception:
+            pass
+        if time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
+            log(f"{indent}Using cached page (not expired): {url}")
+            return entry["html"], False
+
+    if entry and not quick_scan and time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
+        log(f"{indent}Using cached page: {url}")
+        return entry["html"], False
+
+    resp = session.get(url)
+    resp.raise_for_status()
+    html = resp.text
+    page_cache[url] = {
+        "html": html,
+        "timestamp": time.time(),
+        "etag": resp.headers.get("ETag"),
+        "last_modified": resp.headers.get("Last-Modified"),
+    }
+    log(f"{indent}Fetched: {url}")
+    return html, True
+
 BASE_URL = ""  # Will be set from GUI
 session = requests.Session()
 session.headers.update({
@@ -44,7 +108,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -63,6 +127,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     visited: set | None
         Set of URLs that have already been crawled. Used to avoid recursion
         loops when categories link back to their parents.
+    cached_nodes: dict | None
+        Mapping of previously discovered nodes keyed by URL. Used for quick
+        delta scans to skip unchanged subtrees.
     """
     if visited is None:
         visited = set()
@@ -76,50 +143,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     if page_cache is None:
         page_cache = {}
 
-    def fetch_html(url):
-        entry = page_cache.get(url)
-        if entry and quick_scan:
-            headers = {}
-            if entry.get("etag"):
-                headers["If-None-Match"] = entry["etag"]
-            if entry.get("last_modified"):
-                headers["If-Modified-Since"] = entry["last_modified"]
-            try:
-                r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
-                if r.status_code == 304:
-                    entry["timestamp"] = time.time()
-                    log(f"{indent}Using cached page (304): {url}")
-                    return entry["html"]
-                if r.status_code == 200:
-                    et = r.headers.get("ETag")
-                    lm = r.headers.get("Last-Modified")
-                    if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
-                        entry["timestamp"] = time.time()
-                        log(f"{indent}Using cached page (headers match): {url}")
-                        return entry["html"]
-            except Exception:
-                pass
-            if time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
-                log(f"{indent}Using cached page (not expired): {url}")
-                return entry["html"]
-
-        if entry and not quick_scan and time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
-            log(f"{indent}Using cached page: {url}")
-            return entry["html"]
-
-        resp = session.get(url)
-        resp.raise_for_status()
-        html = resp.text
-        page_cache[url] = {
-            "html": html,
-            "timestamp": time.time(),
-            "etag": resp.headers.get("ETag"),
-            "last_modified": resp.headers.get("Last-Modified"),
-        }
-        log(f"{indent}Fetched: {url}")
-        return html
-
-    html = fetch_html(root_url)
+    html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
     soup = BeautifulSoup(html, "html.parser")
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
@@ -155,6 +179,37 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             subcats.append((name, urljoin(root_url, href)))
             log(f"{indent}   Found subcategory: {name}")
 
+    albums = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'thumbnails.php?album=' in href:
+            name = a.text.strip()
+            m = re.search(r'album=([a-zA-Z0-9_]+)', href)
+            if not m or not name:
+                continue
+            album_id = m.group(1)
+            if album_id in [key for _, key in SPECIALS]:
+                continue
+            album_url = urljoin(root_url, href)
+            if cat_id != album_id:
+                albums.append({"type": "album", "name": name, "url": album_url})
+                log(f"{indent}     Found album: {name}")
+
+    child_hash = compute_child_hash(subcats, albums)
+    if root_url in page_cache:
+        page_cache[root_url]['child_hash'] = child_hash
+    node['child_hash'] = child_hash
+
+    cached_node = None
+    if quick_scan and cached_nodes:
+        cached_node = cached_nodes.get(root_url)
+    if quick_scan and cached_node and cached_node.get('child_hash') == child_hash:
+        log(f"{indent}   No changes detected; skipping subtree")
+        if cached_node.get('name') != cat_title:
+            cached_node = dict(cached_node)
+            cached_node['name'] = cat_title
+        return cached_node
+
     seen_cats = set()
     for name, subcat_url in subcats:
         cat_num = re.search(r'cat=(\d+)', subcat_url)
@@ -172,24 +227,12 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             visited=visited,
             page_cache=page_cache,
             quick_scan=quick_scan,
+            cached_nodes=cached_nodes,
         )
         if child:
             node['children'].append(child)
 
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if 'thumbnails.php?album=' in href:
-            name = a.text.strip()
-            m = re.search(r'album=([a-zA-Z0-9_]+)', href)
-            if not m or not name:
-                continue
-            album_id = m.group(1)
-            if album_id in [key for _, key in SPECIALS]:
-                continue
-            album_url = urljoin(root_url, href)
-            if cat_id != album_id:
-                node['albums'].append({"type": "album", "name": name, "url": album_url})
-                log(f"{indent}     Found album: {name}")
+    node['albums'] = albums
 
     log(
         f"{indent}   -> {len(node['children'])} subcategories | {len(node['albums'])} albums"
@@ -225,6 +268,18 @@ def save_page_cache(root_url, tree, pages):
         json.dump({"timestamp": time.time(), "tree": tree, "pages": pages}, f, indent=2)
 
 
+def _build_url_map(node, mapping=None):
+    """Return a dictionary mapping URLs to nodes for *node* and its children."""
+    if mapping is None:
+        mapping = {}
+    if not node:
+        return mapping
+    mapping[node.get("url")] = node
+    for child in node.get("children", []):
+        _build_url_map(child, mapping)
+    return mapping
+
+
 def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=False):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
@@ -233,7 +288,8 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
         pages = {}
     elif cached_tree:
         log("Cache found; using quick scan" if quick_scan else "Cache found.")
-    tree = discover_tree(root_url, log=log, page_cache=pages, quick_scan=quick_scan)
+    cached_nodes = _build_url_map(cached_tree) if cached_tree else None
+    tree = discover_tree(root_url, log=log, page_cache=pages, quick_scan=quick_scan, cached_nodes=cached_nodes)
     save_page_cache(root_url, tree, pages)
     return tree
 
@@ -270,6 +326,49 @@ def get_image_links_from_js(album_url):
     except Exception as e:
         print(f"[DEBUG] Error parsing fb_imagelist: {e}")
         return []
+
+
+def extract_album_image_links(html, album_url):
+    """Return list of image or displayimage links found in album HTML."""
+    links = []
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "displayimage.php" in href and "pid=" in href:
+            links.append(urljoin(album_url, href))
+        elif re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+            links.append(urljoin(album_url, href))
+
+    js_var_pattern = re.compile(
+        r'var\s+js_vars\s*=\s*(\{.*?"fb_imagelist".*?\});',
+        re.DOTALL,
+    )
+    match = js_var_pattern.search(html)
+    if match:
+        js_vars_json = match.group(1)
+        try:
+            if js_vars_json.endswith(";"):
+                js_vars_json = js_vars_json[:-1]
+            js_vars_json = js_vars_json.replace("'", '"')
+            js_vars_json = re.sub(r'([,{])(\w+):', r'\1"\2":', js_vars_json)
+            js_vars = json.loads(js_vars_json)
+            base = album_url.split("/thumbnails.php")[0]
+            for img in js_vars.get("fb_imagelist", []):
+                src = img.get("src")
+                if src:
+                    if src.startswith("http"):
+                        links.append(src)
+                    else:
+                        links.append(base + "/" + src.replace("\\/", "/").lstrip("/"))
+        except Exception:
+            pass
+    return list(dict.fromkeys(links))
+
+
+def compute_album_image_hash(html, album_url):
+    """Return a stable hash for the image links inside an album page."""
+    links = extract_album_image_links(html, album_url)
+    return compute_hash_from_list(links)
 
 
 def get_base_for_relative_images(page_url):
@@ -395,7 +494,7 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     return unique_candidates
 
 
-def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
+def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True):
     """Return all candidate image URLs from an album.
 
     The return value is a list of tuples ``(display_title, [url1, url2, ...], referer)``
@@ -409,7 +508,16 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         return []
     visited.add(album_url)
 
-    soup = get_soup(album_url)
+    if page_cache is None:
+        page_cache = {}
+
+    html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    entry = page_cache.get(album_url, {})
+    if quick_scan and not changed and entry.get("images"):
+        log(f"[DEBUG] Using cached image list for {album_url}")
+        return entry["images"]
+
+    soup = BeautifulSoup(html, "html.parser")
     log = log or (lambda msg: None)
     image_entries = []
     unique_urls = set()
@@ -478,12 +586,25 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             pagelinks.add(urljoin(album_url, a["href"]))
     for pl in pagelinks:
         log(f"[DEBUG] pagination -> {pl}")
-        image_entries.extend(get_all_candidate_images_from_album(pl, log=log, visited=visited))
+        image_entries.extend(
+            get_all_candidate_images_from_album(
+                pl, log=log, visited=visited, page_cache=page_cache, quick_scan=quick_scan
+            )
+        )
 
     if image_entries:
         log(f"Found {len(image_entries)} images total after all strategies.")
     else:
         log("No images found in album after all strategies.")
+
+    entry_urls = []
+    for _, candidates, _ in image_entries:
+        entry_urls.extend(candidates)
+    img_hash = compute_hash_from_list(entry_urls)
+    if album_url in page_cache:
+        page_cache[album_url]["images"] = image_entries
+        page_cache[album_url]["image_hash"] = img_hash
+
     return image_entries
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
@@ -559,20 +680,23 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 album_stats['errors'] += 1
     return False
 
-def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag=None):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
         "Will download {} album(s): {}".format(
             len(selected_albums), ["/".join(a[2]) for a in selected_albums]
         )
     )
+    pages, tree = load_page_cache(root_url)
     download_queue = []
     for album_name, album_url, album_path in selected_albums:
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
             return
         log(f"\nScraping album: {album_name}")
-        image_entries = get_all_candidate_images_from_album(album_url, log=log)
+        image_entries = get_all_candidate_images_from_album(
+            album_url, log=log, page_cache=pages, quick_scan=quick_scan
+        )
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
             continue
@@ -637,6 +761,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
         f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n"
         f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
     )
+    save_page_cache(root_url, tree, pages)
 # ---------- GUI ----------
 class GalleryRipperApp(tb.Window):
     def __init__(self):
@@ -884,16 +1009,28 @@ class GalleryRipperApp(tb.Window):
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
         self.log(f"Starting download of {len(selected)} albums...")
-        self.download_thread = threading.Thread(target=self.download_worker, args=(selected, output_dir), daemon=True)
+        self.download_thread = threading.Thread(
+            target=self.download_worker,
+            args=(selected, output_dir, self.url_var.get().strip()),
+            daemon=True,
+        )
         self.download_thread.start()
 
     def stop_download(self):
         self.log("Stop requested by user. Attempting to stop current operation...")
         self.stop_flag.set()
 
-    def download_worker(self, selected, output_dir):
+    def download_worker(self, selected, output_dir, root_url):
         try:
-            rip_galleries(selected, output_dir, self.log, mimic_human=self.mimic_var.get(), stop_flag=self.stop_flag)
+            rip_galleries(
+                selected,
+                output_dir,
+                self.log,
+                root_url,
+                quick_scan=self.quick_scan_var.get(),
+                mimic_human=self.mimic_var.get(),
+                stop_flag=self.stop_flag,
+            )
             self.log("All downloads finished or stopped!")
         except Exception as e:
             self.log(f"Download error: {e}")
