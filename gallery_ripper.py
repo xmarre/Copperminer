@@ -291,20 +291,17 @@ def get_main_image_from_displayimage(displayimage_url):
 
 
 def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
-    """
-    For an album page, return a list of (display_title, [candidate_image_urls]) for each image.
-    Each image may have multiple possible original URLs.
-    """
+    """Return a list of (display_title, [image_url]) tuples for the album."""
     if visited is None:
         visited = set()
     if album_url in visited:
         return []
     visited.add(album_url)
+
     soup = get_soup(album_url)
     log = log or (lambda msg: None)
     image_entries = []
 
-    # Try fb_imagelist first (for some galleries this is *all* images)
     js_links = get_image_links_from_js(album_url)
     if js_links:
         log(f"Found {len(js_links)} images via fb_imagelist (JS array).")
@@ -312,90 +309,35 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             image_entries.append((f"Image {idx}", [url]))
         return image_entries
 
-    # Try all displayimage.php links
     display_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "displayimage.php" in href and "album=" in href:
+        if "displayimage.php" in href and "album=" in href and "pid=" in href:
             display_links.append(urljoin(album_url, href))
-    display_links = list(dict.fromkeys(display_links))  # dedupe
+    display_links = list(dict.fromkeys(display_links))
 
-    if display_links:
-        log(f"Following {len(display_links)} displayimage.php links...")
-        for idx, dlink in enumerate(display_links, 1):
-            candidates = []
-            try:
-                d_soup = get_soup(dlink)
-                # 1. <a href="..."><img ...></a> — often the original/full-res
-                for a in d_soup.find_all("a", href=True):
-                    img = a.find("img")
-                    if img and img.get("src"):
-                        candidates.append(urljoin(dlink, a["href"]))
-                # 2. all large <img>
-                for img in d_soup.find_all("img"):
-                    src = img.get("src")
-                    if src and re.search(r'\.(jpe?g|png|gif|webp|bmp|tiff)$', src, re.I):
-                        candidates.append(urljoin(dlink, src))
-                # 3. <a href="..."> direct image links
-                for a in d_soup.find_all("a", href=True):
-                    if re.search(r'\.(jpe?g|png|gif|webp|bmp|tiff)$', a["href"], re.I):
-                        candidates.append(urljoin(dlink, a["href"]))
-                # Remove dups
-                candidates = list(dict.fromkeys(candidates))
-            except Exception as e:
-                log(f"[DEBUG] Error fetching images from {dlink}: {e}")
-            if candidates:
-                image_entries.append((f"Image {idx}", candidates))
-        if image_entries:
-            return image_entries
+    log(f"Found {len(display_links)} images in album by following displayimage.php links.")
+    for idx, dlink in enumerate(display_links, 1):
+        try:
+            d_soup = get_soup(dlink)
+            img = d_soup.find("img", class_="image")
+            if img and img.get("src"):
+                image_url = urljoin(dlink, img["src"])
+                image_entries.append((f"Image {idx}", [image_url]))
+                continue
+            imgs = d_soup.find_all("img")
+            if imgs:
+                imgs = sorted(
+                    imgs,
+                    key=lambda i: int(i.get("width", 0)) * int(i.get("height", 0)),
+                    reverse=True,
+                )
+                if imgs[0].get("src"):
+                    image_entries.append((f"Image {idx}", [urljoin(dlink, imgs[0]["src"])]))
+        except Exception as e:
+            log(f"[DEBUG] Error fetching images from {dlink}: {e}")
 
-    # 3. Fallback: large <img> tags not in thumbs
-    img_urls = []
-    for img in soup.find_all("img", src=True):
-        src = img["src"]
-        if (
-            "thumb" in src
-            or "/thumbs/" in src
-            or re.search(r"_(s|t|thumb)\.", src)
-        ):
-            continue
-        width = int(img.get("width", 0))
-        height = int(img.get("height", 0))
-        if width and height and (width < 300 or height < 200):
-            continue
-        img_urls.append(urljoin(album_url, src))
-    if img_urls:
-        log(f"Found {len(img_urls)} images via <img> tags.")
-        for idx, url in enumerate(img_urls, 1):
-            image_entries.append((f"Image {idx}", [url]))
-        return image_entries
-
-    # 4. Direct <a> links to images
-    img_urls = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if re.search(r"\.(jpe?g|png|webp|gif)$", href, re.I):
-            img_urls.append(urljoin(album_url, href))
-    if img_urls:
-        log(f"Found {len(img_urls)} images via direct <a> links.")
-        for idx, url in enumerate(img_urls, 1):
-            image_entries.append((f"Image {idx}", [url]))
-        return image_entries
-
-    # 5. Pagination recursion (grab all sub-pages)
-    pagelinks = set()
-    for a in soup.find_all("a", href=True):
-        if "page=" in a["href"]:
-            pagelinks.add(urljoin(album_url, a["href"]))
-    for pl in pagelinks:
-        image_entries.extend(get_all_candidate_images_from_album(pl, log=log, visited=visited))
-
-    if image_entries:
-        log(f"Found {len(image_entries)} images after pagination.")
-        return image_entries
-
-    log("No images found in album after all strategies.")
-    return []
+    return image_entries
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
     """Try each candidate until one downloads successfully as an image, otherwise count as failed."""
@@ -451,11 +393,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         album_stats['errors'] += 1
     return False
 
-def rip_galleries(selected_albums, output_root, log, mimic_human=True):
+def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(f"Will download {len(selected_albums)} album(s): {[a[0] for a in selected_albums]}")
     download_queue = []
     for album_name, album_url in selected_albums:
+        if stop_flag and stop_flag.is_set():
+            log("Download stopped by user.")
+            return
         log(f"\nScraping album: {album_name}")
         image_entries = get_all_candidate_images_from_album(album_url, log=log)
         log(f"  Found {len(image_entries)} images in {album_name}.")
@@ -480,6 +425,9 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     log(f"Total images in queue: {total_images}")
 
     for idx, (album_name, _, candidate_urls) in enumerate(download_queue, 1):
+        if stop_flag and stop_flag.is_set():
+            log("Download stopped by user.")
+            return
         if stats['downloaded'] > 0:
             avg_time = stats['total_time'] / stats['downloaded']
             eta = avg_time * (total_images - idx + 1)
@@ -528,6 +476,7 @@ class GalleryRipperApp(tb.Window):
         self.albums_tree_data = None
         self.download_thread = None
         self.discovery_thread = None
+        self.stop_flag = threading.Event()
 
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
@@ -573,6 +522,7 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
         ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
         ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
+        ttk.Button(btf, text="Stop", command=self.stop_download).pack(side="left", padx=8)
 
         self.log_box = ScrolledText(frm, height=10, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
@@ -688,12 +638,18 @@ class GalleryRipperApp(tb.Window):
         self.download_thread = threading.Thread(target=self.download_worker, args=(selected, output_dir), daemon=True)
         self.download_thread.start()
 
+    def stop_download(self):
+        self.log("Stop requested by user. Attempting to stop current operation...")
+        self.stop_flag.set()
+
     def download_worker(self, selected, output_dir):
         try:
-            rip_galleries(selected, output_dir, self.log, mimic_human=self.mimic_var.get())
-            self.log("All downloads finished!")
+            rip_galleries(selected, output_dir, self.log, mimic_human=self.mimic_var.get(), stop_flag=self.stop_flag)
+            self.log("All downloads finished or stopped!")
         except Exception as e:
             self.log(f"Download error: {e}")
+        finally:
+            self.stop_flag.clear()
 
 if __name__ == "__main__":
     GalleryRipperApp().mainloop()
