@@ -694,6 +694,7 @@ class GalleryRipperApp(tb.Window):
 
         self.selected_album_urls = set()
         self.item_to_album = {}
+        self._prev_selection = set()
 
         btf = ttk.Frame(frm)
         btf.pack(fill="x")
@@ -758,6 +759,7 @@ class GalleryRipperApp(tb.Window):
         is_cat = node["type"] == "category"
         node_icon = "\U0001F4C1" if is_cat else "\U0001F4F7"
         node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
+        self.tree.set(node_id, "sel", "\u25A1")
         node_path = path + [label]
 
         if self.show_specials_var.get():
@@ -782,17 +784,52 @@ class GalleryRipperApp(tb.Window):
         if getattr(self, "_ignore_next_select", False):
             self._ignore_next_select = False
             return
-        for item in self.tree.selection():
-            if item in self.item_to_album:
+
+        previous_selection = getattr(self, "_prev_selection", set())
+        current_selection = set(self.tree.selection())
+
+        newly_selected = current_selection - previous_selection
+        newly_unselected = previous_selection - current_selection
+
+        for item in newly_selected:
+            text = self.tree.item(item, "text")
+            if text.strip().startswith("\U0001F4C1"):
+                self.select_descendants(item)
+                self.tree.set(item, "sel", "\u2611")
+            elif item in self.item_to_album:
                 if item not in self.selected_album_urls:
                     self.selected_album_urls.add(item)
                     self.tree.set(item, "sel", "\u2611")
-            else:
-                self.tree.selection_remove(item)
-        for item in list(self.selected_album_urls):
-            if item not in self.tree.selection():
+
+        for item in newly_unselected:
+            text = self.tree.item(item, "text")
+            if text.strip().startswith("\U0001F4C1"):
+                self.unselect_descendants(item)
+                self.tree.set(item, "sel", "\u25A1")
+            elif item in self.selected_album_urls:
                 self.selected_album_urls.discard(item)
                 self.tree.set(item, "sel", "\u25A1")
+
+        self._prev_selection = set(self.tree.selection())
+
+    def select_descendants(self, parent):
+        for child in self.tree.get_children(parent):
+            text = self.tree.item(child, "text")
+            if text.strip().startswith("\u2605") and not self.show_specials_var.get():
+                continue
+            if child in self.item_to_album:
+                self.selected_album_urls.add(child)
+                self.tree.selection_add(child)
+                self.tree.set(child, "sel", "\u2611")
+            self.select_descendants(child)
+
+    def unselect_descendants(self, parent):
+        for child in self.tree.get_children(parent):
+            if child in self.selected_album_urls:
+                self.selected_album_urls.discard(child)
+                self.tree.selection_remove(child)
+                self.tree.set(child, "sel", "\u25A1")
+            self.unselect_descendants(child)
 
     def on_tree_doubleclick(self, event):
         item = self.tree.focus()
