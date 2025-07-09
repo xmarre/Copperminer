@@ -35,7 +35,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -51,8 +51,17 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         safe if used from a thread.
     depth: int
         Current recursion depth (used for log indentation).
+    visited: set | None
+        Set of URLs that have already been crawled. Used to avoid recursion
+        loops when categories link back to their parents.
     """
+    if visited is None:
+        visited = set()
     indent = "  " * depth
+    if root_url in visited:
+        log(f"{indent}↪ Already visited: {root_url}, skipping.")
+        return None
+    visited.add(root_url)
     log(f"{indent}→ Crawling: {root_url}")
 
     soup = get_soup(root_url)
@@ -98,8 +107,16 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         if cat_num.group(1) in seen_cats:
             continue
         seen_cats.add(cat_num.group(1))
-        child = discover_tree(subcat_url, parent_cat=cat_id, parent_title=name, log=log, depth=depth+1)
-        node['children'].append(child)
+        child = discover_tree(
+            subcat_url,
+            parent_cat=cat_id,
+            parent_title=name,
+            log=log,
+            depth=depth + 1,
+            visited=visited,
+        )
+        if child:
+            node['children'].append(child)
 
     for a in soup.find_all('a', href=True):
         href = a['href']
@@ -376,7 +393,7 @@ class GalleryRipperApp(tb.Window):
 
     def do_discover(self, url):
         try:
-            tree_data = discover_tree(url, log=self.thread_safe_log)
+            tree_data = discover_tree(url, log=self.thread_safe_log, visited=set())
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
             self.after(0, lambda: self.log("Discovery complete! Expand nodes to explore and select albums to download."))
