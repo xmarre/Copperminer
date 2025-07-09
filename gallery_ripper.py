@@ -124,10 +124,10 @@ def download_image(img_url, output_dir, log, index=None, total=None, album_stats
             album_stats['errors'] += 1
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True):
+    """Download all images from the selected albums with batch-wide progress."""
+
+    download_queue = []
     for album_name, album_url in selected_albums:
-        safe_name = "".join([c for c in album_name if c.isalnum() or c in " _-"]).strip() or "unnamed"
-        outdir = os.path.join(output_root, safe_name)
-        os.makedirs(outdir, exist_ok=True)
         log(f"\nScraping album: {album_name}")
         image_links = get_image_links_from_js(album_url)
         log(f"  Found {len(image_links)} images in {album_name}.")
@@ -139,45 +139,63 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
             image_links = image_links.copy()
             random.shuffle(image_links)
 
-        album_stats = {
-            'total_bytes': 0,
-            'total_time': 0.0,
-            'downloaded': 0,
-            'errors': 0,
-            'album_start': time.time(),
-        }
+        for img_url in image_links:
+            download_queue.append((album_name, album_url, img_url))
 
-        total = len(image_links)
-        for idx, img_url in enumerate(image_links, 1):
-            if idx > 1 and album_stats['total_time'] > 0:
-                avg_time = album_stats['total_time'] / (idx - 1)
-                eta = avg_time * (total - idx + 1)
-                eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
-            else:
-                eta_str = ""
-            log(f"File {idx} of {total}{eta_str}...")
+    total_images = len(download_queue)
+    if total_images == 0:
+        log("No images to download.")
+        return
 
-            download_image(
-                img_url, outdir, log,
-                index=idx, total=total,
-                album_stats=album_stats
-            )
+    stats = {
+        'total_bytes': 0,
+        'total_time': 0.0,
+        'downloaded': 0,
+        'errors': 0,
+        'start_time': time.time(),
+    }
 
-            if mimic_human:
-                time.sleep(random.uniform(0.7, 2.5))
-                if (idx) % random.randint(18, 28) == 0:
-                    log("...taking a longer break to mimic human behavior...")
-                    time.sleep(random.uniform(5, 8))
+    log(f"Total images in queue: {total_images}")
 
-        total_mb = album_stats['total_bytes'] / 1024 / 1024
-        album_time = time.time() - album_stats['album_start']
-        avg_speed = total_mb / album_time if album_time > 0 else 0
-        log(
-            f"Finished album: {album_name}\n"
-            f"  Downloaded {album_stats['downloaded']} files, {total_mb:.2f} MB in {album_time:.1f}s\n"
-            f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {album_stats['errors']}"
+    for idx, (album_name, _, img_url) in enumerate(download_queue, 1):
+        if stats['downloaded'] > 0:
+            avg_time = stats['total_time'] / stats['downloaded']
+            eta = avg_time * (total_images - idx + 1)
+            eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
+        else:
+            eta_str = ""
+
+        log(f"File {idx} of {total_images}{eta_str}... [{album_name}]")
+
+        outdir = os.path.join(
+            output_root,
+            "".join([c for c in album_name if c.isalnum() or c in " _-"]).strip() or "unnamed"
+        )
+        os.makedirs(outdir, exist_ok=True)
+
+        download_image(
+            img_url,
+            outdir,
+            log,
+            index=idx,
+            total=total_images,
+            album_stats=stats,
         )
 
+        if mimic_human:
+            time.sleep(random.uniform(0.7, 2.5))
+            if idx % random.randint(18, 28) == 0:
+                log("...taking a longer break to mimic human behavior...")
+                time.sleep(random.uniform(5, 8))
+
+    total_mb = stats['total_bytes'] / 1024 / 1024
+    elapsed = time.time() - stats['start_time']
+    avg_speed = total_mb / elapsed if elapsed > 0 else 0
+    log(
+        f"\nFinished all downloads!\n"
+        f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n"
+        f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
+    )
 # ---------- GUI ----------
 class GalleryRipperApp(ThemedTk):
     def __init__(self):
