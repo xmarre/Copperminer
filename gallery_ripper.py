@@ -288,6 +288,23 @@ def get_base_for_relative_images(page_url):
     return page_url.rsplit('/', 1)[0] + '/'
 
 
+def _fetch_fullsize_image(full_url, log):
+    """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
+    try:
+        resp = session.get(full_url)
+        resp.raise_for_status()
+        if resp.headers.get("Content-Type", "").startswith("image"):
+            return [full_url]
+        sub = BeautifulSoup(resp.text, "html.parser")
+        base = get_base_for_relative_images(full_url)
+        img = sub.find("img")
+        if img and img.get("src"):
+            return [urljoin(base, img["src"])]
+    except Exception as e:
+        log(f"[DEBUG] Failed to fetch fullsize {full_url}: {e}")
+    return []
+
+
 def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     """Return every plausible original image URL from a displayimage.php page.
 
@@ -302,6 +319,20 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
 
     candidates = []
     base = get_base_for_relative_images(displayimage_url)
+
+    # 0. Follow any explicit fullsize links or onclick targets first
+    fullsize_links = []
+    for tag in soup.find_all(["a", "img"]):
+        if tag.get("href") and "fullsize" in tag["href"]:
+            fullsize_links.append(urljoin(base, tag["href"]))
+        oc = tag.get("onclick")
+        if oc:
+            m = re.search(r"(displayimage\.php[^'\"\s]*fullsize=1[^'\"\s]*)", oc)
+            if m:
+                fullsize_links.append(urljoin(base, m.group(1)))
+    fullsize_links = list(dict.fromkeys(fullsize_links))
+    for fl in fullsize_links:
+        candidates.extend(_fetch_fullsize_image(fl, log))
 
     # 1. <a class="fancybox" href="...">
     for a in soup.find_all("a", href=True):
@@ -345,13 +376,23 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
             if attr.startswith("data") and isinstance(val, str) and re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", val, re.I):
                 candidates.append(urljoin(base, val))
 
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
     unique_candidates = []
     for c in candidates:
         if c not in seen:
             unique_candidates.append(c)
             seen.add(c)
+
+    def score(url):
+        s = 0
+        if "thumb" in url:
+            s += 2
+        if "normal_" in url:
+            s += 1
+        return s
+
+    unique_candidates.sort(key=score)
 
     log(f"[DEBUG] Candidates from {displayimage_url}: {unique_candidates}")
     return unique_candidates
