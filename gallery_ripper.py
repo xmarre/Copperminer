@@ -961,7 +961,13 @@ class GalleryRipperApp(tb.Window):
         self.after(0, lambda m=msg: self.log(m))
 
     def insert_tree_root_safe(self, tree_data):
+        # Clear any previous items and related state before inserting a new tree
+        # to avoid stale item IDs causing TclError callbacks
+        self.tree.selection_remove(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
+        self.selected_album_urls.clear()
+        self.item_to_album.clear()
+        self._prev_selection.clear()
         self.insert_tree_node("", tree_data, [])
 
     def discover_albums(self):
@@ -1020,7 +1026,13 @@ class GalleryRipperApp(tb.Window):
             return
 
         previous_selection = getattr(self, "_prev_selection", set())
-        current_selection = set(self.tree.selection())
+        current_selection = set()
+        for item in self.tree.selection():
+            try:
+                self.tree.item(item)
+            except tk.TclError:
+                continue  # Skip items that vanished due to a tree refresh
+            current_selection.add(item)
 
         newly_selected = current_selection - previous_selection
         newly_unselected = previous_selection - current_selection
