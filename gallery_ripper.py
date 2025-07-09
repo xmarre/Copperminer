@@ -6,7 +6,8 @@ from urllib.parse import urljoin
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
-from ttkthemes import ThemedTk
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
 import re
 import json
 import time
@@ -23,30 +24,78 @@ def get_soup(url):
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
-def find_albums(url, visited=None):
-    """Recursively find all albums (gallery pages) starting from url."""
-    if visited is None:
-        visited = set()
-    soup = get_soup(url)
-    albums = []
+SPECIALS = [
+    ("Last uploads", "lastup"),
+    ("Last comments", "lastcom"),
+    ("Most viewed", "topn"),
+    ("Top rated", "toprated"),
+    ("My Favorites", "favpics"),
+    ("Random", "random"),
+    ("By date", "date"),
+    ("Search", "search"),
+]
 
-    # Coppermine: Albums are usually "thumbnails.php?album=NN"
+def discover_tree(root_url, parent_cat=None, parent_title=None):
+    """Recursively build nested tree of categories, albums, and special albums."""
+    soup = get_soup(root_url)
+    cat_title = parent_title or soup.title.text.strip()
+
+    match = re.search(r'cat=(\d+)', root_url)
+    cat_id = match.group(1) if match else "0"
+
+    node = {
+        "type": "category",
+        "name": cat_title,
+        "url": root_url,
+        "cat_id": cat_id,
+        "children": [],
+        "specials": [],
+        "albums": [],
+    }
+
+    for label, key in SPECIALS:
+        special_url = re.sub(
+            r"index\.php(\?cat=\d+)?",
+            f"thumbnails.php?album={key}{f'&cat={cat_id}' if cat_id != '0' else ''}",
+            root_url,
+        )
+        node["specials"].append({"type": "special", "name": label, "url": special_url})
+
+    subcats = []
     for a in soup.find_all('a', href=True):
         href = a['href']
-        name = a.text.strip()
-        if 'thumbnails.php?album=' in href and href not in visited and name:
-            full_url = urljoin(url, href)
-            albums.append((name, full_url))
-            visited.add(href)
-    # Find deeper categories
+        if "index.php?cat=" in href and not href.endswith(f"cat={cat_id}"):
+            name = a.text.strip()
+            if not name or name == cat_title:
+                continue
+            subcats.append((name, urljoin(root_url, href)))
+
+    seen_cats = set()
+    for name, subcat_url in subcats:
+        cat_num = re.search(r'cat=(\d+)', subcat_url)
+        if not cat_num:
+            continue
+        if cat_num.group(1) in seen_cats:
+            continue
+        seen_cats.add(cat_num.group(1))
+        child = discover_tree(subcat_url, parent_cat=cat_id, parent_title=name)
+        node['children'].append(child)
+
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if 'index.php?cat=' in href:
-            full_url = urljoin(url, href)
-            if full_url not in visited:
-                visited.add(full_url)
-                albums.extend(find_albums(full_url, visited))
-    return albums
+        if 'thumbnails.php?album=' in href:
+            name = a.text.strip()
+            m = re.search(r'album=([a-zA-Z0-9_]+)', href)
+            if not m or not name:
+                continue
+            album_id = m.group(1)
+            if album_id in [key for _, key in SPECIALS]:
+                continue
+            album_url = urljoin(root_url, href)
+            if cat_id != album_id:
+                node['albums'].append({"type": "album", "name": name, "url": album_url})
+
+    return node
 
 def get_image_links_from_js(album_url):
     """Extract image URLs from the fb_imagelist JavaScript variable."""
@@ -205,126 +254,66 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
         f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
     )
 # ---------- GUI ----------
-class GalleryRipperApp(ThemedTk):
+class GalleryRipperApp(tb.Window):
     def __init__(self):
-        super().__init__(theme="equilux")
+        super().__init__(themename="darkly")
         self.title("Coppermine Gallery Ripper")
-        self.geometry("900x700")
-        self.minsize(600, 450)
-        self.resizable(True, True)
-        self.albums = []
-        self.filtered_albums = []
+        self.geometry("980x700")
+        self.minsize(700, 480)
+        self.albums_tree_data = None
         self.download_thread = None
 
-        dark_bg = "#292929"
-        dark_fg = "#EEEEEE"
-        accent_fg = "#CCCCCC"
-
-        style = ttk.Style(self)
-        style.theme_use("equilux")
-        style.configure("TFrame", background=dark_bg)
-        style.configure("TLabel", background=dark_bg, foreground=dark_fg)
-        style.configure("TLabelFrame", background=dark_bg, foreground=accent_fg)
-        style.configure("TButton", background="#323232", foreground=dark_fg)
-        style.configure("Accent.TButton", background="#404060", foreground=dark_fg)
-        style.configure("TLabelframe.Label", background=dark_bg, foreground=accent_fg)
-        self['background'] = dark_bg
-
-        # Layout structure: use a parent frame for spacing and padding
-        content = ttk.Frame(self)
-        content.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-
-        # URL Entry
-        frm_url = ttk.Frame(content)
-        frm_url.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        frm_url.columnconfigure(1, weight=1)
-        ttk.Label(frm_url, text="Gallery Root URL:").grid(row=0, column=0, sticky="w")
-        self.url_entry = ttk.Entry(frm_url)
-        self.url_entry.grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Button(frm_url, text="Discover Galleries", command=self.discover_albums).grid(row=0, column=2, sticky="e")
-
-        # Download Path
-        frm_path = ttk.Frame(content)
-        frm_path.grid(row=1, column=0, sticky="ew", pady=(0, 5))
-        frm_path.columnconfigure(1, weight=1)
-        ttk.Label(frm_path, text="Download Folder:").grid(row=0, column=0, sticky="w")
+        self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
-        ttk.Entry(frm_path, textvariable=self.path_var).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Button(frm_path, text="Browse...", command=self.select_folder).grid(row=0, column=2, sticky="e")
 
-        # Human-like option with tooltip
+        frm = ttk.Frame(self)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        urlf = ttk.Frame(frm)
+        urlf.pack(fill="x")
+        ttk.Label(urlf, text="Gallery Root URL:").pack(side="left")
+        url_entry = ttk.Entry(urlf, textvariable=self.url_var, width=60)
+        url_entry.pack(side="left", padx=5, expand=True, fill="x")
+        ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
+
+        pathf = ttk.Frame(frm)
+        pathf.pack(fill="x", pady=(8,0))
+        ttk.Label(pathf, text="Download Folder:").pack(side="left")
+        ttk.Entry(pathf, textvariable=self.path_var, width=50).pack(side="left", padx=5, expand=True, fill="x")
+        ttk.Button(pathf, text="Browse...", command=self.select_folder).pack(side="left")
+
         self.mimic_var = tk.BooleanVar(value=True)
-        mimic_chk = ttk.Checkbutton(frm_path, text="Mimic human behavior", variable=self.mimic_var)
-        mimic_chk.grid(row=0, column=3, sticky="w", padx=(10, 0))
+        mimic_chk = ttk.Checkbutton(pathf, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk.pack(side="left", padx=(10, 0))
 
-        def show_tip(event):
-            x, y, cx, cy = mimic_chk.bbox("insert")
-            x += mimic_chk.winfo_rootx() + 25
-            y += mimic_chk.winfo_rooty() + 20
-            self.tipwindow = tw = tk.Toplevel(mimic_chk)
-            tw.wm_overrideredirect(True)
-            tw.wm_geometry(f"+{x}+{y}")
-            label = tk.Label(
-                tw, text=(
-                    "Adds random pauses between downloads, and occasionally a long pause,\n"
-                    "to mimic a real human visitor and avoid bans/rate limits.\n"
-                    "Does NOT limit your actual download speed."
-                ),
-                justify='left', background="#232323", fg="#eee", relief='solid', borderwidth=1, font=("Consolas", 9)
-            )
-            label.pack(ipadx=1)
+        treeframe = ttk.LabelFrame(frm, text="Albums & Categories (expand/collapse and select leafs to download)")
+        treeframe.pack(fill="both", expand=True, pady=10)
 
-        def hide_tip(event):
-            if hasattr(self, "tipwindow") and self.tipwindow:
-                self.tipwindow.destroy()
-                self.tipwindow = None
+        self.tree = tb.Treeview(treeframe, show="tree", bootstyle="dark", selectmode="extended")
+        ysb = ttk.Scrollbar(treeframe, orient="vertical", command=self.tree.yview)
+        self.tree.config(yscrollcommand=ysb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="right", fill="y")
 
-        mimic_chk.bind("<Enter>", show_tip)
-        mimic_chk.bind("<Leave>", hide_tip)
+        self.tree["columns"] = ("sel",)
+        self.tree.column("sel", width=30, anchor="center")
+        self.tree.heading("sel", text="\u2714")
 
-        # --- Album filter/search ---
-        frm_filter = ttk.Frame(content)
-        frm_filter.grid(row=2, column=0, sticky="ew")
-        ttk.Label(frm_filter, text="Filter albums:").pack(side="left")
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", self.apply_album_filter)
-        filter_entry = ttk.Entry(frm_filter, textvariable=self.filter_var, width=30)
-        filter_entry.pack(side="left", padx=(5, 0))
-        ttk.Button(frm_filter, text="Clear", command=lambda: self.filter_var.set("")).pack(side="left", padx=5)
+        self.selected_album_urls = set()
+        self.item_to_album = {}
 
-        # Albums Listbox (ultrafast, supports thousands)
-        self.chkfrm = ttk.LabelFrame(content, text="Select Albums to Download")
-        self.chkfrm.grid(row=3, column=0, sticky="nsew", pady=(0, 5))
-        content.rowconfigure(3, weight=4)  # albums list gets most vertical space
-        content.columnconfigure(0, weight=1)
-        self.chkfrm.rowconfigure(0, weight=1)
-        self.chkfrm.columnconfigure(0, weight=1)
+        btf = ttk.Frame(frm)
+        btf.pack(fill="x")
+        ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
+        ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
+        ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
 
-        self.album_listbox = tk.Listbox(self.chkfrm, selectmode="extended", exportselection=False, bg=dark_bg, fg=dark_fg,
-                                        activestyle='dotbox', highlightthickness=0, relief='flat')
-        self.album_scrollbar = ttk.Scrollbar(self.chkfrm, orient="vertical", command=self.album_listbox.yview)
-        self.album_listbox.config(yscrollcommand=self.album_scrollbar.set)
-        self.album_listbox.grid(row=0, column=0, sticky="nsew")
-        self.album_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.chkfrm.rowconfigure(0, weight=1)
-        self.chkfrm.columnconfigure(0, weight=1)
-
-        # Select all/unselect all buttons
-        frm_sel = ttk.Frame(content)
-        frm_sel.grid(row=4, column=0, sticky="ew", padx=10, pady=2)
-        ttk.Button(frm_sel, text="Select All", command=lambda: self.album_listbox.select_set(0, tk.END)).pack(side="left")
-        ttk.Button(frm_sel, text="Unselect All", command=lambda: self.album_listbox.select_clear(0, tk.END)).pack(side="left")
-
-        # Download Button (sticks to bottom but above log)
-        ttk.Button(content, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=5, column=0, pady=5, sticky="ew")
-
-        # Info Log (fully resizable with window)
-        self.log_box = ScrolledText(content, height=7, state='disabled', font=("Consolas", 9),
+        self.log_box = ScrolledText(frm, height=10, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
-        self.log_box.grid(row=6, column=0, sticky="nsew")
-        content.rowconfigure(6, weight=2)  # log area expands as window grows
+        self.log_box.pack(fill="both", expand=False, pady=(10, 0))
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Double-1>", self.on_tree_doubleclick)
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -338,36 +327,69 @@ class GalleryRipperApp(ThemedTk):
         self.log_box.configure(state='disabled')
         self.update_idletasks()
 
-    def apply_album_filter(self, *args):
-        """Filters the album listbox live as the user types."""
-        query = self.filter_var.get().lower().strip()
-        self.album_listbox.delete(0, tk.END)
-        self.filtered_albums = []
-        for (name, url) in self.albums:
-            if name and (not query or query in name.lower()):
-                self.album_listbox.insert(tk.END, name)
-                self.filtered_albums.append((name, url))
-
     def discover_albums(self):
-        url = self.url_entry.get().strip()
+        url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("Missing URL", "Please enter the gallery URL.")
             return
         self.log(f"Discovering albums from: {url}")
-        self.album_listbox.delete(0, tk.END)
-        self.albums = []
+        self.tree.delete(*self.tree.get_children())
         try:
-            global BASE_URL
-            BASE_URL = url.split('/index.php')[0] + '/'
-            albums = find_albums(url)
-            if not albums:
-                self.log("No albums found.")
-                return
-            self.albums = albums
-            self.apply_album_filter()
-            self.log(f"Found {len([a for a in albums if a[0]])} albums.")
+            tree_data = discover_tree(url)
+            self.albums_tree_data = tree_data
+            self.insert_tree_node("", tree_data)
+            self.log("Discovery complete! Expand nodes to explore and select albums to download.")
         except Exception as e:
-            self.log(f"Failed to discover albums: {e}")
+            self.log(f"Discovery failed: {e}")
+
+    def insert_tree_node(self, parent, node):
+        label = node["name"]
+        is_cat = node["type"] == "category"
+        node_icon = "\U0001F4C1" if is_cat else "\U0001F4F7"
+        node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
+
+        for spec in node.get("specials", []):
+            spec_id = self.tree.insert(node_id, "end", text=f"\u2605 {spec['name']}", open=False)
+            self.tree.set(spec_id, "sel", "\u25A1")
+            self.item_to_album[spec_id] = (spec['name'], spec['url'])
+
+        for alb in node.get("albums", []):
+            alb_id = self.tree.insert(node_id, "end", text=f"\U0001F4F7 {alb['name']}", open=False)
+            self.tree.set(alb_id, "sel", "\u25A1")
+            self.item_to_album[alb_id] = (alb['name'], alb['url'])
+
+        for child in node.get("children", []):
+            self.insert_tree_node(node_id, child)
+
+    def on_tree_select(self, event=None):
+        for item in self.tree.selection():
+            if item in self.item_to_album:
+                if item not in self.selected_album_urls:
+                    self.selected_album_urls.add(item)
+                    self.tree.set(item, "sel", "\u2611")
+            else:
+                self.tree.selection_remove(item)
+        for item in list(self.selected_album_urls):
+            if item not in self.tree.selection():
+                self.selected_album_urls.discard(item)
+                self.tree.set(item, "sel", "\u25A1")
+
+    def on_tree_doubleclick(self, event):
+        item = self.tree.focus()
+        if self.tree.get_children(item):
+            self.tree.item(item, open=not self.tree.item(item, "open"))
+
+    def select_all_leaf_albums(self):
+        for item in self.item_to_album:
+            self.selected_album_urls.add(item)
+            self.tree.selection_add(item)
+            self.tree.set(item, "sel", "\u2611")
+
+    def unselect_all_leaf_albums(self):
+        for item in list(self.selected_album_urls):
+            self.selected_album_urls.discard(item)
+            self.tree.selection_remove(item)
+            self.tree.set(item, "sel", "\u25A1")
 
     def start_download(self):
         if self.download_thread and self.download_thread.is_alive():
@@ -377,13 +399,12 @@ class GalleryRipperApp(ThemedTk):
         if not output_dir:
             messagebox.showwarning("Missing folder", "Please select a download folder.")
             return
-        selected_indices = self.album_listbox.curselection()
-        albums_to_download = [self.filtered_albums[i] for i in selected_indices]
-        if not albums_to_download:
+        selected = [self.item_to_album[item] for item in self.selected_album_urls]
+        if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
-        self.log("Starting download...")
-        self.download_thread = threading.Thread(target=self.download_worker, args=(albums_to_download, output_dir), daemon=True)
+        self.log(f"Starting download of {len(selected)} albums...")
+        self.download_thread = threading.Thread(target=self.download_worker, args=(selected, output_dir), daemon=True)
         self.download_thread.start()
 
     def download_worker(self, selected, output_dir):
