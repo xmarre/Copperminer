@@ -13,6 +13,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Quick scan caching — Saves HTML of each visited page. Subsequent runs hit the network only if a page has changed or the cache expired.
 - “Mimic human behavior” — Optionally randomizes download order and timing to avoid hammering servers (toggle in the GUI)
 - Windows double-click support — via `start_gallery_ripper.bat`
+- One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
 
 ## Limitations
@@ -25,7 +26,8 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 
 1. Install Python 3.10 or newer. [Download here.](https://www.python.org/downloads/)
 2. Clone or download this repository.
-3. On Windows, run `setup_gallery_ripper.bat` to set up everything. To update the tool later, run `update_gallery_ripper.bat`.
+3. On Windows, run `setup_gallery_ripper.bat` to set up everything. Launch with `start_gallery_ripper.bat`.
+   To update later, either run `update_gallery_ripper.bat` or click **Update from Git** inside the app.
 4. On other platforms, follow these manual steps:
 
    Create and activate a virtual environment:

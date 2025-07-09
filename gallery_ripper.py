@@ -13,6 +13,8 @@ import json
 import time
 import random
 import hashlib
+import subprocess
+import sys
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -32,6 +34,20 @@ def compute_hash_from_list(items):
     for it in sorted(items):
         h.update(it.encode("utf-8", errors="ignore"))
     return h.hexdigest()
+
+
+def get_git_version():
+    """Return the current git version (tag or commit hash)."""
+    repo_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    try:
+        version = subprocess.check_output(
+            ["git", "describe", "--tags", "--always"],
+            cwd=repo_dir,
+            text=True,
+        ).strip()
+        return version
+    except Exception:
+        return "(unknown)"
 
 
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
@@ -810,6 +826,9 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
         ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
         ttk.Button(btf, text="Stop", command=self.stop_download).pack(side="left", padx=8)
+        ttk.Button(btf, text="Update from Git", command=self.start_git_update).pack(side="left", padx=8)
+        self.version_label = ttk.Label(btf, text="Current version: " + get_git_version())
+        self.version_label.pack(side="left", padx=6)
 
         paned = ttk.Panedwindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1036,6 +1055,43 @@ class GalleryRipperApp(tb.Window):
             self.log(f"Download error: {e}")
         finally:
             self.stop_flag.clear()
+
+    def start_git_update(self):
+        repo_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        self.log("Checking for updates via git...")
+        try:
+            prev_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+            ).strip()
+            result = subprocess.run(
+                ["git", "pull"],
+                cwd=repo_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.log(result.stdout)
+            if result.stderr:
+                self.log("Error during git pull:\n" + result.stderr)
+            new_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+            ).strip()
+            if prev_commit != new_commit:
+                self.log("Update applied! Restarting app...")
+                self.restart_app()
+            else:
+                self.log("No updates found. App is up to date.")
+        except Exception as e:
+            self.log(f"Update failed: {e}")
+            messagebox.showerror("Update failed", str(e))
+
+    def restart_app(self):
+        python = sys.executable
+        script = sys.argv[0]
+        args = [python, script] + sys.argv[1:]
+        self.log("Restarting app...")
+        self.after(1000, lambda: subprocess.Popen(args))
+        self.after(1500, self.quit)
 
 if __name__ == "__main__":
     GalleryRipperApp().mainloop()
