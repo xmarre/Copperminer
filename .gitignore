@@ -13,3 +13,5 @@ __pycache__/
 # Ignore OS junk files
 .DS_Store
 Thumbs.db
+
+!setup_gallery_ripper.bat

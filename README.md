@@ -17,18 +17,51 @@ No thumbnails—just full images, organized by album.
 
 ## Installation
 
-1. **Clone or download this repository.**
-2. **Install dependencies:**
+Follow the steps below if you are new to Python or virtual environments.
+
+1. **Install Python 3.10 or newer.**
+   Download it from [python.org](https://www.python.org/downloads/) and
+   follow the instructions for your operating system.
+
+2. **Clone or download this repository.**
+
+   Windows users can run `setup_gallery_ripper.bat` in the repository root to
+   automatically create a virtual environment and install all dependencies.
+   The rest of this section explains the manual steps for other platforms.
+
+3. **Create and activate a virtual environment (recommended):**
+
+   ```bash
+   python3 -m venv .venv
+   ```
+
+   Activate the environment so `pip` and `python` use the local copy:
+
+   - **Windows**
+
+     ```bash
+     .venv\Scripts\activate
+     ```
+
+   - **macOS/Linux**
+
+     ```bash
+     source .venv/bin/activate
+     ```
+
+4. **Install dependencies:**
 
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Run the application:**
+5. **Run the application:**
 
-   On Windows, simply double-click `start_gallery_ripper.bat` to launch
-   the tool (the batch script activates the virtual environment if present).
-   On other platforms run:
+   After running `setup_gallery_ripper.bat` (or completing the steps above
+   manually), Windows users can simply double-click
+   `start_gallery_ripper.bat` to launch the tool. The batch script
+   automatically activates `.venv` if it exists. On any platform you can run
+   the script directly:
 
    ```bash
    python gallery_ripper.py
