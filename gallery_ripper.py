@@ -128,17 +128,39 @@ def select_adapter_for_url(url: str) -> str:
 
 
 def universal_get_album_pages(album_url, rules, page_cache, log=lambda msg: None, quick_scan=False):
-    """Return all pagination URLs for a gallery using *rules*."""
+    """Return all pagination URLs for a gallery using *rules*.
+
+    Some galleries only show a subset of page links (e.g. ``?page=1``, ``?page=2``)
+    around the current page.  To avoid missing pages we collect every pagination
+    link found and also try to determine the maximum ``page`` number so we can
+    generate the full list of page URLs.
+    """
     html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
     soup = BeautifulSoup(html, "html.parser")
-    pages = [album_url]
+
+    pages = set([album_url])
     selector = rules.get("pagination_selector")
     if selector:
         for a in soup.select(selector):
             purl = urljoin(album_url, a.get("href", ""))
-            if purl not in pages:
-                pages.append(purl)
-    return pages, soup
+            if purl:
+                pages.add(purl)
+
+        # Attempt to find the highest page number and create URLs up to that
+        max_page = 1
+        for a in soup.select(selector):
+            href = a.get("href", "")
+            if "page=" in href:
+                try:
+                    n = int(href.split("page=")[-1])
+                    if n > max_page:
+                        max_page = n
+                except Exception:
+                    continue
+        for i in range(1, max_page + 1):
+            pages.add(f"{album_url}?page={i}")
+
+    return sorted(pages), soup
 
 
 def universal_get_album_image_count(album_url, rules, page_cache=None):
