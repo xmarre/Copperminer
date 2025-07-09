@@ -12,12 +12,16 @@ import re
 import json
 import time
 import random
+import hashlib
 
 BASE_URL = ""  # Will be set from GUI
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 })
+
+CACHE_DIR = ".coppermine_cache"
+CACHE_EXPIRY = 60 * 60 * 24 * 7  # 1 week
 
 def get_soup(url):
     resp = session.get(url)
@@ -138,6 +142,98 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     )
 
     return node
+
+
+def site_cache_path(root_url):
+    h = hashlib.sha1(root_url.encode()).hexdigest()
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    return os.path.join(CACHE_DIR, f"{h}.json")
+
+
+def compute_subtree_checksum(node):
+    """Recursively compute checksum for a tree node."""
+    m = hashlib.sha1()
+    m.update(node["name"].encode("utf-8"))
+    m.update(node["url"].encode("utf-8"))
+    for album in sorted(node.get("albums", []), key=lambda x: x["url"]):
+        m.update(album["name"].encode("utf-8"))
+        m.update(album["url"].encode("utf-8"))
+    for spec in sorted(node.get("specials", []), key=lambda x: x["url"]):
+        m.update(spec["name"].encode("utf-8"))
+        m.update(spec["url"].encode("utf-8"))
+    for child in sorted(node.get("children", []), key=lambda x: x["url"]):
+        m.update(compute_subtree_checksum(child).encode("utf-8"))
+    return m.hexdigest()
+
+
+def load_gallery_tree_cache(root_url):
+    path = site_cache_path(root_url)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if time.time() - cache.get("timestamp", 0) < CACHE_EXPIRY:
+            return cache.get("tree"), cache.get("checksums", {})
+    return None, {}
+
+
+def save_gallery_tree_cache(root_url, tree, checksums):
+    path = site_cache_path(root_url)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "timestamp": time.time(),
+            "tree": tree,
+            "checksums": checksums,
+        }, f, indent=2)
+
+
+def build_checksums_dict(node, checksums):
+    csum = compute_subtree_checksum(node)
+    checksums[node["url"]] = csum
+    for child in node.get("children", []):
+        build_checksums_dict(child, checksums)
+
+
+def refresh_changed_subtrees(root_url, cached_node, checksums, log, depth=0):
+    indent = "  " * depth
+    try:
+        fresh_node = discover_tree(cached_node["url"], parent_title=cached_node["name"], log=log, depth=depth)
+    except Exception as e:
+        log(f"{indent}Failed to refresh {cached_node['name']}: {e}")
+        return cached_node
+
+    fresh_csum = compute_subtree_checksum(fresh_node)
+    cached_csum = checksums.get(cached_node["url"])
+    if fresh_csum == cached_csum:
+        log(f"{indent}No changes in {cached_node['name']}")
+        return cached_node
+
+    log(f"{indent}Refreshing changed subtree: {cached_node['name']}")
+    url_to_cached = {c["url"]: c for c in cached_node.get("children", [])}
+    for i, child in enumerate(fresh_node.get("children", [])):
+        c_url = child["url"]
+        if c_url in url_to_cached:
+            fresh_node["children"][i] = refresh_changed_subtrees(root_url, url_to_cached[c_url], checksums, log, depth + 1)
+    return fresh_node
+
+
+def discover_or_load_gallery_tree(root_url, log):
+    log("Looking for cache...")
+    cached_tree, checksums = load_gallery_tree_cache(root_url)
+    if cached_tree:
+        log("Cache found, checking for changes...")
+        updated_tree = refresh_changed_subtrees(root_url, cached_tree, checksums, log)
+        new_checksums = {}
+        build_checksums_dict(updated_tree, new_checksums)
+        save_gallery_tree_cache(root_url, updated_tree, new_checksums)
+        return updated_tree
+    else:
+        log("No valid cache, building full gallery tree (this may take a while)...")
+        tree = discover_tree(root_url, log=log)
+        checksums = {}
+        build_checksums_dict(tree, checksums)
+        save_gallery_tree_cache(root_url, tree, checksums)
+        return tree
 
 def get_image_links_from_js(album_url):
     """Extract image URLs from the fb_imagelist JavaScript variable."""
@@ -490,10 +586,10 @@ class GalleryRipperApp(tb.Window):
 
     def do_discover(self, url):
         try:
-            tree_data = discover_tree(url, log=self.thread_safe_log, visited=set())
+            tree_data = discover_or_load_gallery_tree(url, self.thread_safe_log)
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
-            self.after(0, lambda: self.log("Discovery complete! Expand nodes to explore and select albums to download."))
+            self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
         except Exception as e:
             self.after(0, lambda: self.log(f"Discovery failed: {e}"))
 
