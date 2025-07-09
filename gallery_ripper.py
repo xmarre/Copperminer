@@ -35,10 +35,29 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None):
-    """Recursively build nested tree of categories, albums, and special albums."""
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0):
+    """Recursively build nested tree of categories, albums, and special albums.
+
+    Parameters
+    ----------
+    root_url: str
+        URL of the category/album to crawl.
+    parent_cat: str | None
+        Parent category id.
+    parent_title: str | None
+        Title of the parent category.
+    log: callable
+        Logger function accepting a single string argument. It should be thread
+        safe if used from a thread.
+    depth: int
+        Current recursion depth (used for log indentation).
+    """
+    indent = "  " * depth
+    log(f"{indent}→ Crawling: {root_url}")
+
     soup = get_soup(root_url)
     cat_title = parent_title or soup.title.text.strip()
+    log(f"{indent}   In category: {cat_title}")
 
     match = re.search(r'cat=(\d+)', root_url)
     cat_id = match.group(1) if match else "0"
@@ -69,6 +88,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None):
             if not name or name == cat_title:
                 continue
             subcats.append((name, urljoin(root_url, href)))
+            log(f"{indent}   Found subcategory: {name}")
 
     seen_cats = set()
     for name, subcat_url in subcats:
@@ -78,7 +98,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None):
         if cat_num.group(1) in seen_cats:
             continue
         seen_cats.add(cat_num.group(1))
-        child = discover_tree(subcat_url, parent_cat=cat_id, parent_title=name)
+        child = discover_tree(subcat_url, parent_cat=cat_id, parent_title=name, log=log, depth=depth+1)
         node['children'].append(child)
 
     for a in soup.find_all('a', href=True):
@@ -94,6 +114,11 @@ def discover_tree(root_url, parent_cat=None, parent_title=None):
             album_url = urljoin(root_url, href)
             if cat_id != album_id:
                 node['albums'].append({"type": "album", "name": name, "url": album_url})
+                log(f"{indent}     Found album: {name}")
+
+    log(
+        f"{indent}   -> {len(node['children'])} subcategories | {len(node['albums'])} albums"
+    )
 
     return node
 
@@ -262,6 +287,7 @@ class GalleryRipperApp(tb.Window):
         self.minsize(700, 480)
         self.albums_tree_data = None
         self.download_thread = None
+        self.discovery_thread = None
 
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
@@ -327,20 +353,35 @@ class GalleryRipperApp(tb.Window):
         self.log_box.configure(state='disabled')
         self.update_idletasks()
 
+    def thread_safe_log(self, msg):
+        """Log from worker threads without touching tkinter from outside"""
+        self.after(0, lambda m=msg: self.log(m))
+
+    def insert_tree_root_safe(self, tree_data):
+        self.tree.delete(*self.tree.get_children())
+        self.insert_tree_node("", tree_data)
+
     def discover_albums(self):
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("Missing URL", "Please enter the gallery URL.")
             return
-        self.log(f"Discovering albums from: {url}")
+        if self.discovery_thread and self.discovery_thread.is_alive():
+            messagebox.showinfo("Discovery running", "Please wait for the current discovery to finish.")
+            return
+        self.thread_safe_log(f"Discovering albums from: {url}")
         self.tree.delete(*self.tree.get_children())
+        self.discovery_thread = threading.Thread(target=self.do_discover, args=(url,), daemon=True)
+        self.discovery_thread.start()
+
+    def do_discover(self, url):
         try:
-            tree_data = discover_tree(url)
+            tree_data = discover_tree(url, log=self.thread_safe_log)
             self.albums_tree_data = tree_data
-            self.insert_tree_node("", tree_data)
-            self.log("Discovery complete! Expand nodes to explore and select albums to download.")
+            self.after(0, self.insert_tree_root_safe, tree_data)
+            self.after(0, lambda: self.log("Discovery complete! Expand nodes to explore and select albums to download."))
         except Exception as e:
-            self.log(f"Discovery failed: {e}")
+            self.after(0, lambda: self.log(f"Discovery failed: {e}"))
 
     def insert_tree_node(self, parent, node):
         label = node["name"]
