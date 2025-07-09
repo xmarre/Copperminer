@@ -23,7 +23,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 ## Limitations
 
 - Supports Coppermine and a small set of rule-based sites (initially ThePlace2): other galleries may fail
-- No thumbnails or junk: Only saves original/full-size images—not previews, icons, or other irrelevant files
+- No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below
 
 ## Installation

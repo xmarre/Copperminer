@@ -88,6 +88,41 @@ def ensure_https_remote(repo_dir):
         pass
 
 
+# --- Filtering helpers -------------------------------------------------------
+
+UI_IMAGE_FILENAMES = {
+    "rate_empty.png",
+    "rate_full.png",
+    "rate_highlight.png",
+    "folder.gif",
+    "thumbs.db",
+    "spacer.gif",
+}
+
+
+def is_ui_image(url: str, name: str) -> bool:
+    """Return True if *name* or *url* looks like a UI/icon asset."""
+    name = name.lower()
+    if name in UI_IMAGE_FILENAMES:
+        return True
+    patterns = ["/themes/", "/images/", "/icons/", "/button_", "/star", "/rating"]
+    if any(p in url for p in patterns):
+        return True
+    return False
+
+
+def is_probably_thumbnail(url: str) -> bool:
+    """Return True if the remote resource is very small (<4KB)."""
+    try:
+        r = session.head(url, timeout=5, allow_redirects=True)
+        length = int(r.headers.get("content-length", 0))
+        if 0 < length < 4096:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # --- Universal gallery adapter ----------------------------------------------
 
 DEFAULT_RULES = {
@@ -299,12 +334,26 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
             if full_img and full_img not in seen:
                 seen.add(full_img)
                 image_entries.append((os.path.basename(full_img), [full_img], detail_url))
-    entry_urls = [url for _, [url], _ in image_entries]
+    filtered_entries = []
+    for name, candidates, referer in image_entries:
+        main_url = candidates[0]
+        fname = os.path.basename(main_url.split("?")[0])
+        if is_ui_image(main_url, fname):
+            log(f"Skipping UI/icon image: {fname}")
+            continue
+        if is_probably_thumbnail(main_url):
+            log(f"Skipping small image (likely icon): {main_url}")
+            continue
+        filtered_entries.append((name, candidates, referer))
+
+    entry_urls = []
+    for _, candidates, _ in filtered_entries:
+        entry_urls.extend(candidates)
     img_hash = compute_hash_from_list(entry_urls)
     if album_url in page_cache:
-        page_cache[album_url]["images"] = image_entries
+        page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
-    return image_entries
+    return filtered_entries
 
 
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
@@ -943,15 +992,27 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     else:
         log("No images found in album after all strategies.")
 
+    filtered_entries = []
+    for name, candidates, referer in image_entries:
+        main_url = candidates[0]
+        fname = os.path.basename(main_url.split("?")[0])
+        if is_ui_image(main_url, fname):
+            log(f"Skipping UI/icon image: {fname}")
+            continue
+        if is_probably_thumbnail(main_url):
+            log(f"Skipping small image (likely icon): {main_url}")
+            continue
+        filtered_entries.append((name, candidates, referer))
+
     entry_urls = []
-    for _, candidates, _ in image_entries:
+    for _, candidates, _ in filtered_entries:
         entry_urls.extend(candidates)
     img_hash = compute_hash_from_list(entry_urls)
     if album_url in page_cache:
-        page_cache[album_url]["images"] = image_entries
+        page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
 
-    return image_entries
+    return filtered_entries
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None):
