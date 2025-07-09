@@ -291,7 +291,10 @@ def get_main_image_from_displayimage(displayimage_url):
 
 
 def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
-    """Return a list of (display_title, [image_url]) tuples for the album."""
+    """
+    Returns a list of (display_title, [image_url1, image_url2, ...]) for each image in the album,
+    trying all Coppermine extraction techniques, paginating if necessary, and only unique original images.
+    """
     if visited is None:
         visited = set()
     if album_url in visited:
@@ -301,30 +304,41 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     soup = get_soup(album_url)
     log = log or (lambda msg: None)
     image_entries = []
+    unique_urls = set()
 
+    # 1. Try JS fb_imagelist (if present, it's best)
     js_links = get_image_links_from_js(album_url)
     if js_links:
-        log(f"Found {len(js_links)} images via fb_imagelist (JS array).")
+        log(f"Found {len(js_links)} images via fb_imagelist.")
         for idx, url in enumerate(js_links, 1):
-            image_entries.append((f"Image {idx}", [url]))
-        return image_entries
+            if url and url not in unique_urls:
+                log(f"[DEBUG] fb_imagelist -> {url}")
+                image_entries.append((f"Image {idx}", [url]))
+                unique_urls.add(url)
 
+    # 2. Try all displayimage.php pages (these are "original" image pages)
     display_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
+        # only consider unique displayimage.php?album=...&pid=...
         if "displayimage.php" in href and "album=" in href and "pid=" in href:
             display_links.append(urljoin(album_url, href))
-    display_links = list(dict.fromkeys(display_links))
+    display_links = list(dict.fromkeys(display_links))  # dedupe
+    if display_links:
+        log(f"[DEBUG] Found {len(display_links)} displayimage links")
 
-    log(f"Found {len(display_links)} images in album by following displayimage.php links.")
     for idx, dlink in enumerate(display_links, 1):
         try:
             d_soup = get_soup(dlink)
+            # Try <img class="image" ...>
             img = d_soup.find("img", class_="image")
+            candidates = []
             if img and img.get("src"):
-                image_url = urljoin(dlink, img["src"])
-                image_entries.append((f"Image {idx}", [image_url]))
-                continue
+                url = urljoin(dlink, img["src"])
+                if url and url not in unique_urls:
+                    candidates.append(url)
+                    unique_urls.add(url)
+            # Fallback: biggest image on page
             imgs = d_soup.find_all("img")
             if imgs:
                 imgs = sorted(
@@ -333,10 +347,58 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                     reverse=True,
                 )
                 if imgs[0].get("src"):
-                    image_entries.append((f"Image {idx}", [urljoin(dlink, imgs[0]["src"])]))
+                    url = urljoin(dlink, imgs[0]["src"])
+                    if url and url not in unique_urls:
+                        candidates.append(url)
+                        unique_urls.add(url)
+            if candidates:
+                log(f"[DEBUG] displayimage {idx} -> {candidates}")
+                image_entries.append((f"Image (displayimage) {idx}", candidates))
         except Exception as e:
             log(f"[DEBUG] Error fetching images from {dlink}: {e}")
 
+    # 3. Direct <img> links that aren't thumbnails
+    for img in soup.find_all("img", src=True):
+        src = img["src"]
+        if (
+            "thumb" in src
+            or "/thumbs/" in src
+            or re.search(r"_(s|t|thumb)\.", src)
+        ):
+            continue
+        width = int(img.get("width", 0))
+        height = int(img.get("height", 0))
+        if width and height and (width < 300 or height < 200):
+            continue
+        url = urljoin(album_url, src)
+        if url and url not in unique_urls:
+            log(f"[DEBUG] img tag -> {url}")
+            image_entries.append((f"Image (img tag)", [url]))
+            unique_urls.add(url)
+
+    # 4. Direct <a> links to image files
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"\.(jpe?g|png|webp|gif)$", href, re.I):
+            url = urljoin(album_url, href)
+            if url and url not in unique_urls:
+                log(f"[DEBUG] a tag -> {url}")
+                image_entries.append((f"Image (a tag)", [url]))
+                unique_urls.add(url)
+
+    # 5. Pagination support (recurse for all "page=" links)
+    pagelinks = set()
+    for a in soup.find_all("a", href=True):
+        if "page=" in a["href"]:
+            pagelinks.add(urljoin(album_url, a["href"]))
+    for pl in pagelinks:
+        log(f"[DEBUG] pagination -> {pl}")
+        image_entries.extend(get_all_candidate_images_from_album(pl, log=log, visited=visited))
+
+    if image_entries:
+        log(f"Found {len(image_entries)} images total after all strategies.")
+    else:
+        log("No images found in album after all strategies.")
     return image_entries
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
