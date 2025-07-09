@@ -1171,6 +1171,17 @@ class GalleryRipperApp(tb.Window):
         self.version_label = ttk.Label(btf, text="Current version: " + get_git_version())
         self.version_label.pack(side="left", padx=6)
 
+        # -- Search/filter frame --
+        search_frame = ttk.Frame(control_frame)
+        search_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(search_frame, text="Search:").pack(side="left")
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
+        search_entry.pack(side="left", fill="x", expand=True)
+        self.search_var.trace_add("write", self.on_search)
+
+        self._all_albums = None
+
         paned = ttk.Panedwindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -1294,6 +1305,34 @@ class GalleryRipperApp(tb.Window):
         """Log from worker threads without touching tkinter from outside"""
         self.after(0, lambda m=msg: self.log(m))
 
+    def insert_album_nodes(self, albums):
+        """Insert the given albums into the tree under root."""
+        self.tree.delete(*self.tree.get_children())
+        self.selected_album_urls.clear()
+        self.item_to_album.clear()
+        self._prev_selection.clear()
+        for alb in albums:
+            img_count = alb.get("image_count", "?")
+            alb_id = self.tree.insert(
+                "",
+                "end",
+                text=f"\U0001F4F7 {alb['name']} ({img_count})",
+                open=False,
+            )
+            self.tree.set(alb_id, "sel", "\u25A1")
+            self.item_to_album[alb_id] = (alb['name'], alb['url'], [alb['name']])
+
+    def on_search(self, *args):
+        """Filter albums in the tree based on search."""
+        term = self.search_var.get().strip().lower()
+        if self._all_albums is None:
+            return
+        if not term:
+            albums = self._all_albums
+        else:
+            albums = [a for a in self._all_albums if term in a['name'].lower()]
+        self.insert_album_nodes(albums)
+
     def insert_tree_root_safe(self, tree_data):
         # Clear any previous items and related state before inserting a new tree
         # to avoid stale item IDs causing TclError callbacks
@@ -1302,6 +1341,11 @@ class GalleryRipperApp(tb.Window):
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self._prev_selection.clear()
+        if "albums" in tree_data:
+            self._all_albums = tree_data["albums"]
+            self.insert_album_nodes(self._all_albums)
+            return
+        self._all_albums = None
         self.insert_tree_node("", tree_data, [])
 
     def discover_albums(self):
