@@ -731,6 +731,9 @@ class GalleryRipperApp(tb.Window):
             self.insert_tree_node(node_id, child, node_path)
 
     def on_tree_select(self, event=None):
+        if getattr(self, "_ignore_next_select", False):
+            self._ignore_next_select = False
+            return
         for item in self.tree.selection():
             if item in self.item_to_album:
                 if item not in self.selected_album_urls:
@@ -749,13 +752,15 @@ class GalleryRipperApp(tb.Window):
             self.tree.item(item, open=not self.tree.item(item, "open"))
 
     def on_tree_click(self, event):
-        """Prevent selection changes when clicking expand/collapse arrow."""
+        """Allow expand/collapse, but ignore selection when clicking the arrow."""
         item = self.tree.identify_row(event.y)
         region = self.tree.identify("region", event.x, event.y)
         if region == "tree":
             bbox = self.tree.bbox(item)
             if bbox and event.x < bbox[0] + 20:
-                return "break"
+                self._ignore_next_select = True
+                return
+        self._ignore_next_select = False
 
     def select_all_leaf_albums(self):
         for item in self.item_to_album:
