@@ -136,6 +136,22 @@ def sanitize_name(name: str) -> str:
     cleaned = "".join(c for c in name if c.isalnum() or c in " _-").strip()
     return cleaned or "unnamed"
 
+def get_album_image_count(album_url, page_cache=None):
+    """Extract image count from album page (uses cache if present)."""
+    if page_cache is None:
+        page_cache = {}
+    html, _ = fetch_html_cached(album_url, page_cache, log=lambda m: None, quick_scan=False)
+    soup = BeautifulSoup(html, "html.parser")
+    filecount = None
+    info_div = soup.find(string=re.compile(r"files", re.I))
+    if info_div:
+        m = re.search(r"(\d+)\s+files?", info_div)
+        if m:
+            filecount = int(m.group(1))
+    if not filecount:
+        filecount = len(soup.find_all("a", href=re.compile(r"displayimage\.php")))
+    return filecount
+
 SPECIALS = [
     ("Last uploads", "lastup"),
     ("Last comments", "lastcom"),
@@ -231,8 +247,14 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 continue
             album_url = urljoin(root_url, href)
             if cat_id != album_id:
-                albums.append({"type": "album", "name": name, "url": album_url})
-                log(f"{indent}     Found album: {name}")
+                img_count = get_album_image_count(album_url, page_cache)
+                albums.append({
+                    "type": "album",
+                    "name": name,
+                    "url": album_url,
+                    "image_count": img_count,
+                })
+                log(f"{indent}     Found album: {name} ({img_count} images)")
 
     child_hash = compute_child_hash(subcats, albums)
     if root_url in page_cache:
@@ -1009,7 +1031,13 @@ class GalleryRipperApp(tb.Window):
                 self.item_to_album[spec_id] = (spec['name'], spec['url'], node_path + [spec['name']])
 
         for alb in node.get("albums", []):
-            alb_id = self.tree.insert(node_id, "end", text=f"\U0001F4F7 {alb['name']}", open=False)
+            img_count = alb.get("image_count", "?")
+            alb_id = self.tree.insert(
+                node_id,
+                "end",
+                text=f"\U0001F4F7 {alb['name']} ({img_count})",
+                open=False,
+            )
             self.tree.set(alb_id, "sel", "\u25A1")
             self.item_to_album[alb_id] = (alb['name'], alb['url'], node_path + [alb['name']])
 
