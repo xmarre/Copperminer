@@ -290,42 +290,67 @@ def get_main_image_from_displayimage(displayimage_url):
     return None
 
 
-def get_album_image_links(album_url, log=lambda msg: None, visited=None):
-    """Adaptive extraction of all image URLs from a Coppermine album."""
+def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None):
+    """
+    For an album page, return a list of (display_title, [candidate_image_urls]) for each image.
+    Each image may have multiple possible original URLs.
+    """
     if visited is None:
         visited = set()
     if album_url in visited:
         return []
     visited.add(album_url)
-
     soup = get_soup(album_url)
-    img_urls = set()
+    log = log or (lambda msg: None)
+    image_entries = []
 
-    # 1. JS variable fb_imagelist
+    # Try fb_imagelist first (for some galleries this is *all* images)
     js_links = get_image_links_from_js(album_url)
     if js_links:
-        log(f"Found {len(js_links)} images via fb_imagelist.")
-        return js_links
+        log(f"Found {len(js_links)} images via fb_imagelist (JS array).")
+        for idx, url in enumerate(js_links, 1):
+            image_entries.append((f"Image {idx}", [url]))
+        return image_entries
 
-    # 2. displayimage.php pages
+    # Try all displayimage.php links
     display_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "displayimage.php" in href and "album=" in href:
             display_links.append(urljoin(album_url, href))
+    display_links = list(dict.fromkeys(display_links))  # dedupe
+
     if display_links:
         log(f"Following {len(display_links)} displayimage.php links...")
-        for link in display_links:
+        for idx, dlink in enumerate(display_links, 1):
+            candidates = []
             try:
-                img = get_main_image_from_displayimage(link)
-                if img:
-                    img_urls.add(img)
+                d_soup = get_soup(dlink)
+                # 1. <a href="..."><img ...></a> — often the original/full-res
+                for a in d_soup.find_all("a", href=True):
+                    img = a.find("img")
+                    if img and img.get("src"):
+                        candidates.append(urljoin(dlink, a["href"]))
+                # 2. all large <img>
+                for img in d_soup.find_all("img"):
+                    src = img.get("src")
+                    if src and re.search(r'\.(jpe?g|png|gif|webp|bmp|tiff)$', src, re.I):
+                        candidates.append(urljoin(dlink, src))
+                # 3. <a href="..."> direct image links
+                for a in d_soup.find_all("a", href=True):
+                    if re.search(r'\.(jpe?g|png|gif|webp|bmp|tiff)$', a["href"], re.I):
+                        candidates.append(urljoin(dlink, a["href"]))
+                # Remove dups
+                candidates = list(dict.fromkeys(candidates))
             except Exception as e:
-                log(f"[DEBUG] Failed to get main image from {link}: {e}")
-        if img_urls:
-            return list(img_urls)
+                log(f"[DEBUG] Error fetching images from {dlink}: {e}")
+            if candidates:
+                image_entries.append((f"Image {idx}", candidates))
+        if image_entries:
+            return image_entries
 
-    # 3. Large <img> tags that are not thumbs
+    # 3. Fallback: large <img> tags not in thumbs
+    img_urls = []
     for img in soup.find_all("img", src=True):
         src = img["src"]
         if (
@@ -338,101 +363,106 @@ def get_album_image_links(album_url, log=lambda msg: None, visited=None):
         height = int(img.get("height", 0))
         if width and height and (width < 300 or height < 200):
             continue
-        img_urls.add(urljoin(album_url, src))
+        img_urls.append(urljoin(album_url, src))
     if img_urls:
         log(f"Found {len(img_urls)} images via <img> tags.")
-        return list(img_urls)
+        for idx, url in enumerate(img_urls, 1):
+            image_entries.append((f"Image {idx}", [url]))
+        return image_entries
 
-    # 4. Direct links to image files
+    # 4. Direct <a> links to images
+    img_urls = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if re.search(r"\.(jpe?g|png|webp|gif)$", href, re.I):
-            img_urls.add(urljoin(album_url, href))
+            img_urls.append(urljoin(album_url, href))
     if img_urls:
         log(f"Found {len(img_urls)} images via direct <a> links.")
-        return list(img_urls)
+        for idx, url in enumerate(img_urls, 1):
+            image_entries.append((f"Image {idx}", [url]))
+        return image_entries
 
-    # 5. Pagination recursion
+    # 5. Pagination recursion (grab all sub-pages)
     pagelinks = set()
     for a in soup.find_all("a", href=True):
         if "page=" in a["href"]:
             pagelinks.add(urljoin(album_url, a["href"]))
     for pl in pagelinks:
-        img_urls.update(get_album_image_links(pl, log=log, visited=visited))
-    if img_urls:
-        log(f"Found {len(img_urls)} images after pagination.")
-        return list(img_urls)
+        image_entries.extend(get_all_candidate_images_from_album(pl, log=log, visited=visited))
+
+    if image_entries:
+        log(f"Found {len(image_entries)} images after pagination.")
+        return image_entries
 
     log("No images found in album after all strategies.")
     return []
 
-def download_image(img_url, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
-    fname = os.path.basename(img_url.split("?")[0])
-    fpath = os.path.join(output_dir, fname)
-    if os.path.exists(fpath):
-        log(f"Already downloaded: {fname}")
-        if album_stats is not None:
-            album_stats['downloaded'] += 1
-        return
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = session.get(img_url, stream=True, timeout=20)
-            r.raise_for_status()
-            total_bytes = 0
-            start_time = time.time()
-            with open(fpath, "wb") as f:
-                for chunk in r.iter_content(1024 * 16):
-                    if chunk:
-                        f.write(chunk)
-                        total_bytes += len(chunk)
-            elapsed = time.time() - start_time
-            speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
-            size_str = (
-                f"{total_bytes / 1024 / 1024:.2f} MB"
-                if total_bytes > 1024 * 1024
-                else f"{total_bytes / 1024:.1f} KB"
-            )
-            speed_str = (
-                f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
-            )
-            prefix = ""
-            if index is not None and total is not None:
-                prefix = f"File {index} of {total}: "
-            log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
+def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
+    """Try each candidate until one downloads successfully as an image, otherwise count as failed."""
+    for candidate in candidate_urls:
+        fname = os.path.basename(candidate.split("?")[0])
+        fpath = os.path.join(output_dir, fname)
+        if os.path.exists(fpath):
+            log(f"Already downloaded: {fname}")
             if album_stats is not None:
-                album_stats['total_bytes'] += total_bytes
-                album_stats['total_time'] += elapsed
                 album_stats['downloaded'] += 1
-            return
-        except Exception as e:
-            if attempt < max_retries:
-                log(f"Error downloading {img_url}: {e} (retry {attempt}/{max_retries})")
-                time.sleep(1.0)
-            else:
-                log(f"FAILED to download after {max_retries} tries: {img_url} ({e})")
+            return True
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = session.get(candidate, stream=True, timeout=20)
+                r.raise_for_status()
+                # Only accept actual images!
+                if not r.headers.get("Content-Type", "").startswith("image"):
+                    raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
+                total_bytes = 0
+                start_time = time.time()
+                with open(fpath, "wb") as f:
+                    for chunk in r.iter_content(1024 * 16):
+                        if chunk:
+                            f.write(chunk)
+                            total_bytes += len(chunk)
+                elapsed = time.time() - start_time
+                speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
+                size_str = (
+                    f"{total_bytes / 1024 / 1024:.2f} MB"
+                    if total_bytes > 1024 * 1024
+                    else f"{total_bytes / 1024:.1f} KB"
+                )
+                speed_str = (
+                    f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+                )
+                prefix = ""
+                if index is not None and total is not None:
+                    prefix = f"File {index} of {total}: "
+                log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
                 if album_stats is not None:
-                    album_stats['errors'] += 1
+                    album_stats['total_bytes'] += total_bytes
+                    album_stats['total_time'] += elapsed
+                    album_stats['downloaded'] += 1
+                return True
+            except Exception as e:
+                if attempt < max_retries:
+                    log(f"Error downloading {candidate}: {e} (retry {attempt}/{max_retries})")
+                    time.sleep(1.0)
+                else:
+                    log(f"FAILED to download after {max_retries} tries: {candidate} ({e})")
+    # All candidates failed
+    if album_stats is not None:
+        album_stats['errors'] += 1
+    return False
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True):
-    """Download all images from the selected albums with batch-wide progress."""
-
+    """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(f"Will download {len(selected_albums)} album(s): {[a[0] for a in selected_albums]}")
-
     download_queue = []
     for album_name, album_url in selected_albums:
         log(f"\nScraping album: {album_name}")
-        image_links = get_album_image_links(album_url, log=log)
-        log(f"  Found {len(image_links)} images in {album_name}.")
-
-        if not image_links:
+        image_entries = get_all_candidate_images_from_album(album_url, log=log)
+        log(f"  Found {len(image_entries)} images in {album_name}.")
+        if not image_entries:
             continue
-
-        if mimic_human:
-            image_links = image_links.copy()
-            random.shuffle(image_links)
-
-        for img_url in image_links:
-            download_queue.append((album_name, album_url, img_url))
+        for entry_name, candidates in image_entries:
+            download_queue.append((album_name, album_url, candidates))
 
     total_images = len(download_queue)
     if total_images == 0:
@@ -449,7 +479,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
 
     log(f"Total images in queue: {total_images}")
 
-    for idx, (album_name, _, img_url) in enumerate(download_queue, 1):
+    for idx, (album_name, _, candidate_urls) in enumerate(download_queue, 1):
         if stats['downloaded'] > 0:
             avg_time = stats['total_time'] / stats['downloaded']
             eta = avg_time * (total_images - idx + 1)
@@ -465,8 +495,8 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
         )
         os.makedirs(outdir, exist_ok=True)
 
-        download_image(
-            img_url,
+        download_image_candidates(
+            candidate_urls,
             outdir,
             log,
             index=idx,
