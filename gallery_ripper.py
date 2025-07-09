@@ -655,18 +655,18 @@ class GalleryRipperApp(tb.Window):
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
 
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        control_frame = ttk.Frame(self)
+        control_frame.pack(fill="x", padx=10, pady=(10, 0))
 
-        urlf = ttk.Frame(frm)
+        urlf = ttk.Frame(control_frame)
         urlf.pack(fill="x")
         ttk.Label(urlf, text="Gallery Root URL:").pack(side="left")
         url_entry = ttk.Entry(urlf, textvariable=self.url_var, width=60)
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
 
-        pathf = ttk.Frame(frm)
-        pathf.pack(fill="x", pady=(8,0))
+        pathf = ttk.Frame(control_frame)
+        pathf.pack(fill="x", pady=(8, 0))
         ttk.Label(pathf, text="Download Folder:").pack(side="left")
         ttk.Entry(pathf, textvariable=self.path_var, width=50).pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(pathf, text="Browse...", command=self.select_folder).pack(side="left")
@@ -678,9 +678,18 @@ class GalleryRipperApp(tb.Window):
         self.show_specials_var = tk.BooleanVar(value=False)
         specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
         specials_chk.pack(side="left", padx=(10, 0))
+        btf = ttk.Frame(control_frame)
+        btf.pack(fill="x", pady=(8, 0))
+        ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
+        ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
+        ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
+        ttk.Button(btf, text="Stop", command=self.stop_download).pack(side="left", padx=8)
 
-        treeframe = ttk.LabelFrame(frm, text="Albums & Categories (expand/collapse and select leafs to download)")
-        treeframe.pack(fill="both", expand=True, pady=10)
+        paned = ttk.Panedwindow(self, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        treeframe = ttk.LabelFrame(paned, text="Albums & Categories (expand/collapse and select leafs to download)")
+        treeframe.pack(fill="both", expand=True, pady=0)
 
         self.tree = tb.Treeview(treeframe, show="tree", bootstyle="dark", selectmode="extended")
         ysb = ttk.Scrollbar(treeframe, orient="vertical", command=self.tree.yview)
@@ -696,16 +705,14 @@ class GalleryRipperApp(tb.Window):
         self.item_to_album = {}
         self._prev_selection = set()
 
-        btf = ttk.Frame(frm)
-        btf.pack(fill="x")
-        ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
-        ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
-        ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
-        ttk.Button(btf, text="Stop", command=self.stop_download).pack(side="left", padx=8)
-
-        self.log_box = ScrolledText(frm, height=10, state='disabled', font=("Consolas", 9),
+        logframe = ttk.LabelFrame(paned, text="Log")
+        logframe.pack(fill="both", expand=False, pady=0)
+        self.log_box = ScrolledText(logframe, height=10, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
-        self.log_box.pack(fill="both", expand=False, pady=(10, 0))
+        self.log_box.pack(fill="both", expand=True)
+
+        paned.add(treeframe, weight=3)
+        paned.add(logframe, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
