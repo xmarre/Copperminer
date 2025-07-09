@@ -7,12 +7,15 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Point-and-click GUI — No command line needed, always-on dark mode
 - Intelligent discovery — Enter any gallery root or album URL (works with multi-level Coppermine sites)
 - Album tree — Finds and displays all real albums for selection, ignoring “Last uploads”, “Most viewed”, and other virtual/special albums
+- Optional special galleries toggle — Include “Last uploads”, “Most viewed”, etc. only when you want them
 - Preserves structure — Downloads images into folders/subfolders that match the gallery’s layout
 - Download progress & log — See what’s happening at every step
+- Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
+- Resizable log panel — Drag to change how much space the log uses
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
-- Quick scan caching — Saves HTML of each visited page. Subsequent runs hit the network only if a page has changed or the cache expired.
+- Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
 - History dropdown — Quickly reopen recently scanned galleries from cache
-- “Mimic human behavior” — Optionally randomizes download order and timing to avoid hammering servers (toggle in the GUI)
+- “Mimic human behavior” — Adds random pauses between downloads to avoid hammering servers (toggle in the GUI)
 - Windows double-click support — via `start_gallery_ripper.bat`
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
