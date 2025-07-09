@@ -4,6 +4,7 @@ cd /d "%~dp0"
 
 REM Pull latest changes from repository
 if exist .git (
+    git remote set-url origin https://github.com/xmarre/Copperminer.git
     git pull
 ) else (
     echo This directory is not a Git repository.

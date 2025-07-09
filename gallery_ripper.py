@@ -50,6 +50,28 @@ def get_git_version():
         return "(unknown)"
 
 
+def ensure_https_remote(repo_dir):
+    """Ensure the git remote uses HTTPS rather than SSH."""
+    try:
+        subprocess.run(
+            [
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/xmarre/Copperminer.git",
+            ],
+            cwd=repo_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        # If this fails we still attempt the update normally
+        pass
+
+
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
@@ -1058,6 +1080,7 @@ class GalleryRipperApp(tb.Window):
 
     def start_git_update(self):
         repo_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        ensure_https_remote(repo_dir)
         self.log("Checking for updates via git...")
         try:
             prev_commit = subprocess.check_output(
