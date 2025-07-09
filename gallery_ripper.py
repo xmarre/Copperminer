@@ -101,8 +101,10 @@ DEFAULT_RULES = {
     "theplace-2com": {
         "domains": ["theplace-2.com"],
         "root_album_selector": "a[href^='/photos/'][href*='-pictures-'][href$='.htm']",
-        "pagination_selector": "div.pagination a[href]",
-        "thumb_selector": "a[href^='pic-']",
+        # Works for both mobile and desktop navigation
+        "pagination_selector": "nav[aria-label*='pagination'] a.page-link[href]",
+        # Each thumbnail link points to a pic-XXXXXX.html detail page
+        "thumb_selector": ".pic-card a.link[href*='pic-']",
         "detail_image_selector": ".big-photo-wrapper a[href]",
     },
 }
@@ -251,7 +253,6 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     image_entries = []
     seen = set()
     thumb_sel = rules.get("thumb_selector")
-    detail_sel = rules.get("detail_image_selector")
     for idx, page in enumerate(pages):
         if idx == 0:
             current_soup = soup
@@ -260,14 +261,22 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
             current_soup = BeautifulSoup(html, "html.parser")
         for a in current_soup.select(thumb_sel or ""):
             detail_url = urljoin(page, a.get("href", ""))
+            # Load the detail page to get the real image (not just the thumb)
             det_html, _ = fetch_html_cached(detail_url, page_cache, log=log, quick_scan=quick_scan)
             det_soup = BeautifulSoup(det_html, "html.parser")
-            big = det_soup.select_one(detail_sel or "")
-            if big:
-                img_url = urljoin(detail_url, big.get("href", ""))
-                if img_url and img_url not in seen:
-                    seen.add(img_url)
-                    image_entries.append((os.path.basename(img_url), [img_url], detail_url))
+            # Find the <a class="fancybox" href="..."> or the largest <img>
+            full_img = None
+            fancy = det_soup.select_one("a.fancybox[href]")
+            if fancy:
+                full_img = urljoin(detail_url, fancy["href"])
+            if not full_img:
+                img = det_soup.select_one("img")
+                if img and "src" in img.attrs:
+                    full_img = urljoin(detail_url, img["src"])
+            # Use filename as entry name
+            if full_img and full_img not in seen:
+                seen.add(full_img)
+                image_entries.append((os.path.basename(full_img), [full_img], detail_url))
     entry_urls = [url for _, [url], _ in image_entries]
     img_hash = compute_hash_from_list(entry_urls)
     if album_url in page_cache:
