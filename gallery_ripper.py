@@ -187,7 +187,7 @@ class GalleryRipperApp(ThemedTk):
         self.minsize(600, 450)
         self.resizable(True, True)
         self.albums = []
-        self.selected_vars = []
+        self.filtered_albums = []
         self.download_thread = None
 
         dark_bg = "#292929"
@@ -199,7 +199,6 @@ class GalleryRipperApp(ThemedTk):
         style.configure("TFrame", background=dark_bg)
         style.configure("TLabel", background=dark_bg, foreground=dark_fg)
         style.configure("TLabelFrame", background=dark_bg, foreground=accent_fg)
-        style.configure("TCheckbutton", background=dark_bg, foreground=dark_fg)
         style.configure("TButton", background="#323232", foreground=dark_fg)
         style.configure("Accent.TButton", background="#404060", foreground=dark_fg)
         style.configure("TLabelframe.Label", background=dark_bg, foreground=accent_fg)
@@ -255,47 +254,47 @@ class GalleryRipperApp(ThemedTk):
         mimic_chk.bind("<Enter>", show_tip)
         mimic_chk.bind("<Leave>", hide_tip)
 
-        # Albums List (Scrollable & fully resizable)
+        # --- Album filter/search ---
+        frm_filter = ttk.Frame(content)
+        frm_filter.grid(row=2, column=0, sticky="ew")
+        ttk.Label(frm_filter, text="Filter albums:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", self.apply_album_filter)
+        filter_entry = ttk.Entry(frm_filter, textvariable=self.filter_var, width=30)
+        filter_entry.pack(side="left", padx=(5, 0))
+        ttk.Button(frm_filter, text="Clear", command=lambda: self.filter_var.set("")).pack(side="left", padx=5)
+
+        # Albums Listbox (ultrafast, supports thousands)
         self.chkfrm = ttk.LabelFrame(content, text="Select Albums to Download")
-        self.chkfrm.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
-        content.rowconfigure(2, weight=4)
+        self.chkfrm.grid(row=3, column=0, sticky="nsew", pady=(0, 5))
+        content.rowconfigure(3, weight=4)  # albums list gets most vertical space
         content.columnconfigure(0, weight=1)
-        # Top "Select All" checkbox
-        self.top_select_all_var = tk.BooleanVar(value=True)
-        top_cb = ttk.Checkbutton(self.chkfrm, text="Select All", variable=self.top_select_all_var, command=self.top_select_all_toggle)
-        top_cb.grid(row=0, column=0, sticky="w", padx=(2, 2), pady=(0, 2))
-        self.chkfrm.rowconfigure(1, weight=1)
+        self.chkfrm.rowconfigure(0, weight=1)
         self.chkfrm.columnconfigure(0, weight=1)
 
-        # Canvas for scrolling
-        self.canvas = tk.Canvas(self.chkfrm, borderwidth=0, highlightthickness=0, bg=dark_bg)
-        self.scrollbar = ttk.Scrollbar(self.chkfrm, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        self.scrollbar.grid(row=1, column=1, sticky="ns")
-        self.chkfrm.rowconfigure(1, weight=1)
+        self.album_listbox = tk.Listbox(self.chkfrm, selectmode="extended", exportselection=False, bg=dark_bg, fg=dark_fg,
+                                        activestyle='dotbox', highlightthickness=0, relief='flat')
+        self.album_scrollbar = ttk.Scrollbar(self.chkfrm, orient="vertical", command=self.album_listbox.yview)
+        self.album_listbox.config(yscrollcommand=self.album_scrollbar.set)
+        self.album_listbox.grid(row=0, column=0, sticky="nsew")
+        self.album_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.chkfrm.rowconfigure(0, weight=1)
         self.chkfrm.columnconfigure(0, weight=1)
 
-        # Select/Unselect All
+        # Select all/unselect all buttons
         frm_sel = ttk.Frame(content)
-        frm_sel.grid(row=3, column=0, sticky="ew", pady=(0, 5))
-        ttk.Button(frm_sel, text="Select All", command=lambda: self.set_all_checks(True)).pack(side="left")
-        ttk.Button(frm_sel, text="Unselect All", command=lambda: self.set_all_checks(False)).pack(side="left")
+        frm_sel.grid(row=4, column=0, sticky="ew", padx=10, pady=2)
+        ttk.Button(frm_sel, text="Select All", command=lambda: self.album_listbox.select_set(0, tk.END)).pack(side="left")
+        ttk.Button(frm_sel, text="Unselect All", command=lambda: self.album_listbox.select_clear(0, tk.END)).pack(side="left")
 
         # Download Button (sticks to bottom but above log)
-        ttk.Button(content, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=4, column=0, pady=5, sticky="ew")
+        ttk.Button(content, text="Start Download", command=self.start_download, style="Accent.TButton").grid(row=5, column=0, pady=5, sticky="ew")
 
         # Info Log (fully resizable with window)
         self.log_box = ScrolledText(content, height=7, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
-        self.log_box.grid(row=5, column=0, sticky="nsew")
-        content.rowconfigure(5, weight=2)
+        self.log_box.grid(row=6, column=0, sticky="nsew")
+        content.rowconfigure(6, weight=2)  # log area expands as window grows
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -309,16 +308,15 @@ class GalleryRipperApp(ThemedTk):
         self.log_box.configure(state='disabled')
         self.update_idletasks()
 
-    def clear_album_checks(self):
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.selected_vars = []
-        self.top_select_all_var.set(True)
-
-    def top_select_all_toggle(self):
-        val = self.top_select_all_var.get()
-        for var in self.selected_vars:
-            var.set(val)
+    def apply_album_filter(self, *args):
+        """Filters the album listbox live as the user types."""
+        query = self.filter_var.get().lower().strip()
+        self.album_listbox.delete(0, tk.END)
+        self.filtered_albums = []
+        for (name, url) in self.albums:
+            if name and (not query or query in name.lower()):
+                self.album_listbox.insert(tk.END, name)
+                self.filtered_albums.append((name, url))
 
     def discover_albums(self):
         url = self.url_entry.get().strip()
@@ -326,7 +324,8 @@ class GalleryRipperApp(ThemedTk):
             messagebox.showwarning("Missing URL", "Please enter the gallery URL.")
             return
         self.log(f"Discovering albums from: {url}")
-        self.clear_album_checks()
+        self.album_listbox.delete(0, tk.END)
+        self.albums = []
         try:
             global BASE_URL
             BASE_URL = url.split('/index.php')[0] + '/'
@@ -335,21 +334,10 @@ class GalleryRipperApp(ThemedTk):
                 self.log("No albums found.")
                 return
             self.albums = albums
-            for i, (name, _) in enumerate(albums):
-                if not name:
-                    continue
-                var = tk.BooleanVar(value=True)
-                cb = ttk.Checkbutton(self.scrollable_frame, text=name, variable=var)
-                cb.pack(fill="x", anchor="w", padx=2, pady=0)
-                self.selected_vars.append(var)
+            self.apply_album_filter()
             self.log(f"Found {len([a for a in albums if a[0]])} albums.")
-            self.top_select_all_var.set(True)
         except Exception as e:
             self.log(f"Failed to discover albums: {e}")
-
-    def set_all_checks(self, value):
-        for var in self.selected_vars:
-            var.set(value)
 
     def start_download(self):
         if self.download_thread and self.download_thread.is_alive():
@@ -359,7 +347,10 @@ class GalleryRipperApp(ThemedTk):
         if not output_dir:
             messagebox.showwarning("Missing folder", "Please select a download folder.")
             return
-        selected = [(name, url) for (name, url), var in zip(self.albums, self.selected_vars) if var.get()]
+        # Only download selected albums
+        selected_indices = self.album_listbox.curselection()
+        # Always use filtered list to map names to URLs
+        selected = [self.filtered_albums[i] for i in selected_indices] if hasattr(self, "filtered_albums") and self.filtered_albums else [self.albums[i] for i in selected_indices]
         if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
