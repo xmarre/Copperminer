@@ -44,7 +44,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -73,7 +73,54 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     visited.add(root_url)
     log(f"{indent}→ Crawling: {root_url}")
 
-    soup = get_soup(root_url)
+    if page_cache is None:
+        page_cache = {}
+
+    def fetch_html(url):
+        entry = page_cache.get(url)
+        if entry and quick_scan:
+            headers = {}
+            if entry.get("etag"):
+                headers["If-None-Match"] = entry["etag"]
+            if entry.get("last_modified"):
+                headers["If-Modified-Since"] = entry["last_modified"]
+            try:
+                r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
+                if r.status_code == 304:
+                    entry["timestamp"] = time.time()
+                    log(f"{indent}Using cached page (304): {url}")
+                    return entry["html"]
+                if r.status_code == 200:
+                    et = r.headers.get("ETag")
+                    lm = r.headers.get("Last-Modified")
+                    if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
+                        entry["timestamp"] = time.time()
+                        log(f"{indent}Using cached page (headers match): {url}")
+                        return entry["html"]
+            except Exception:
+                pass
+            if time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
+                log(f"{indent}Using cached page (not expired): {url}")
+                return entry["html"]
+
+        if entry and not quick_scan and time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
+            log(f"{indent}Using cached page: {url}")
+            return entry["html"]
+
+        resp = session.get(url)
+        resp.raise_for_status()
+        html = resp.text
+        page_cache[url] = {
+            "html": html,
+            "timestamp": time.time(),
+            "etag": resp.headers.get("ETag"),
+            "last_modified": resp.headers.get("Last-Modified"),
+        }
+        log(f"{indent}Fetched: {url}")
+        return html
+
+    html = fetch_html(root_url)
+    soup = BeautifulSoup(html, "html.parser")
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
 
@@ -123,6 +170,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             log=log,
             depth=depth + 1,
             visited=visited,
+            page_cache=page_cache,
+            quick_scan=quick_scan,
         )
         if child:
             node['children'].append(child)
@@ -156,89 +205,37 @@ def site_cache_path(root_url):
     return os.path.join(CACHE_DIR, f"{h}.json")
 
 
-def compute_subtree_checksum(node):
-    """Recursively compute checksum for a tree node."""
-    m = hashlib.sha1()
-    m.update(node["name"].encode("utf-8"))
-    m.update(node["url"].encode("utf-8"))
-    for album in sorted(node.get("albums", []), key=lambda x: x["url"]):
-        m.update(album["name"].encode("utf-8"))
-        m.update(album["url"].encode("utf-8"))
-    for spec in sorted(node.get("specials", []), key=lambda x: x["url"]):
-        m.update(spec["name"].encode("utf-8"))
-        m.update(spec["url"].encode("utf-8"))
-    for child in sorted(node.get("children", []), key=lambda x: x["url"]):
-        m.update(compute_subtree_checksum(child).encode("utf-8"))
-    return m.hexdigest()
-
-
-def load_gallery_tree_cache(root_url):
+def load_page_cache(root_url):
+    """Return the per-page cache and previously saved tree for *root_url*."""
     path = site_cache_path(root_url)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-        if time.time() - cache.get("timestamp", 0) < CACHE_EXPIRY:
-            return cache.get("tree"), cache.get("checksums", {})
-    return None, {}
+            data = json.load(f)
+        pages = data.get("pages", {})
+        tree = data.get("tree")
+        timestamp = data.get("timestamp", 0)
+        if time.time() - timestamp < CACHE_EXPIRY:
+            return pages, tree
+    return {}, None
 
 
-def save_gallery_tree_cache(root_url, tree, checksums):
+def save_page_cache(root_url, tree, pages):
     path = site_cache_path(root_url)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({
-            "timestamp": time.time(),
-            "tree": tree,
-            "checksums": checksums,
-        }, f, indent=2)
+        json.dump({"timestamp": time.time(), "tree": tree, "pages": pages}, f, indent=2)
 
 
-def build_checksums_dict(node, checksums):
-    csum = compute_subtree_checksum(node)
-    checksums[node["url"]] = csum
-    for child in node.get("children", []):
-        build_checksums_dict(child, checksums)
-
-
-def refresh_changed_subtrees(root_url, cached_node, checksums, log, depth=0):
-    indent = "  " * depth
-    try:
-        fresh_node = discover_tree(cached_node["url"], parent_title=cached_node["name"], log=log, depth=depth)
-    except Exception as e:
-        log(f"{indent}Failed to refresh {cached_node['name']}: {e}")
-        return cached_node
-
-    fresh_csum = compute_subtree_checksum(fresh_node)
-    cached_csum = checksums.get(cached_node["url"])
-    if fresh_csum == cached_csum:
-        log(f"{indent}No changes in {cached_node['name']}")
-        return cached_node
-
-    log(f"{indent}Refreshing changed subtree: {cached_node['name']}")
-    url_to_cached = {c["url"]: c for c in cached_node.get("children", [])}
-    for i, child in enumerate(fresh_node.get("children", [])):
-        c_url = child["url"]
-        if c_url in url_to_cached:
-            fresh_node["children"][i] = refresh_changed_subtrees(root_url, url_to_cached[c_url], checksums, log, depth + 1)
-    return fresh_node
-
-
-def discover_or_load_gallery_tree(root_url, log):
-    log("Looking for cache...")
-    cached_tree, checksums = load_gallery_tree_cache(root_url)
-    if cached_tree:
-        log("Cache found, checking for changes...")
-        updated_tree = refresh_changed_subtrees(root_url, cached_tree, checksums, log)
-        new_checksums = {}
-        build_checksums_dict(updated_tree, new_checksums)
-        save_gallery_tree_cache(root_url, updated_tree, new_checksums)
-        return updated_tree
-    else:
-        log("No valid cache, building full gallery tree (this may take a while)...")
-        tree = discover_tree(root_url, log=log)
-        checksums = {}
-        build_checksums_dict(tree, checksums)
-        save_gallery_tree_cache(root_url, tree, checksums)
-        return tree
+def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=False):
+    """Discover galleries using cached pages when possible."""
+    pages, cached_tree = load_page_cache(root_url)
+    if force_refresh:
+        log("Forcing full refresh (ignoring cache)...")
+        pages = {}
+    elif cached_tree:
+        log("Cache found; using quick scan" if quick_scan else "Cache found.")
+    tree = discover_tree(root_url, log=log, page_cache=pages, quick_scan=quick_scan)
+    save_page_cache(root_url, tree, pages)
+    return tree
 
 def get_image_links_from_js(album_url):
     """Extract image URLs from the fb_imagelist JavaScript variable."""
@@ -678,6 +675,10 @@ class GalleryRipperApp(tb.Window):
         self.show_specials_var = tk.BooleanVar(value=False)
         specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
         specials_chk.pack(side="left", padx=(10, 0))
+
+        self.quick_scan_var = tk.BooleanVar(value=True)
+        quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
+        quick_chk.pack(side="left", padx=(10, 0))
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
@@ -748,12 +749,13 @@ class GalleryRipperApp(tb.Window):
             return
         self.thread_safe_log(f"Discovering albums from: {url}")
         self.tree.delete(*self.tree.get_children())
-        self.discovery_thread = threading.Thread(target=self.do_discover, args=(url,), daemon=True)
+        quick = self.quick_scan_var.get()
+        self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
         self.discovery_thread.start()
 
-    def do_discover(self, url):
+    def do_discover(self, url, quick):
         try:
-            tree_data = discover_or_load_gallery_tree(url, self.thread_safe_log)
+            tree_data = discover_or_load_gallery_tree(url, self.thread_safe_log, quick_scan=quick, force_refresh=not quick)
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
