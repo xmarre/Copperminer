@@ -478,9 +478,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             fpath = os.path.join(output_dir, fname)
             if os.path.exists(fpath):
                 log(f"Already downloaded: {fname}")
-                if album_stats is not None:
-                    album_stats['downloaded'] += 1
-                return True
+                return False
             try:
                 headers = {'Referer': referer} if referer else {}
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
@@ -577,7 +575,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
         )
         os.makedirs(outdir, exist_ok=True)
 
-        download_image_candidates(
+        was_downloaded = download_image_candidates(
             candidate_urls,
             outdir,
             log,
@@ -587,7 +585,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
             referer=referer,
         )
 
-        if mimic_human:
+        if was_downloaded and mimic_human:
             time.sleep(random.uniform(0.7, 2.5))
             if idx % random.randint(18, 28) == 0:
                 log("...taking a longer break to mimic human behavior...")
