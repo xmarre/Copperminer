@@ -28,6 +28,11 @@ def get_soup(url):
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
+def sanitize_name(name: str) -> str:
+    """Return a filesystem-safe version of *name*."""
+    cleaned = "".join(c for c in name if c.isalnum() or c in " _-").strip()
+    return cleaned or "unnamed"
+
 SPECIALS = [
     ("Last uploads", "lastup"),
     ("Last comments", "lastcom"),
@@ -520,9 +525,13 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
-    log(f"Will download {len(selected_albums)} album(s): {[a[0] for a in selected_albums]}")
+    log(
+        "Will download {} album(s): {}".format(
+            len(selected_albums), ["/".join(a[2]) for a in selected_albums]
+        )
+    )
     download_queue = []
-    for album_name, album_url in selected_albums:
+    for album_name, album_url, album_path in selected_albums:
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
             return
@@ -532,7 +541,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
         if not image_entries:
             continue
         for entry_name, candidates, referer in image_entries:
-            download_queue.append((album_name, album_url, candidates, referer))
+            download_queue.append((album_name, album_path, candidates, referer))
 
     total_images = len(download_queue)
     if total_images == 0:
@@ -549,7 +558,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
 
     log(f"Total images in queue: {total_images}")
 
-    for idx, (album_name, _, candidate_urls, referer) in enumerate(download_queue, 1):
+    for idx, (album_name, album_path, candidate_urls, referer) in enumerate(download_queue, 1):
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
             return
@@ -564,7 +573,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True, stop_flag
 
         outdir = os.path.join(
             output_root,
-            "".join([c for c in album_name if c.isalnum() or c in " _-"]).strip() or "unnamed"
+            *[sanitize_name(p) for p in album_path],
         )
         os.makedirs(outdir, exist_ok=True)
 
@@ -675,7 +684,7 @@ class GalleryRipperApp(tb.Window):
 
     def insert_tree_root_safe(self, tree_data):
         self.tree.delete(*self.tree.get_children())
-        self.insert_tree_node("", tree_data)
+        self.insert_tree_node("", tree_data, [])
 
     def discover_albums(self):
         url = self.url_var.get().strip()
@@ -699,24 +708,26 @@ class GalleryRipperApp(tb.Window):
         except Exception as e:
             self.after(0, lambda: self.log(f"Discovery failed: {e}"))
 
-    def insert_tree_node(self, parent, node):
+    def insert_tree_node(self, parent, node, path=None):
+        path = path or []
         label = node["name"]
         is_cat = node["type"] == "category"
         node_icon = "\U0001F4C1" if is_cat else "\U0001F4F7"
         node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
+        node_path = path + [label]
 
         for spec in node.get("specials", []):
             spec_id = self.tree.insert(node_id, "end", text=f"\u2605 {spec['name']}", open=False)
             self.tree.set(spec_id, "sel", "\u25A1")
-            self.item_to_album[spec_id] = (spec['name'], spec['url'])
+            self.item_to_album[spec_id] = (spec['name'], spec['url'], node_path + [spec['name']])
 
         for alb in node.get("albums", []):
             alb_id = self.tree.insert(node_id, "end", text=f"\U0001F4F7 {alb['name']}", open=False)
             self.tree.set(alb_id, "sel", "\u25A1")
-            self.item_to_album[alb_id] = (alb['name'], alb['url'])
+            self.item_to_album[alb_id] = (alb['name'], alb['url'], node_path + [alb['name']])
 
         for child in node.get("children", []):
-            self.insert_tree_node(node_id, child)
+            self.insert_tree_node(node_id, child, node_path)
 
     def on_tree_select(self, event=None):
         for item in self.tree.selection():
