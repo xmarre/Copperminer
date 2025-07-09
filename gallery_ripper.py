@@ -173,6 +173,103 @@ def get_image_links_from_js(album_url):
         print(f"[DEBUG] Error parsing fb_imagelist: {e}")
         return []
 
+
+def get_main_image_from_displayimage(displayimage_url):
+    """Return the main image URL from a displayimage.php page."""
+    soup = get_soup(displayimage_url)
+    img = soup.find("img", class_="image")
+    if img and img.get("src"):
+        return urljoin(displayimage_url, img["src"])
+
+    imgs = soup.find_all("img")
+    if not imgs:
+        return None
+    imgs = sorted(
+        imgs,
+        key=lambda i: int(i.get("width", 0)) * int(i.get("height", 0)),
+        reverse=True,
+    )
+    if imgs[0].get("src"):
+        return urljoin(displayimage_url, imgs[0]["src"])
+    return None
+
+
+def get_album_image_links(album_url, log=lambda msg: None, visited=None):
+    """Adaptive extraction of all image URLs from a Coppermine album."""
+    if visited is None:
+        visited = set()
+    if album_url in visited:
+        return []
+    visited.add(album_url)
+
+    soup = get_soup(album_url)
+    img_urls = set()
+
+    # 1. JS variable fb_imagelist
+    js_links = get_image_links_from_js(album_url)
+    if js_links:
+        log(f"Found {len(js_links)} images via fb_imagelist.")
+        return js_links
+
+    # 2. displayimage.php pages
+    display_links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "displayimage.php" in href and "album=" in href:
+            display_links.append(urljoin(album_url, href))
+    if display_links:
+        log(f"Following {len(display_links)} displayimage.php links...")
+        for link in display_links:
+            try:
+                img = get_main_image_from_displayimage(link)
+                if img:
+                    img_urls.add(img)
+            except Exception as e:
+                log(f"[DEBUG] Failed to get main image from {link}: {e}")
+        if img_urls:
+            return list(img_urls)
+
+    # 3. Large <img> tags that are not thumbs
+    for img in soup.find_all("img", src=True):
+        src = img["src"]
+        if (
+            "thumb" in src
+            or "/thumbs/" in src
+            or re.search(r"_(s|t|thumb)\.", src)
+        ):
+            continue
+        width = int(img.get("width", 0))
+        height = int(img.get("height", 0))
+        if width and height and (width < 300 or height < 200):
+            continue
+        img_urls.add(urljoin(album_url, src))
+    if img_urls:
+        log(f"Found {len(img_urls)} images via <img> tags.")
+        return list(img_urls)
+
+    # 4. Direct links to image files
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"\.(jpe?g|png|webp|gif)$", href, re.I):
+            img_urls.add(urljoin(album_url, href))
+    if img_urls:
+        log(f"Found {len(img_urls)} images via direct <a> links.")
+        return list(img_urls)
+
+    # 5. Pagination recursion
+    pagelinks = set()
+    for a in soup.find_all("a", href=True):
+        if "page=" in a["href"]:
+            pagelinks.add(urljoin(album_url, a["href"]))
+    for pl in pagelinks:
+        img_urls.update(get_album_image_links(pl, log=log, visited=visited))
+    if img_urls:
+        log(f"Found {len(img_urls)} images after pagination.")
+        return list(img_urls)
+
+    log("No images found in album after all strategies.")
+    return []
+
 def download_image(img_url, output_dir, log, index=None, total=None, album_stats=None, max_retries=3):
     fname = os.path.basename(img_url.split("?")[0])
     fpath = os.path.join(output_dir, fname)
@@ -228,7 +325,7 @@ def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     download_queue = []
     for album_name, album_url in selected_albums:
         log(f"\nScraping album: {album_name}")
-        image_links = get_image_links_from_js(album_url)
+        image_links = get_album_image_links(album_url, log=log)
         log(f"  Found {len(image_links)} images in {album_name}.")
 
         if not image_links:

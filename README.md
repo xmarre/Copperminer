@@ -9,6 +9,7 @@ No thumbnails—just full images, organized by album.
 - Enter any gallery root or album URL (works with multi-level Coppermine sites)
 - Finds all albums/galleries, lists them for selection
 - Download progress and info log
+- Adaptive scraping engine handles custom Coppermine themes and plugins
 - Windows double-click support via `start_gallery_ripper.bat`
 - Compatible with Python 3.10+
 - Always-on Equilux dark theme
