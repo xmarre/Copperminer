@@ -82,43 +82,101 @@ def get_image_links_from_js(album_url):
         print(f"[DEBUG] Error parsing fb_imagelist: {e}")
         return []
 
-def download_image(img_url, output_dir, log):
+def download_image(img_url, output_dir, log, index=None, total=None, album_stats=None):
     fname = os.path.basename(img_url.split("?")[0])
     fpath = os.path.join(output_dir, fname)
     if os.path.exists(fpath):
         log(f"Already downloaded: {fname}")
+        if album_stats is not None:
+            album_stats['downloaded'] += 1
         return
     try:
         r = session.get(img_url, stream=True)
         r.raise_for_status()
+        total_bytes = 0
+        start_time = time.time()
         with open(fpath, "wb") as f:
-            for chunk in r.iter_content(1024):
-                f.write(chunk)
-        log(f"Downloaded: {fname}")
+            for chunk in r.iter_content(1024 * 16):
+                if chunk:
+                    f.write(chunk)
+                    total_bytes += len(chunk)
+        elapsed = time.time() - start_time
+        speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0  # KB/s
+        size_str = (
+            f"{total_bytes / 1024 / 1024:.2f} MB"
+            if total_bytes > 1024 * 1024
+            else f"{total_bytes / 1024:.1f} KB"
+        )
+        speed_str = (
+            f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+        )
+        prefix = ""
+        if index is not None and total is not None:
+            prefix = f"File {index} of {total}: "
+        log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
+        if album_stats is not None:
+            album_stats['total_bytes'] += total_bytes
+            album_stats['total_time'] += elapsed
+            album_stats['downloaded'] += 1
     except Exception as e:
         log(f"Error downloading {img_url}: {e}")
+        if album_stats is not None:
+            album_stats['errors'] += 1
 
 def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     for album_name, album_url in selected_albums:
         safe_name = "".join([c for c in album_name if c.isalnum() or c in " _-"]).strip() or "unnamed"
         outdir = os.path.join(output_root, safe_name)
         os.makedirs(outdir, exist_ok=True)
-        log(f"Scraping album: {album_name}")
+        log(f"\nScraping album: {album_name}")
         image_links = get_image_links_from_js(album_url)
         log(f"  Found {len(image_links)} images in {album_name}.")
+
+        if not image_links:
+            continue
 
         if mimic_human:
             image_links = image_links.copy()
             random.shuffle(image_links)
 
-        for idx, img_url in enumerate(image_links):
-            download_image(img_url, outdir, log)
+        album_stats = {
+            'total_bytes': 0,
+            'total_time': 0.0,
+            'downloaded': 0,
+            'errors': 0,
+            'album_start': time.time(),
+        }
+
+        total = len(image_links)
+        for idx, img_url in enumerate(image_links, 1):
+            if idx > 1 and album_stats['total_time'] > 0:
+                avg_time = album_stats['total_time'] / (idx - 1)
+                eta = avg_time * (total - idx + 1)
+                eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
+            else:
+                eta_str = ""
+            log(f"File {idx} of {total}{eta_str}...")
+
+            download_image(
+                img_url, outdir, log,
+                index=idx, total=total,
+                album_stats=album_stats
+            )
+
             if mimic_human:
                 time.sleep(random.uniform(0.7, 2.5))
-                if (idx + 1) % random.randint(18, 28) == 0:
+                if (idx) % random.randint(18, 28) == 0:
                     log("...taking a longer break to mimic human behavior...")
                     time.sleep(random.uniform(5, 8))
-        log(f"Done with album: {album_name}")
+
+        total_mb = album_stats['total_bytes'] / 1024 / 1024
+        album_time = time.time() - album_stats['album_start']
+        avg_speed = total_mb / album_time if album_time > 0 else 0
+        log(
+            f"Finished album: {album_name}\n"
+            f"  Downloaded {album_stats['downloaded']} files, {total_mb:.2f} MB in {album_time:.1f}s\n"
+            f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {album_stats['errors']}"
+        )
 
 # ---------- GUI ----------
 class GalleryRipperApp(ThemedTk):
