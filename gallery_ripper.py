@@ -126,6 +126,8 @@ def download_image(img_url, output_dir, log, index=None, total=None, album_stats
 def rip_galleries(selected_albums, output_root, log, mimic_human=True):
     """Download all images from the selected albums with batch-wide progress."""
 
+    log(f"Will download {len(selected_albums)} album(s): {[a[0] for a in selected_albums]}")
+
     download_queue = []
     for album_name, album_url in selected_albums:
         log(f"\nScraping album: {album_name}")
@@ -365,15 +367,13 @@ class GalleryRipperApp(ThemedTk):
         if not output_dir:
             messagebox.showwarning("Missing folder", "Please select a download folder.")
             return
-        # Only download selected albums
         selected_indices = self.album_listbox.curselection()
-        # Always use filtered list to map names to URLs
-        selected = [self.filtered_albums[i] for i in selected_indices] if hasattr(self, "filtered_albums") and self.filtered_albums else [self.albums[i] for i in selected_indices]
-        if not selected:
+        albums_to_download = [self.filtered_albums[i] for i in selected_indices]
+        if not albums_to_download:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
         self.log("Starting download...")
-        self.download_thread = threading.Thread(target=self.download_worker, args=(selected, output_dir), daemon=True)
+        self.download_thread = threading.Thread(target=self.download_worker, args=(albums_to_download, output_dir), daemon=True)
         self.download_thread.start()
 
     def download_worker(self, selected, output_dir):
