@@ -665,6 +665,7 @@ class GalleryRipperApp(tb.Window):
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
+        self.tree.bind("<Button-1>", self.on_tree_click)
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -747,8 +748,20 @@ class GalleryRipperApp(tb.Window):
         if self.tree.get_children(item):
             self.tree.item(item, open=not self.tree.item(item, "open"))
 
+    def on_tree_click(self, event):
+        """Prevent selection changes when clicking expand/collapse arrow."""
+        item = self.tree.identify_row(event.y)
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "tree":
+            bbox = self.tree.bbox(item)
+            if bbox and event.x < bbox[0] + 20:
+                return "break"
+
     def select_all_leaf_albums(self):
         for item in self.item_to_album:
+            label = self.tree.item(item, "text")
+            if label.lstrip().startswith("\u2605"):
+                continue
             self.selected_album_urls.add(item)
             self.tree.selection_add(item)
             self.tree.set(item, "sel", "\u2611")
