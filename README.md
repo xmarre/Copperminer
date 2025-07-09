@@ -25,7 +25,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 
 1. Install Python 3.10 or newer. [Download here.](https://www.python.org/downloads/)
 2. Clone or download this repository.
-3. On Windows, run `setup_gallery_ripper.bat` to set up everything.
+3. On Windows, run `setup_gallery_ripper.bat` to set up everything. To update the tool later, run `update_gallery_ripper.bat`.
 4. On other platforms, follow these manual steps:
 
    Create and activate a virtual environment:
