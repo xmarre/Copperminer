@@ -675,6 +675,10 @@ class GalleryRipperApp(tb.Window):
         mimic_chk = ttk.Checkbutton(pathf, text="Mimic human behavior", variable=self.mimic_var)
         mimic_chk.pack(side="left", padx=(10, 0))
 
+        self.show_specials_var = tk.BooleanVar(value=False)
+        specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
+        specials_chk.pack(side="left", padx=(10, 0))
+
         treeframe = ttk.LabelFrame(frm, text="Albums & Categories (expand/collapse and select leafs to download)")
         treeframe.pack(fill="both", expand=True, pady=10)
 
@@ -756,10 +760,11 @@ class GalleryRipperApp(tb.Window):
         node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
         node_path = path + [label]
 
-        for spec in node.get("specials", []):
-            spec_id = self.tree.insert(node_id, "end", text=f"\u2605 {spec['name']}", open=False)
-            self.tree.set(spec_id, "sel", "\u25A1")
-            self.item_to_album[spec_id] = (spec['name'], spec['url'], node_path + [spec['name']])
+        if self.show_specials_var.get():
+            for spec in node.get("specials", []):
+                spec_id = self.tree.insert(node_id, "end", text=f"\u2605 {spec['name']}", open=False)
+                self.tree.set(spec_id, "sel", "\u25A1")
+                self.item_to_album[spec_id] = (spec['name'], spec['url'], node_path + [spec['name']])
 
         for alb in node.get("albums", []):
             alb_id = self.tree.insert(node_id, "end", text=f"\U0001F4F7 {alb['name']}", open=False)
@@ -768,6 +773,10 @@ class GalleryRipperApp(tb.Window):
 
         for child in node.get("children", []):
             self.insert_tree_node(node_id, child, node_path)
+
+    def refresh_tree(self):
+        if self.albums_tree_data:
+            self.insert_tree_root_safe(self.albums_tree_data)
 
     def on_tree_select(self, event=None):
         if getattr(self, "_ignore_next_select", False):
