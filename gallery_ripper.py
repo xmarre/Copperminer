@@ -17,6 +17,21 @@ import subprocess
 import sys
 import glob
 
+SETTINGS_FILE = "settings.json"
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
     h = hashlib.sha1()
@@ -870,6 +885,9 @@ class GalleryRipperApp(tb.Window):
 
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
+        settings = load_settings()
+        if "download_folder" in settings:
+            self.path_var.set(settings["download_folder"])
 
         control_frame = ttk.Frame(self)
         control_frame.pack(fill="x", padx=10, pady=(10, 0))
@@ -946,6 +964,9 @@ class GalleryRipperApp(tb.Window):
         folder = filedialog.askdirectory()
         if folder:
             self.path_var.set(folder)
+            settings = load_settings()
+            settings["download_folder"] = folder
+            save_settings(settings)
 
     def show_history(self):
         history = list_cached_galleries()
