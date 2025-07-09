@@ -7,6 +7,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 from ttkthemes import ThemedTk
+import re
+import json
 
 BASE_URL = ""  # Will be set from GUI
 session = requests.Session()
@@ -44,29 +46,35 @@ def find_albums(url, visited=None):
                 albums.extend(find_albums(full_url, visited))
     return albums
 
-def get_displayimage_links(album_url):
+def get_image_links_from_js(album_url):
+    """
+    Extracts image URLs from the Coppermine gallery's embedded fb_imagelist JavaScript object.
+    Returns a list of full image URLs.
+    """
     soup = get_soup(album_url)
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a['href']
-        if href.startswith('displayimage.php') and 'album=' in href:
-            full_link = urljoin(album_url, href)
-            if full_link not in links:
-                links.append(full_link)
-    return links
-
-def get_full_image_url(displayimage_url):
-    soup = get_soup(displayimage_url)
-    img = soup.find('img', class_="image")
-    if img:
-        src = img.get('src')
-        return urljoin(displayimage_url, src)
-    # fallback: largest img
-    imgs = soup.find_all('img')
-    if imgs:
-        imgs = sorted(imgs, key=lambda i: int(i.get('width', 0)) * int(i.get('height', 0)), reverse=True)
-        return urljoin(displayimage_url, imgs[0]['src'])
-    return None
+    js_var_pattern = re.compile(r'var\s+js_vars\s*=\s*({.*?});', re.DOTALL)
+    match = js_var_pattern.search(soup.text)
+    if not match:
+        return []
+    js_vars_json = match.group(1)
+    try:
+        js_vars_json = js_vars_json.replace('\n', '')
+        js_vars_json = re.sub(r'(\w+):', r'"\1":', js_vars_json)
+        js_vars = json.loads(js_vars_json)
+        fb_imagelist = js_vars.get("fb_imagelist", [])
+        base = album_url.split("/thumbnails.php")[0]
+        image_urls = []
+        for img in fb_imagelist:
+            src = img.get("src")
+            if src and not src.startswith("http"):
+                full_url = base + "/" + src.replace("\\/", "/").lstrip("/")
+            else:
+                full_url = src
+            image_urls.append(full_url)
+        return image_urls
+    except Exception as e:
+        print("Error parsing fb_imagelist:", e)
+        return []
 
 def download_image(img_url, output_dir, log):
     fname = os.path.basename(img_url.split("?")[0])
@@ -90,14 +98,10 @@ def rip_galleries(selected_albums, output_root, log):
         outdir = os.path.join(output_root, safe_name)
         os.makedirs(outdir, exist_ok=True)
         log(f"Scraping album: {album_name}")
-        display_links = get_displayimage_links(album_url)
-        log(f"  Found {len(display_links)} images in {album_name}.")
-        for link in display_links:
-            img_url = get_full_image_url(link)
-            if img_url:
-                download_image(img_url, outdir, log)
-            else:
-                log(f"  [!] No image found at: {link}")
+        image_links = get_image_links_from_js(album_url)
+        log(f"  Found {len(image_links)} images in {album_name}.")
+        for img_url in image_links:
+            download_image(img_url, outdir, log)
         log(f"Done with album: {album_name}")
 
 # ---------- GUI ----------
@@ -156,7 +160,11 @@ class GalleryRipperApp(ThemedTk):
         self.chkfrm.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
         content.rowconfigure(2, weight=4)
         content.columnconfigure(0, weight=1)
-        self.chkfrm.rowconfigure(0, weight=1)
+        # Top "Select All" checkbox
+        self.top_select_all_var = tk.BooleanVar(value=True)
+        top_cb = ttk.Checkbutton(self.chkfrm, text="Select All", variable=self.top_select_all_var, command=self.top_select_all_toggle)
+        top_cb.grid(row=0, column=0, sticky="w", padx=(2, 2), pady=(0, 2))
+        self.chkfrm.rowconfigure(1, weight=1)
         self.chkfrm.columnconfigure(0, weight=1)
 
         # Canvas for scrolling
@@ -169,9 +177,9 @@ class GalleryRipperApp(ThemedTk):
         )
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.scrollbar.grid(row=0, column=1, sticky="ns")
-        self.chkfrm.rowconfigure(0, weight=1)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.scrollbar.grid(row=1, column=1, sticky="ns")
+        self.chkfrm.rowconfigure(1, weight=1)
         self.chkfrm.columnconfigure(0, weight=1)
 
         # Select/Unselect All
@@ -205,6 +213,12 @@ class GalleryRipperApp(ThemedTk):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.selected_vars = []
+        self.top_select_all_var.set(True)
+
+    def top_select_all_toggle(self):
+        val = self.top_select_all_var.get()
+        for var in self.selected_vars:
+            var.set(val)
 
     def discover_albums(self):
         url = self.url_entry.get().strip()
@@ -229,6 +243,7 @@ class GalleryRipperApp(ThemedTk):
                 cb.pack(fill="x", anchor="w", padx=2, pady=0)
                 self.selected_vars.append(var)
             self.log(f"Found {len([a for a in albums if a[0]])} albums.")
+            self.top_select_all_var.set(True)
         except Exception as e:
             self.log(f"Failed to discover albums: {e}")
 
