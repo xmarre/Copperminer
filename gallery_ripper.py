@@ -55,6 +55,9 @@ VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
 )
 DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
 
+# Global flag to control proxy usage
+USE_PROXIES = settings.get("use_proxies", True)
+
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
     h = hashlib.sha1()
@@ -158,7 +161,7 @@ def is_probably_thumbnail(url: str) -> bool:
     """Return True if the remote resource is very small (<4KB)."""
     try:
         status, headers = run_async(
-            async_http.head_with_proxy(url, proxy_pool, headers=session_headers, timeout=5)
+            async_http.head_with_proxy(url, get_pool_or_none(), headers=session_headers, timeout=5)
         )
         length = int(headers.get("content-length", 0))
         if 0 < length < 4096:
@@ -412,7 +415,9 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
             status, hdrs = run_async(
-                async_http.head_with_proxy(url, proxy_pool, headers={**session_headers, **headers}, timeout=10)
+                async_http.head_with_proxy(
+                    url, get_pool_or_none(), headers={**session_headers, **headers}, timeout=10
+                )
             )
             if status == 304:
                 entry["timestamp"] = time.time()
@@ -436,7 +441,7 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         return entry["html"], False
 
     html, hdrs = run_async(
-        async_http.fetch_html(url, proxy_pool, headers=session_headers, timeout=15)
+        async_http.fetch_html(url, get_pool_or_none(), headers=session_headers, timeout=15)
     )
     page_cache[url] = {
         "html": html,
@@ -460,6 +465,11 @@ proxy_pool = ProxyPool(
     fast_fill=DOWNLOAD_WORKERS,
     validation_concurrency=VALIDATION_CONCURRENCY,
 )
+
+
+def get_pool_or_none():
+    """Return the proxy pool if proxies are enabled."""
+    return proxy_pool if USE_PROXIES else None
 
 def _proxy_thread():
     async def runner():
@@ -486,7 +496,9 @@ def run_async(coro):
 CACHE_DIR = ".coppermine_cache"
 
 def get_soup(url):
-    html, _ = run_async(async_http.fetch_html(url, proxy_pool, headers=session_headers))
+    html, _ = run_async(
+        async_http.fetch_html(url, get_pool_or_none(), headers=session_headers)
+    )
     return BeautifulSoup(html, "html.parser")
 
 def sanitize_name(name: str) -> str:
@@ -856,7 +868,7 @@ def _fetch_fullsize_image(full_url, log):
     """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
     try:
         html, hdrs = run_async(
-            async_http.fetch_html(full_url, proxy_pool, headers=session_headers)
+            async_http.fetch_html(full_url, get_pool_or_none(), headers=session_headers)
         )
         if hdrs.get("Content-Type", "").startswith("image"):
             return [full_url]
@@ -1131,7 +1143,7 @@ async def download_image_candidates(
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
                 start_time = time.time()
                 success = await async_http.download_with_proxy(
-                    candidate, fpath, proxy_pool, referer=referer
+                    candidate, fpath, get_pool_or_none(), referer=referer
                 )
                 if not success:
                     raise Exception("Download failed")
@@ -1318,6 +1330,15 @@ class GalleryRipperApp(tb.Window):
         self.quick_scan_var = tk.BooleanVar(value=True)
         quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
+
+        self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", True))
+        proxies_chk = ttk.Checkbutton(
+            pathf,
+            text="Use proxies",
+            variable=self.use_proxies_var,
+            command=self.on_use_proxies_toggle,
+        )
+        proxies_chk.pack(side="left", padx=(10, 0))
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
@@ -1730,6 +1751,14 @@ class GalleryRipperApp(tb.Window):
             run_async(proxy_pool.refresh())
             self.after(0, self.update_proxy_status)
         threading.Thread(target=do_refresh, daemon=True).start()
+
+    def on_use_proxies_toggle(self):
+        """Handle toggling of the Use proxies checkbox."""
+        global USE_PROXIES
+        USE_PROXIES = self.use_proxies_var.get()
+        settings = load_settings()
+        settings["use_proxies"] = USE_PROXIES
+        save_settings(settings)
 
     def update_proxy_status(self):
         count = len(proxy_pool.pool)
