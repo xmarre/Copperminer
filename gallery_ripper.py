@@ -4,6 +4,7 @@ import asyncio
 import warnings
 import argparse
 import logging
+from typing import Any
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import tkinter as tk
@@ -231,7 +232,7 @@ def universal_get_album_pages(album_url, rules, page_cache, log=lambda msg: None
     generate the full list of page URLs.
     """
     html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     print(f"[DEBUG] Soup loaded, proxies: {USE_PROXIES}")
 
     pages = set([album_url])
@@ -270,7 +271,7 @@ def universal_get_album_image_count(album_url, rules, page_cache=None):
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=lambda m: None, quick_scan=False)
-            current_soup = BeautifulSoup(html, "html.parser")
+            current_soup = safe_soup(html)
         if thumb_sel:
             count += len(current_soup.select(thumb_sel))
     return count
@@ -280,7 +281,7 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     title_tag = soup.find("h1") or soup.find("title")
     gallery_title = title_tag.text.strip() if title_tag else root_url
     node = {
@@ -376,12 +377,12 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=log, quick_scan=quick_scan)
-            current_soup = BeautifulSoup(html, "html.parser")
+            current_soup = safe_soup(html)
         for a in current_soup.select(thumb_sel or ""):
             detail_url = urljoin(page, a.get("href", ""))
             # Load the detail page to get the real image (not just the thumb)
             det_html, _ = fetch_html_cached(detail_url, page_cache, log=log, quick_scan=quick_scan)
-            det_soup = BeautifulSoup(det_html, "html.parser")
+            det_soup = safe_soup(det_html)
             # Find the <a class="fancybox" href="..."> or the largest <img>
             full_img = None
             fancy = det_soup.select_one("a.fancybox[href]")
@@ -523,11 +524,45 @@ def run_async(coro):
 
 CACHE_DIR = ".coppermine_cache"
 
+def safe_soup(html: str, parser: str = "html.parser", timeout: float = 5.0):
+    """Parse *html* safely using BeautifulSoup with a timeout.
+
+    When the builtin ``html.parser`` occasionally hangs on malformed input,
+    we fall back to the ``html5lib`` parser instead of blocking indefinitely.
+    """
+
+    result: list[Any] = []
+
+    def _worker() -> None:
+        try:
+            result.append(BeautifulSoup(html, parser))
+        except Exception as e:  # pragma: no cover - best effort
+            result.append(e)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        logging.getLogger("ripper.parser").warning(
+            "[WARN] html.parser timeout; falling back to html5lib"
+        )
+        return BeautifulSoup(html, "html5lib")
+
+    soup_or_exc = result[0]
+    if isinstance(soup_or_exc, Exception):
+        logging.getLogger("ripper.parser").warning(
+            "[WARN] html.parser failed (%s); using html5lib", soup_or_exc
+        )
+        return BeautifulSoup(html, "html5lib")
+    return soup_or_exc
+
+
 def get_soup(url):
     html, _ = run_async(
         async_http.fetch_html(url, get_pool_or_none(), headers=session_headers)
     )
-    return BeautifulSoup(html, "html.parser")
+    return safe_soup(html)
 
 def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
@@ -539,7 +574,7 @@ def get_album_image_count(album_url, page_cache=None):
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(album_url, page_cache, log=lambda m: None, quick_scan=False)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     filecount = None
     info_div = soup.find(string=re.compile(r"files", re.I))
     if info_div:
@@ -597,7 +632,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         page_cache = {}
 
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
 
@@ -839,7 +874,7 @@ def get_image_links_from_js(album_url):
 def extract_album_image_links(html, album_url):
     """Return list of image or displayimage links found in album HTML."""
     links = []
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "displayimage.php" in href and "pid=" in href:
@@ -900,7 +935,7 @@ def _fetch_fullsize_image(full_url, log):
         )
         if hdrs.get("Content-Type", "").startswith("image"):
             return [full_url]
-        sub = BeautifulSoup(html, "html.parser")
+        sub = safe_soup(html)
         base = get_base_for_relative_images(full_url)
         img = sub.find("img")
         if img and img.get("src"):
@@ -1028,7 +1063,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         log(f"[DEBUG] Using cached image list for {album_url}")
         return entry["images"]
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = safe_soup(html)
     log = log or (lambda msg: None)
     image_entries = []
     unique_urls = set()
