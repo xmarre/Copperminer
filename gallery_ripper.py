@@ -1289,7 +1289,7 @@ class GalleryRipperApp(tb.Window):
     def __init__(self):
         super().__init__(themename="darkly")
         self.title("Coppermine Gallery Ripper")
-        self.geometry("980x700")
+        self.geometry("1000x700")
         self.minsize(700, 480)
         self.albums_tree_data = None
         self.download_thread = None
@@ -1319,21 +1319,24 @@ class GalleryRipperApp(tb.Window):
         ttk.Entry(pathf, textvariable=self.path_var, width=50).pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(pathf, text="Browse...", command=self.select_folder).pack(side="left")
 
+        optionsf = ttk.Frame(control_frame)
+        optionsf.pack(fill="x")
+
         self.mimic_var = tk.BooleanVar(value=True)
-        mimic_chk = ttk.Checkbutton(pathf, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk = ttk.Checkbutton(optionsf, text="Mimic human behavior", variable=self.mimic_var)
         mimic_chk.pack(side="left", padx=(10, 0))
 
         self.show_specials_var = tk.BooleanVar(value=False)
-        specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
+        specials_chk = ttk.Checkbutton(optionsf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
         specials_chk.pack(side="left", padx=(10, 0))
 
         self.quick_scan_var = tk.BooleanVar(value=True)
-        quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
+        quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
 
         self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", True))
         proxies_chk = ttk.Checkbutton(
-            pathf,
+            optionsf,
             text="Use proxies",
             variable=self.use_proxies_var,
             command=self.on_use_proxies_toggle,

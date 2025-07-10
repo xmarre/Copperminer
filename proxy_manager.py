@@ -127,13 +127,13 @@ class ProxyPool:
 
     async def validate_proxy(self, proxy: str) -> bool:
         async with self.sema:
-            for test_url in ["http://httpbin.org/ip", "https://httpbin.org/ip"]:
+            for test_url in ["http://github.com", "https://github.com"]:
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
                             test_url, proxy=f"http://{proxy}", timeout=15
                         ) as resp:
-                            if resp.status == 200:
+                            if resp.status in {200, 301, 302}:
                                 print(f"[PROXY] OK: {proxy} on {test_url}")
                                 return True
                 except Exception:
