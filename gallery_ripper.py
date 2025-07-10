@@ -2,6 +2,7 @@ import os
 import threading
 import asyncio
 import warnings
+import argparse
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import tkinter as tk
@@ -34,6 +35,25 @@ def load_settings():
 def save_settings(settings):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+
+
+# -- Configuration ------------------------------------------------------------
+settings = load_settings()
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--min-proxies", type=int, help="Minimum working proxies")
+parser.add_argument(
+    "--validation-concurrency",
+    type=int,
+    help="Concurrent proxy validation tasks",
+)
+parser.add_argument("--download-workers", type=int, help="Concurrent downloads")
+args, _ = parser.parse_known_args()
+
+MIN_PROXIES = args.min_proxies or settings.get("min_proxies", 40)
+VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
+    "proxy_validation_concurrency", 30
+)
+DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -435,7 +455,11 @@ session_headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 }
 
-proxy_pool = ProxyPool()
+proxy_pool = ProxyPool(
+    min_proxies=MIN_PROXIES,
+    fast_fill=DOWNLOAD_WORKERS,
+    validation_concurrency=VALIDATION_CONCURRENCY,
+)
 
 def _proxy_thread():
     async def runner():
@@ -1064,8 +1088,16 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
     return filtered_entries
 
-def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
-                             album_stats=None, max_attempts=3, referer=None):
+async def download_image_candidates(
+    candidate_urls,
+    output_dir,
+    log,
+    index=None,
+    total=None,
+    album_stats=None,
+    max_attempts=3,
+    referer=None,
+):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -1098,8 +1130,8 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             try:
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
                 start_time = time.time()
-                success = run_async(
-                    async_http.download_with_proxy(candidate, fpath, proxy_pool, referer=referer)
+                success = await async_http.download_with_proxy(
+                    candidate, fpath, proxy_pool, referer=referer
                 )
                 if not success:
                     raise Exception("Download failed")
@@ -1124,15 +1156,25 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             except Exception as e:
                 log(f"Error downloading {candidate}: {e}")
         if block_attempt < max_attempts:
-            log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
-            time.sleep(1.0)
+            log(
+                f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods."
+            )
+            await asyncio.sleep(1.0)
         else:
             log(f"FAILED to download after {max_attempts} attempts: {candidate_urls}")
             if album_stats is not None:
                 album_stats['errors'] += 1
     return False
 
-def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
+async def rip_galleries(
+    selected_albums,
+    output_root,
+    log,
+    root_url,
+    quick_scan=True,
+    mimic_human=True,
+    stop_flag=None,
+):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
         "Will download {} album(s): {}".format(
@@ -1177,9 +1219,10 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
 
     log(f"Total images in queue: {total_images}")
 
-    for idx, (album_name, album_path, candidate_urls, referer) in enumerate(download_queue, 1):
+    sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
+
+    async def worker(idx, album_name, album_path, candidate_urls, referer):
         if stop_flag and stop_flag.is_set():
-            log("Download stopped by user.")
             return
         if stats['downloaded'] > 0:
             avg_time = stats['total_time'] / stats['downloaded']
@@ -1196,21 +1239,29 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
         )
         os.makedirs(outdir, exist_ok=True)
 
-        was_downloaded = download_image_candidates(
-            candidate_urls,
-            outdir,
-            log,
-            index=idx,
-            total=total_images,
-            album_stats=stats,
-            referer=referer,
-        )
+        async with sem:
+            was_downloaded = await download_image_candidates(
+                candidate_urls,
+                outdir,
+                log,
+                index=idx,
+                total=total_images,
+                album_stats=stats,
+                referer=referer,
+            )
 
         if was_downloaded and mimic_human:
-            time.sleep(random.uniform(0.7, 2.5))
+            await asyncio.sleep(random.uniform(0.7, 2.5))
             if idx % random.randint(18, 28) == 0:
                 log("...taking a longer break to mimic human behavior...")
-                time.sleep(random.uniform(5, 8))
+                await asyncio.sleep(random.uniform(5, 8))
+
+    tasks = [
+        asyncio.create_task(worker(idx, alb, path, urls, ref))
+        for idx, (alb, path, urls, ref) in enumerate(download_queue, 1)
+    ]
+
+    await asyncio.gather(*tasks)
 
     total_mb = stats['total_bytes'] / 1024 / 1024
     elapsed = time.time() - stats['start_time']
@@ -1702,18 +1753,20 @@ class GalleryRipperApp(tb.Window):
 
     def download_worker(self, selected, output_dir, root_url):
         try:
-            rip_galleries(
-                selected,
-                output_dir,
-                self.log,
-                root_url,
-                quick_scan=self.quick_scan_var.get(),
-                mimic_human=self.mimic_var.get(),
-                stop_flag=self.stop_flag,
+            run_async(
+                rip_galleries(
+                    selected,
+                    output_dir,
+                    self.thread_safe_log,
+                    root_url,
+                    quick_scan=self.quick_scan_var.get(),
+                    mimic_human=self.mimic_var.get(),
+                    stop_flag=self.stop_flag,
+                )
             )
-            self.log("All downloads finished or stopped!")
+            self.thread_safe_log("All downloads finished or stopped!")
         except Exception as e:
-            self.log(f"Download error: {e}")
+            self.thread_safe_log(f"Download error: {e}")
         finally:
             self.stop_flag.clear()
 

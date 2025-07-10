@@ -58,9 +58,22 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 
    On any platform:
 
-   ```bash
-   python gallery_ripper.py
-   ```
+  ```bash
+  python gallery_ripper.py
+  ```
+
+### Command-line options
+
+The ripper now supports a few optional flags to control proxy usage and
+download concurrency:
+
+```bash
+python gallery_ripper.py --min-proxies 50 --validation-concurrency 20 --download-workers 4
+```
+
+- `--min-proxies` – minimum number of working proxies to keep in the pool
+- `--validation-concurrency` – how many proxies to validate in parallel
+- `--download-workers` – number of concurrent image download tasks
 
 ## License
 
