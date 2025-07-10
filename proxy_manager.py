@@ -9,6 +9,7 @@ import logging
 from typing import Callable, Optional
 
 log = logging.getLogger("ripper.proxy")
+log.setLevel(logging.INFO)
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -103,6 +104,7 @@ class ProxyPool:
         if not self.pool_ready:
             self.pool_ready = True
             self.ready_event.set()
+            log.info("[PROXY] Ready with %d proxies", len(self.pool))
             if self.ready_callback:
                 try:
                     self.ready_callback()
@@ -256,4 +258,5 @@ class ProxyPool:
                 await self.replenish()
 
         if not self.refresh_task:
+            log.info("[PROXY] Auto refresh every %d seconds", interval)
             self.refresh_task = asyncio.create_task(auto_refresh())
