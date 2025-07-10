@@ -1372,6 +1372,14 @@ class GalleryRipperApp(tb.Window):
         quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
 
+        self.verbose_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            optionsf,
+            text="Verbose",
+            variable=self.verbose_var,
+            command=self._toggle_verbose,
+        ).pack(side="left", padx=(10, 0))
+
         self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", True))
         proxies_chk = ttk.Checkbutton(
             optionsf,
@@ -1443,6 +1451,7 @@ class GalleryRipperApp(tb.Window):
         for h in list(root_logger.handlers):
             root_logger.removeHandler(h)
         handler = logging.StreamHandler(self.log_stream)
+        handler.setLevel(LOG_LEVEL)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
         root_logger.addHandler(handler)
@@ -1812,6 +1821,13 @@ class GalleryRipperApp(tb.Window):
         settings = load_settings()
         settings["use_proxies"] = USE_PROXIES
         save_settings(settings)
+
+    def _toggle_verbose(self):
+        lvl = logging.DEBUG if self.verbose_var.get() else logging.INFO
+        root = logging.getLogger()
+        root.setLevel(lvl)
+        for h in root.handlers:
+            h.setLevel(lvl)
 
     def update_proxy_status(self):
         count = len(proxy_pool.pool)
