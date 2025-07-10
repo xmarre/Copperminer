@@ -380,11 +380,11 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
                     return entry["html"], False
         except Exception:
             pass
-        if time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
-            log(f"{indent}Using cached page (not expired): {url}")
-            return entry["html"], False
+        # No expiration check: always use cached page if above conditions aren't met
+        log(f"{indent}Using cached page: {url}")
+        return entry["html"], False
 
-    if entry and not quick_scan and time.time() - entry.get("timestamp", 0) < CACHE_EXPIRY:
+    if entry and not quick_scan:
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
@@ -407,7 +407,6 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
-CACHE_EXPIRY = 60 * 60 * 24 * 7  # 1 week
 
 def get_soup(url):
     resp = session.get(url)
@@ -600,9 +599,7 @@ def load_page_cache(root_url):
             data = json.load(f)
         pages = data.get("pages", {})
         tree = data.get("tree")
-        timestamp = data.get("timestamp", 0)
-        if time.time() - timestamp < CACHE_EXPIRY:
-            return pages, tree
+        return pages, tree
     return {}, None
 
 
