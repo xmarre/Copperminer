@@ -1,6 +1,7 @@
 import os
 import threading
 import asyncio
+import warnings
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import tkinter as tk
@@ -16,6 +17,8 @@ import hashlib
 import subprocess
 import sys
 import glob
+
+warnings.filterwarnings("ignore", category=ResourceWarning)
 
 SETTINGS_FILE = "settings.json"
 
@@ -1679,7 +1682,15 @@ class GalleryRipperApp(tb.Window):
 
     def update_proxy_status(self):
         count = len(proxy_pool.pool)
-        self.proxy_status.set(f"Proxies available: {count} | Last refresh: {time.strftime('%H:%M:%S')}")
+        if count == 0:
+            self.proxy_status.set("Searching for working proxies… (may take a minute)")
+        else:
+            ts = "N/A"
+            if proxy_pool.last_checked:
+                ts = time.strftime("%H:%M:%S", time.localtime(proxy_pool.last_checked))
+            self.proxy_status.set(
+                f"Proxies available: {count} | Last checked: {ts}"
+            )
         if hasattr(self, "proxy_listbox"):
             self.proxy_listbox.delete(0, tk.END)
             for proxy in proxy_pool.pool[:15]:
