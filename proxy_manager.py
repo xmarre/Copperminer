@@ -140,14 +140,16 @@ class ProxyPool:
         print(f"[PROXY] BAD: {proxy}")
         return False
 
-    async def _finish_tasks(self, tasks: dict[asyncio.Task, str]) -> None:
-        """Background task to finalize validation of *tasks*."""
+    async def _finish_tasks(self, tasks: list[asyncio.Task]) -> None:
+        """Background task to finalize validation of remaining proxy checks."""
         for t in tasks:
+            proxy = getattr(t, "proxy", None)
+            if proxy is None:
+                continue
             try:
                 ok = await t
             except Exception:
                 ok = False
-            proxy = tasks[t]
             self.cache.update(proxy, "good" if ok else "bad")
             if ok and proxy not in self.pool:
                 self.pool.append(proxy)
@@ -174,24 +176,41 @@ class ProxyPool:
 
             raw = await self.fetch_proxies()
             to_test = [p for p in raw if self.cache.should_test(p)]
-            task_map = {asyncio.create_task(self.validate_proxy(p)): p for p in to_test}
-            good_found = 0
 
-            for fut in asyncio.as_completed(list(task_map.keys())):
-                ok = await fut
-                proxy = task_map[fut]
-                self.cache.update(proxy, "good" if ok else "bad")
-                if ok and proxy not in self.pool:
-                    self.pool.append(proxy)
-                    good_found += 1
-                    if good_found >= fast_fill:
-                        self._signal_ready()
-                        break
+            tasks = []
+            for p in to_test:
+                t = asyncio.create_task(self.validate_proxy(p))
+                t.proxy = p  # type: ignore[attr-defined]
+                tasks.append(t)
+
+            good_found = 0
+            pending = set(tasks)
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    proxy = getattr(t, "proxy", None)
+                    if proxy is None:
+                        continue
+                    try:
+                        ok = t.result()
+                    except Exception:
+                        ok = False
+                    self.cache.update(proxy, "good" if ok else "bad")
+                    if ok and proxy not in self.pool:
+                        self.pool.append(proxy)
+                        good_found += 1
+                        if good_found >= fast_fill:
+                            pending = set()
+                            break
+                if good_found >= fast_fill:
+                    break
 
             # Continue validating remaining proxies in background
-            remaining = {t: p for t, p in task_map.items() if not t.done()}
-            if remaining:
-                asyncio.create_task(self._finish_tasks(remaining))
+            if pending:
+                asyncio.create_task(self._finish_tasks(list(pending)))
 
             # Remove duplicates, limit pool size
             self.pool = list(dict.fromkeys(self.pool))
