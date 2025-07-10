@@ -468,8 +468,12 @@ proxy_pool = ProxyPool(
 
 
 def get_pool_or_none():
-    """Return the proxy pool if proxies are enabled."""
-    return proxy_pool if USE_PROXIES else None
+    """Return the proxy pool only when it's ready and proxies are enabled."""
+    if not USE_PROXIES:
+        return None
+    if proxy_pool.pool_ready and proxy_pool.pool:
+        return proxy_pool
+    return None
 
 def _proxy_thread():
     async def runner():
