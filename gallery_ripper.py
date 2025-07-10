@@ -407,6 +407,10 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
+    # Skip the costly HEAD check when proxies are enabled and a cached entry exists
+    if entry and quick_scan and USE_PROXIES:
+        log(f"{indent}Using cached page (skipping proxy HEAD): {url}")
+        return entry["html"], False
     if entry and quick_scan:
         pool = get_pool_or_none()
         if USE_PROXIES and pool is None:

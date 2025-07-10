@@ -2,14 +2,14 @@ import aiohttp
 import asyncio
 from proxy_manager import ProxyPool
 
-async def head_with_proxy(url, proxy_pool: ProxyPool | None, headers=None, timeout=10):
+async def head_with_proxy(url, proxy_pool: ProxyPool | None, headers=None, timeout=5):
     headers = headers or {}
     if proxy_pool is None:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.head(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
                 return resp.status, dict(resp.headers)
-    for attempt in range(5):
+    for attempt in range(3):
         proxy = await proxy_pool.get_proxy()
         proxy_url = f"http://{proxy}"
         try:
