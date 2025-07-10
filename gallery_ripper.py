@@ -460,9 +460,12 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
+    pool = get_pool_or_none()
+    log(f"{indent}[DEBUG] Fetching {url} using proxy: {pool}")
     html, hdrs = run_async(
-        async_http.fetch_html(url, get_pool_or_none(), headers=session_headers, timeout=15)
+        async_http.fetch_html(url, pool, headers=session_headers, timeout=15)
     )
+    log(f"{indent}[DEBUG] Finished fetching {url}")
     page_cache[url] = {
         "html": html,
         "timestamp": time.time(),

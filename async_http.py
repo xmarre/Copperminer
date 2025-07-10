@@ -48,6 +48,7 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
         if proxy_pool:
             proxy = await proxy_pool.get_proxy()
             proxy_url = f"http://{proxy}"
+        log.debug("Attempting %s via %s", url, proxy_url if proxy else "DIRECT")
         t0 = time.time()
         try:
             log.info("[%s %d/%d] %s via %s", label, attempt, attempts,
@@ -62,10 +63,12 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
                 ) as r:
                     log.info("[HTTP] %s -> %s in %.1fs",
                              url, r.status, time.time() - t0)
+                    log.debug("Fetched %s via %s", url, proxy_url if proxy else "DIRECT")
                     if r.status == 200:
                         return await r.text(), dict(r.headers)
         except Exception as e:
             log.info("[HTTP-ERR] %s via %s : %s", url, proxy or "DIRECT", e)
+            log.debug("Attempt failed for %s via %s", url, proxy_url if proxy else "DIRECT")
             if proxy_pool and proxy:
                 await proxy_pool.remove_proxy(proxy)
     raise Exception(f"Failed to fetch {url}")
@@ -78,6 +81,7 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
         if proxy_pool:
             proxy = await proxy_pool.get_proxy()
             proxy_url = f"http://{proxy}"
+        log.debug("Attempting image %s via %s", url, proxy_url if proxy else "DIRECT")
         try:
             log.info("[IMG %d/%d] %s via %s", attempt, attempts, url, proxy or "DIRECT")
             connector = aiohttp.TCPConnector(ssl=False)
@@ -93,9 +97,11 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
                         with open(out_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(16*1024):
                                 f.write(chunk)
+                        log.debug("Downloaded %s via %s", url, proxy_url if proxy else "DIRECT")
                         return True
         except Exception as e:
             log.info("[HTTP-ERR] %s via %s : %s", url, proxy or "DIRECT", e)
+            log.debug("Image attempt failed for %s via %s", url, proxy_url if proxy else "DIRECT")
             if proxy_pool and proxy:
                 await proxy_pool.remove_proxy(proxy)
             continue
