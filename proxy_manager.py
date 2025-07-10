@@ -5,7 +5,10 @@ import time
 import warnings
 import json
 import os
+import logging
 from typing import Callable, Optional
+
+log = logging.getLogger("ripper.proxy")
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -231,9 +234,12 @@ class ProxyPool:
             while not self.pool:
                 await self.replenish()
                 await asyncio.sleep(2)
-            return random.choice(self.pool)
+            p = random.choice(self.pool)
+            log.debug("[PROXY] → %s", p)
+            return p
 
     async def remove_proxy(self, proxy: str) -> None:
+        log.debug("[PROXY] ✗ %s", proxy)
         async with self.lock:
             if proxy in self.pool:
                 self.pool.remove(proxy)
