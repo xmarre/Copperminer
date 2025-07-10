@@ -88,6 +88,26 @@ def ensure_https_remote(repo_dir):
         pass
 
 
+def update_requirements(log=print):
+    """Install or update dependencies listed in requirements.txt."""
+    req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    if not os.path.exists(req_path):
+        log("requirements.txt not found.")
+        return
+    log("Installing/updating requirements...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "-r", req_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.stdout:
+        log(result.stdout)
+    if result.returncode != 0:
+        log("Error installing requirements:\n" + result.stderr)
+
+
+
 # --- Filtering helpers -------------------------------------------------------
 
 UI_IMAGE_FILENAMES = {
@@ -1704,6 +1724,7 @@ class GalleryRipperApp(tb.Window):
             self.log(result.stdout)
             if result.stderr:
                 self.log("Error during git pull:\n" + result.stderr)
+            update_requirements(log=self.log)
             new_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
             ).strip()
