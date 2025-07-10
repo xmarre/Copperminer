@@ -19,7 +19,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Windows double-click support — via `start_gallery_ripper.bat`
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
-- Dynamic proxy pool — Harvests and validates free proxies automatically (HTTP/HTTPS) and refreshes periodically; UI shows last check time
+- Dynamic proxy pool with caching — Harvests and validates free proxies automatically, caches results to skip dead proxies, and fast-fills the pool for quick startup; UI shows last check time
 
 ## Limitations
 
