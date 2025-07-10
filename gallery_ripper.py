@@ -408,6 +408,10 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
     if entry and quick_scan:
+        pool = get_pool_or_none()
+        if USE_PROXIES and pool is None:
+            log(f"{indent}Using cached page (proxy pool not ready): {url}")
+            return entry["html"], False
         headers = {}
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
