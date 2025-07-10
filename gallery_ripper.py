@@ -1,6 +1,6 @@
 import os
 import threading
-import requests
+import asyncio
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import tkinter as tk
@@ -114,8 +114,10 @@ def is_ui_image(url: str, name: str) -> bool:
 def is_probably_thumbnail(url: str) -> bool:
     """Return True if the remote resource is very small (<4KB)."""
     try:
-        r = session.head(url, timeout=5, allow_redirects=True)
-        length = int(r.headers.get("content-length", 0))
+        status, headers = run_async(
+            async_http.head_with_proxy(url, proxy_pool, headers=session_headers, timeout=5)
+        )
+        length = int(headers.get("content-length", 0))
         if 0 < length < 4096:
             return True
     except Exception:
@@ -366,14 +368,16 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         if entry.get("last_modified"):
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
-            r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
-            if r.status_code == 304:
+            status, hdrs = run_async(
+                async_http.head_with_proxy(url, proxy_pool, headers={**session_headers, **headers}, timeout=10)
+            )
+            if status == 304:
                 entry["timestamp"] = time.time()
                 log(f"{indent}Using cached page (304): {url}")
                 return entry["html"], False
-            if r.status_code == 200:
-                et = r.headers.get("ETag")
-                lm = r.headers.get("Last-Modified")
+            if status == 200:
+                et = hdrs.get("ETag")
+                lm = hdrs.get("Last-Modified")
                 if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
                     entry["timestamp"] = time.time()
                     log(f"{indent}Using cached page (headers match): {url}")
@@ -388,30 +392,55 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
-    resp = session.get(url)
-    resp.raise_for_status()
-    html = resp.text
+    html, hdrs = run_async(
+        async_http.fetch_html(url, proxy_pool, headers=session_headers, timeout=15)
+    )
     page_cache[url] = {
         "html": html,
         "timestamp": time.time(),
-        "etag": resp.headers.get("ETag"),
-        "last_modified": resp.headers.get("Last-Modified"),
+        "etag": hdrs.get("ETag"),
+        "last_modified": hdrs.get("Last-Modified"),
     }
     log(f"{indent}Fetched: {url}")
     return html, True
 
 BASE_URL = ""  # Will be set from GUI
-session = requests.Session()
-session.headers.update({
+from proxy_manager import ProxyPool
+import async_http
+
+session_headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-})
+}
+
+proxy_pool = ProxyPool()
+
+def _proxy_thread():
+    async def runner():
+        await proxy_pool.refresh()
+        await proxy_pool.start_auto_refresh(interval=600)
+        await asyncio.Event().wait()
+    asyncio.run(runner())
+
+threading.Thread(target=_proxy_thread, daemon=True).start()
+
+def run_async(coro):
+    """Safely execute *coro* whether or not an event loop is running."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No event loop, run a new one
+        return asyncio.run(coro)
+    else:
+        if loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            return fut.result()
+        return loop.run_until_complete(coro)
 
 CACHE_DIR = ".coppermine_cache"
 
 def get_soup(url):
-    resp = session.get(url)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    html, _ = run_async(async_http.fetch_html(url, proxy_pool, headers=session_headers))
+    return BeautifulSoup(html, "html.parser")
 
 def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
@@ -779,11 +808,12 @@ def get_base_for_relative_images(page_url):
 def _fetch_fullsize_image(full_url, log):
     """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
     try:
-        resp = session.get(full_url)
-        resp.raise_for_status()
-        if resp.headers.get("Content-Type", "").startswith("image"):
+        html, hdrs = run_async(
+            async_http.fetch_html(full_url, proxy_pool, headers=session_headers)
+        )
+        if hdrs.get("Content-Type", "").startswith("image"):
             return [full_url]
-        sub = BeautifulSoup(resp.text, "html.parser")
+        sub = BeautifulSoup(html, "html.parser")
         base = get_base_for_relative_images(full_url)
         img = sub.find("img")
         if img and img.get("src"):
@@ -1043,20 +1073,15 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 log(f"Already downloaded: {fname}")
                 return False
             try:
-                headers = {'Referer': referer} if referer else {}
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
-                r = session.get(candidate, headers=headers, stream=True, timeout=20)
-                r.raise_for_status()
-                if not r.headers.get("Content-Type", "").startswith("image"):
-                    raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
-                total_bytes = 0
                 start_time = time.time()
-                with open(fpath, "wb") as f:
-                    for chunk in r.iter_content(1024 * 16):
-                        if chunk:
-                            f.write(chunk)
-                            total_bytes += len(chunk)
+                success = run_async(
+                    async_http.download_with_proxy(candidate, fpath, proxy_pool, referer=referer)
+                )
+                if not success:
+                    raise Exception("Download failed")
                 elapsed = time.time() - start_time
+                total_bytes = os.path.getsize(fpath)
                 speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
                 size_str = (
                     f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"

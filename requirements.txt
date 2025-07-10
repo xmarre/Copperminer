@@ -1,4 +1,7 @@
-requests
 beautifulsoup4
 ttkthemes
 ttkbootstrap
+
+proxybroker
+aiohttp
+
