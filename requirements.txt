@@ -2,4 +2,5 @@ beautifulsoup4
 ttkthemes
 ttkbootstrap
 aiohttp
+html5lib
 
