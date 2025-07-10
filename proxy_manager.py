@@ -82,6 +82,7 @@ class ProxyPool:
         cache_file: str = PROXY_CACHE_FILE,
         fast_fill: int = 10,
         ready_callback: Optional[Callable[[], None]] = None,
+        validation_concurrency: int = VALIDATION_CONCURRENCY,
     ) -> None:
         self.cache = ProxyCache(cache_file)
         self.pool: list[str] = list(dict.fromkeys(self.cache.get_good_proxies()))
@@ -92,7 +93,7 @@ class ProxyPool:
         self.lock = asyncio.Lock()
         self.refresh_task: asyncio.Task | None = None
         self.last_checked: float = 0.0
-        self.sema = asyncio.Semaphore(VALIDATION_CONCURRENCY)
+        self.sema = asyncio.Semaphore(validation_concurrency)
         self.ready_event = asyncio.Event()
 
     def _signal_ready(self) -> None:
