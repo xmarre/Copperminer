@@ -59,6 +59,14 @@ DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
 
 LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
 
+# Configure the root logger early so debug/info messages from imported
+# modules aren't dropped before the GUI attaches its own handler.
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    stream=sys.stdout,
+)
+
 # Global flag to control proxy usage
 USE_PROXIES = settings.get("use_proxies", True)
 
@@ -1429,11 +1437,16 @@ class GalleryRipperApp(tb.Window):
         self.log_box.pack(fill="both", expand=True)
 
         self.log_stream = _GuiStream(self.thread_safe_log)
-        logging.basicConfig(
-            level=LOG_LEVEL,
-            format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-            handlers=[logging.StreamHandler(self.log_stream)]
-        )
+        root_logger = logging.getLogger()
+        # Replace any existing handlers (e.g. the initial stdout handler) so
+        # log messages are routed to the GUI textbox once it exists.
+        for h in list(root_logger.handlers):
+            root_logger.removeHandler(h)
+        handler = logging.StreamHandler(self.log_stream)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
+        root_logger.addHandler(handler)
+        root_logger.setLevel(LOG_LEVEL)
 
         self.proxy_frame = ttk.LabelFrame(paned, text="Proxy Pool")
         self.proxy_frame.pack(fill="x", padx=10, pady=6)
