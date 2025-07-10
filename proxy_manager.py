@@ -9,6 +9,7 @@ import logging
 from typing import Callable, Optional
 
 log = logging.getLogger("ripper.proxy")
+log.setLevel(logging.INFO)
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -103,6 +104,7 @@ class ProxyPool:
         if not self.pool_ready:
             self.pool_ready = True
             self.ready_event.set()
+            log.info("[PROXY] Ready with %d proxies", len(self.pool))
             if self.ready_callback:
                 try:
                     self.ready_callback()
@@ -137,11 +139,11 @@ class ProxyPool:
                             test_url, proxy=f"http://{proxy}", timeout=15
                         ) as resp:
                             if resp.status in {200, 301, 302}:
-                                print(f"[PROXY] OK: {proxy} on {test_url}")
+                                log.info("[PROXY] OK: %s on %s", proxy, test_url)
                                 return True
                 except Exception:
                     continue
-        print(f"[PROXY] BAD: {proxy}")
+        log.info("[PROXY] BAD: %s", proxy)
         return False
 
     async def _finish_tasks(self, tasks: list[asyncio.Task]) -> None:
@@ -163,7 +165,7 @@ class ProxyPool:
 
     async def replenish(self, fast_fill: int | None = None) -> None:
         async with self.lock:
-            print("[PROXY] Replenishing proxies...")
+            log.info("[PROXY] Replenishing proxies...")
 
             fast_fill = fast_fill or self.fast_fill
 
@@ -174,7 +176,7 @@ class ProxyPool:
             if len(self.pool) >= fast_fill:
                 self.last_checked = time.time()
                 self.cache.save()
-                print(f"[PROXY] Fast pool fill from cache: {len(self.pool)} proxies.")
+                log.info("[PROXY] Fast pool fill from cache: %d proxies.", len(self.pool))
                 self._signal_ready()
                 return
 
@@ -222,7 +224,7 @@ class ProxyPool:
                 self.pool = random.sample(self.pool, 150)
             self.last_checked = time.time()
             self.cache.save()
-            print(f"[PROXY] Pool size: {len(self.pool)}")
+            log.info("[PROXY] Pool size: %d", len(self.pool))
 
     async def refresh(self) -> None:
         await self.replenish()
@@ -256,4 +258,5 @@ class ProxyPool:
                 await self.replenish()
 
         if not self.refresh_task:
+            log.info("[PROXY] Auto refresh every %d seconds", interval)
             self.refresh_task = asyncio.create_task(auto_refresh())
