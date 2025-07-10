@@ -408,6 +408,10 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
     if entry and quick_scan:
+        pool = get_pool_or_none()
+        if USE_PROXIES and pool is None:
+            log(f"{indent}Using cached page (proxy pool not ready): {url}")
+            return entry["html"], False
         headers = {}
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
@@ -468,8 +472,12 @@ proxy_pool = ProxyPool(
 
 
 def get_pool_or_none():
-    """Return the proxy pool if proxies are enabled."""
-    return proxy_pool if USE_PROXIES else None
+    """Return the proxy pool only when it's ready and proxies are enabled."""
+    if not USE_PROXIES:
+        return None
+    if proxy_pool.pool_ready and proxy_pool.pool:
+        return proxy_pool
+    return None
 
 def _proxy_thread():
     async def runner():
