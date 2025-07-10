@@ -3,6 +3,7 @@ import threading
 import asyncio
 import warnings
 import argparse
+import logging
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import tkinter as tk
@@ -47,6 +48,7 @@ parser.add_argument(
     help="Concurrent proxy validation tasks",
 )
 parser.add_argument("--download-workers", type=int, help="Concurrent downloads")
+parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 args, _ = parser.parse_known_args()
 
 MIN_PROXIES = args.min_proxies or settings.get("min_proxies", 40)
@@ -54,6 +56,8 @@ VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
     "proxy_validation_concurrency", 30
 )
 DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
+
+LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
 
 # Global flag to control proxy usage
 USE_PROXIES = settings.get("use_proxies", True)
@@ -1036,11 +1040,12 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     if display_links:
         log(f"[DEBUG] Found {len(display_links)} displayimage links")
 
-    for idx, dlink in enumerate(display_links, 1):
+    for n, dlink in enumerate(display_links, 1):
+        log(f"[ALBUM] {n}/{len(display_links)} scan {dlink}")
         candidates = extract_all_displayimage_candidates(dlink, log)
         good_candidates = [url for url in candidates if url not in unique_urls]
         if good_candidates:
-            image_entries.append((f"Image (displayimage) {idx}", good_candidates, dlink))
+            image_entries.append((f"Image (displayimage) {n}", good_candidates, dlink))
             unique_urls.update(good_candidates)
 
     # 3. Direct <img> links that aren't thumbnails
@@ -1297,6 +1302,19 @@ async def rip_galleries(
     )
     save_page_cache(root_url, tree, pages)
 # ---------- GUI ----------
+
+class _GuiStream:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def write(self, msg):
+        msg = msg.strip()
+        if msg:
+            self.callback(msg)
+
+    def flush(self):
+        pass
+
 class GalleryRipperApp(tb.Window):
     def __init__(self):
         super().__init__(themename="darkly")
@@ -1409,6 +1427,13 @@ class GalleryRipperApp(tb.Window):
         self.log_box = ScrolledText(logframe, height=10, state='disabled', font=("Consolas", 9),
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
         self.log_box.pack(fill="both", expand=True)
+
+        self.log_stream = _GuiStream(self.thread_safe_log)
+        logging.basicConfig(
+            level=LOG_LEVEL,
+            format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+            handlers=[logging.StreamHandler(self.log_stream)]
+        )
 
         self.proxy_frame = ttk.LabelFrame(paned, text="Proxy Pool")
         self.proxy_frame.pack(fill="x", padx=10, pady=6)
