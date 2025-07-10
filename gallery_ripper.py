@@ -1300,12 +1300,23 @@ class GalleryRipperApp(tb.Window):
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
         self.log_box.pack(fill="both", expand=True)
 
+        self.proxy_frame = ttk.LabelFrame(paned, text="Proxy Pool")
+        self.proxy_frame.pack(fill="x", padx=10, pady=6)
+        self.proxy_status = tk.StringVar()
+        ttk.Label(self.proxy_frame, textvariable=self.proxy_status).pack(side="left", padx=4)
+        self.proxy_listbox = tk.Listbox(self.proxy_frame, height=4, width=36, font=("Consolas", 8))
+        self.proxy_listbox.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(self.proxy_frame, text="Refresh Proxies", command=self.manual_refresh_proxies).pack(side="right", padx=6)
+
         paned.add(treeframe, weight=3)
         paned.add(logframe, weight=1)
+        paned.add(self.proxy_frame, weight=0)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
         self.tree.bind("<Button-1>", self.on_tree_click)
+
+        self.start_proxy_status_updater()
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -1638,6 +1649,25 @@ class GalleryRipperApp(tb.Window):
     def stop_download(self):
         self.log("Stop requested by user. Attempting to stop current operation...")
         self.stop_flag.set()
+
+    def manual_refresh_proxies(self):
+        def do_refresh():
+            self.thread_safe_log("Manual proxy pool refresh requested.")
+            run_async(proxy_pool.refresh())
+            self.after(0, self.update_proxy_status)
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+    def update_proxy_status(self):
+        count = len(proxy_pool.pool)
+        self.proxy_status.set(f"Proxies available: {count} | Last refresh: {time.strftime('%H:%M:%S')}")
+        if hasattr(self, "proxy_listbox"):
+            self.proxy_listbox.delete(0, tk.END)
+            for proxy in proxy_pool.pool[:15]:
+                self.proxy_listbox.insert(tk.END, proxy)
+
+    def start_proxy_status_updater(self):
+        self.update_proxy_status()
+        self.after(5000, self.start_proxy_status_updater)
 
     def download_worker(self, selected, output_dir, root_url):
         try:
