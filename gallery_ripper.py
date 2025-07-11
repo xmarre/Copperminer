@@ -673,6 +673,12 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         page_cache = {}
 
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
+    if depth == 0:
+        try:
+            with open("latest-proxy-fetch.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception as e:
+            log(f"{indent}[WARN] Failed to save HTML: {e}")
     if not html or not html.strip():
         raise Exception(
             f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
