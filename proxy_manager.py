@@ -63,6 +63,14 @@ class ProxyCache:
         except Exception:
             pass
 
+    def clear(self) -> None:
+        """Remove all cached proxy entries and delete the cache file."""
+        self.cache.clear()
+        try:
+            os.remove(self.filename)
+        except OSError:
+            pass
+
     def update(self, proxy: str, status: str) -> None:
         self.cache[proxy] = {
             "status": status,
@@ -117,6 +125,7 @@ class ProxyPool:
         self.last_checked: float = 0.0
         self.sema = asyncio.Semaphore(validation_concurrency)
         self.ready_event = asyncio.Event()
+        self.stop_requested = False
         if self.manual_proxies:
             self._signal_ready()
         
@@ -207,30 +216,39 @@ class ProxyPool:
         if len(self.pool) >= self.fast_fill:
             self._signal_ready()
 
-    async def replenish(self, fast_fill: int | None = None) -> None:
+    async def replenish(self, fast_fill: int | None = None, force: bool = False) -> None:
         if self.manual_proxies:
             async with self.lock:
                 self.pool = list(dict.fromkeys(self.manual_proxies))
                 self._signal_ready()
             return
         async with self.lock:
-            log.info("[PROXY] Replenishing proxies...")
+            if self.stop_requested:
+                return
+            log.info("[PROXY] Replenishing proxies%s...", " (full)" if force else "")
 
             fast_fill = fast_fill or self.fast_fill
 
-            # Load cached good proxies first
-            for p in self.cache.get_good_proxies():
-                if p not in self.pool:
-                    self.pool.append(p)
-            if len(self.pool) >= fast_fill:
-                self.last_checked = time.time()
-                self.cache.save()
-                log.info("[PROXY] Fast pool fill from cache: %d proxies.", len(self.pool))
-                self._signal_ready()
-                return
+            cached_good = self.cache.get_good_proxies()
+            if force:
+                self.pool = []
+            else:
+                for p in cached_good:
+                    if p not in self.pool:
+                        self.pool.append(p)
+                if len(self.pool) >= fast_fill:
+                    self.last_checked = time.time()
+                    self.cache.save()
+                    log.info("[PROXY] Fast pool fill from cache: %d proxies.", len(self.pool))
+                    self._signal_ready()
+                    return
 
             raw = await self.fetch_proxies()
-            to_test = [p for p in raw if self.cache.should_test(p)]
+            if force:
+                candidate = list(dict.fromkeys(cached_good + list(raw)))
+                to_test = candidate
+            else:
+                to_test = [p for p in raw if self.cache.should_test(p)]
 
             tasks = []
             for p in to_test:
@@ -241,7 +259,7 @@ class ProxyPool:
             good_found = 0
             pending = set(tasks)
 
-            while pending:
+            while pending and not self.stop_requested:
                 done, pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -260,7 +278,7 @@ class ProxyPool:
                         if good_found >= fast_fill:
                             pending = set()
                             break
-                if good_found >= fast_fill:
+                if good_found >= fast_fill and not force:
                     break
 
             # Continue validating remaining proxies in background
@@ -275,8 +293,8 @@ class ProxyPool:
             self.cache.save()
             log.info("[PROXY] Pool size: %d", len(self.pool))
 
-    async def refresh(self) -> None:
-        await self.replenish()
+    async def refresh(self, force: bool = False) -> None:
+        await self.replenish(force=force)
 
     async def get_proxy(self) -> str:
         async with self.lock:
@@ -305,12 +323,31 @@ class ProxyPool:
 
     async def start_auto_refresh(self, interval: int = 600) -> None:
         async def auto_refresh():
-            while True:
+            while not self.stop_requested:
                 await asyncio.sleep(interval)
+                if self.stop_requested:
+                    break
                 await self.replenish()
 
         if self.manual_proxies:
             return
         if not self.refresh_task:
+            self.stop_requested = False
             log.info("[PROXY] Auto refresh every %d seconds", interval)
             self.refresh_task = asyncio.create_task(auto_refresh())
+
+    async def stop_auto_refresh(self) -> None:
+        """Stop any ongoing automatic proxy harvesting."""
+        self.stop_requested = True
+        if self.refresh_task:
+            self.refresh_task.cancel()
+            try:
+                await self.refresh_task
+            except Exception:
+                pass
+            self.refresh_task = None
+        log.info("[PROXY] Auto refresh stopped")
+
+    def clear_cache(self) -> None:
+        """Clear cached proxy information."""
+        self.cache.clear()
