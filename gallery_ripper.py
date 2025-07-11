@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlparse
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import webbrowser
 from tkinter.scrolledtext import ScrolledText
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -1686,6 +1687,7 @@ class GalleryRipperApp(tb.Window):
         self.discovery_thread = None
         self.stop_flag = threading.Event()
         self.history_stack = []
+        self.forward_stack = []
 
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
@@ -1699,12 +1701,16 @@ class GalleryRipperApp(tb.Window):
         urlf = ttk.Frame(control_frame)
         urlf.pack(fill="x")
         ttk.Label(urlf, text="Gallery Root URL:").pack(side="left")
+        nav = ttk.Frame(urlf)
+        nav.pack(side="left", padx=(5, 0))
+        self.back_btn = ttk.Button(nav, text="<-", width=3, command=self.go_back, state="disabled")
+        self.back_btn.pack(side="left")
+        self.fwd_btn = ttk.Button(nav, text="->", width=3, command=self.go_forward, state="disabled")
+        self.fwd_btn.pack(side="left")
         url_entry = ttk.Entry(urlf, textvariable=self.url_var, width=60)
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
-        self.back_btn = ttk.Button(urlf, text="Back", command=self.go_back)
-        self.back_btn.pack_forget()
 
         pathf = ttk.Frame(control_frame)
         pathf.pack(fill="x", pady=(8, 0))
@@ -1832,6 +1838,11 @@ class GalleryRipperApp(tb.Window):
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+
+        self.rclick_menu = tk.Menu(self, tearoff=0)
+        self.rclick_menu.add_command(label="Open in browser", command=self.open_thread_in_browser)
+        self._rclick_item = None
 
         # Proxy functionality is disabled for now
 
@@ -1914,13 +1925,29 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(button_frame, text="Delete Selected", command=do_delete).pack(side="left")
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 5))
 
+    def update_nav_buttons(self):
+        state = "normal" if self.history_stack else "disabled"
+        self.back_btn.configure(state=state)
+        state = "normal" if self.forward_stack else "disabled"
+        self.fwd_btn.configure(state=state)
+
     def go_back(self):
         if self.history_stack:
+            current = self.url_var.get()
+            self.forward_stack.append(current)
             prev_url = self.history_stack.pop()
             self.url_var.set(prev_url)
             self.discover_albums()
-        if not self.history_stack:
-            self.back_btn.pack_forget()
+        self.update_nav_buttons()
+
+    def go_forward(self):
+        if self.forward_stack:
+            current = self.url_var.get()
+            self.history_stack.append(current)
+            next_url = self.forward_stack.pop()
+            self.url_var.set(next_url)
+            self.discover_albums()
+        self.update_nav_buttons()
 
     def log(self, msg):
         self.log_box.configure(state='normal')
@@ -2023,8 +2050,7 @@ class GalleryRipperApp(tb.Window):
         quick = self.quick_scan_var.get()
         self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
         self.discovery_thread.start()
-        if not self.history_stack:
-            self.back_btn.pack_forget()
+        self.update_nav_buttons()
 
     def do_discover(self, url, quick):
         try:
@@ -2152,9 +2178,10 @@ class GalleryRipperApp(tb.Window):
                     not self.history_stack or self.history_stack[-1] != self.url_var.get()
                 ):
                     self.history_stack.append(self.url_var.get())
+                    self.forward_stack.clear()
                 self.url_var.set(url)
-                self.back_btn.pack(side="left", padx=(5, 0))
                 self.discover_albums()
+                self.update_nav_buttons()
                 return
         if self.tree.get_children(item):
             self.tree.item(item, open=not self.tree.item(item, "open"))
@@ -2169,6 +2196,35 @@ class GalleryRipperApp(tb.Window):
                 self._ignore_next_select = True
                 return
         self._ignore_next_select = False
+
+    def on_tree_right_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self.tree.selection_set(item)
+        self._rclick_item = item
+        url = None
+        if item in self.item_to_album:
+            _, album_url, _ = self.item_to_album[item]
+            after = album_url.split(":", 1)[-1]
+            if select_adapter_for_url(album_url) == "4chan" and "/" in after:
+                url = album_url
+        if url:
+            self.rclick_menu.tk_popup(event.x_root, event.y_root)
+        else:
+            self._rclick_item = None
+
+    def open_thread_in_browser(self):
+        item = getattr(self, "_rclick_item", None)
+        if not item or item not in self.item_to_album:
+            return
+        _, album_url, _ = self.item_to_album[item]
+        after = album_url.split(":", 1)[-1]
+        if "/" not in after:
+            return
+        board, tid = after.split("/", 1)
+        web_url = f"https://boards.4chan.org/{board}/thread/{tid}"
+        webbrowser.open(web_url)
 
     def select_all_leaf_albums(self):
         for item in self.item_to_album:
