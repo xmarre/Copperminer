@@ -49,6 +49,7 @@ parser.add_argument(
     help="Concurrent proxy validation tasks",
 )
 parser.add_argument("--download-workers", type=int, help="Concurrent downloads")
+parser.add_argument("--proxy", help="Use a single HTTP proxy for all requests")
 parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 args, _ = parser.parse_known_args()
 
@@ -57,6 +58,7 @@ VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
     "proxy_validation_concurrency", 30
 )
 DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
+MANUAL_PROXY = args.proxy
 
 LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
 
@@ -519,7 +521,10 @@ proxy_pool = ProxyPool(
     min_proxies=MIN_PROXIES,
     fast_fill=DOWNLOAD_WORKERS,
     validation_concurrency=VALIDATION_CONCURRENCY,
+    manual_proxies=[MANUAL_PROXY] if MANUAL_PROXY else None,
 )
+if MANUAL_PROXY:
+    logging.getLogger("ripper.proxy").info(f"[PROXY] Using manual proxy: {MANUAL_PROXY}")
 
 
 def get_pool_or_none():

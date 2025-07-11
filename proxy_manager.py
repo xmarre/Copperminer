@@ -87,9 +87,15 @@ class ProxyPool:
         fast_fill: int = 10,
         ready_callback: Optional[Callable[[], None]] = None,
         validation_concurrency: int = VALIDATION_CONCURRENCY,
+        manual_proxies: Optional[list[str]] = None,
     ) -> None:
         self.cache = ProxyCache(cache_file)
-        self.pool: list[str] = list(dict.fromkeys(self.cache.get_good_proxies()))
+        self.manual_proxies = manual_proxies or []
+        self.pool: list[str] = []
+        if self.manual_proxies:
+            self.pool = list(dict.fromkeys(self.manual_proxies))
+        else:
+            self.pool = list(dict.fromkeys(self.cache.get_good_proxies()))
         self.min_proxies = min_proxies
         self.fast_fill = fast_fill
         self.ready_callback = ready_callback
@@ -99,7 +105,9 @@ class ProxyPool:
         self.last_checked: float = 0.0
         self.sema = asyncio.Semaphore(validation_concurrency)
         self.ready_event = asyncio.Event()
-
+        if self.manual_proxies:
+            self._signal_ready()
+        
     def _signal_ready(self) -> None:
         if not self.pool_ready:
             self.pool_ready = True
@@ -164,6 +172,11 @@ class ProxyPool:
             self._signal_ready()
 
     async def replenish(self, fast_fill: int | None = None) -> None:
+        if self.manual_proxies:
+            async with self.lock:
+                self.pool = list(dict.fromkeys(self.manual_proxies))
+                self._signal_ready()
+            return
         async with self.lock:
             log.info("[PROXY] Replenishing proxies...")
 
@@ -231,7 +244,9 @@ class ProxyPool:
 
     async def get_proxy(self) -> str:
         async with self.lock:
-            if len(self.pool) < self.min_proxies:
+            if not self.pool:
+                await self.replenish()
+            if len(self.pool) < self.min_proxies and not self.manual_proxies:
                 await self.replenish()
             while not self.pool:
                 await self.replenish()
@@ -243,10 +258,11 @@ class ProxyPool:
     async def remove_proxy(self, proxy: str) -> None:
         log.debug("[PROXY] ✗ %s", proxy)
         async with self.lock:
-            if proxy in self.pool:
+            if proxy in self.pool and not self.manual_proxies:
                 self.pool.remove(proxy)
-            self.cache.update(proxy, "bad")
-            self.cache.save()
+            if not self.manual_proxies:
+                self.cache.update(proxy, "bad")
+                self.cache.save()
 
     def __len__(self) -> int:
         return len(self.pool)
@@ -257,6 +273,8 @@ class ProxyPool:
                 await asyncio.sleep(interval)
                 await self.replenish()
 
+        if self.manual_proxies:
+            return
         if not self.refresh_task:
             log.info("[PROXY] Auto refresh every %d seconds", interval)
             self.refresh_task = asyncio.create_task(auto_refresh())

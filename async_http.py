@@ -4,6 +4,8 @@ import logging
 import time
 from proxy_manager import ProxyPool
 
+cookie_jar = aiohttp.CookieJar()
+
 log = logging.getLogger("ripper.http")
 # Use INFO so important connection details show even when the root logger
 # runs at its default INFO level. More verbose timing info is logged at DEBUG.
@@ -13,8 +15,10 @@ async def head_with_proxy(url, proxy_pool: ProxyPool | None, headers=None, timeo
     headers = headers or {}
     if proxy_pool is None:
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar) as session:
             async with session.head(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
+                log.debug("HEAD headers: %s", headers)
+                log.debug("HEAD cookies: %s", cookie_jar.filter_cookies(url))
                 return resp.status, dict(resp.headers)
     attempts = 3
     for attempt in range(1, attempts + 1):
@@ -23,7 +27,7 @@ async def head_with_proxy(url, proxy_pool: ProxyPool | None, headers=None, timeo
         try:
             log.info("[HEAD %d/%d] %s via %s", attempt, attempts, url, proxy)
             connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar) as session:
                 async with session.head(
                     url,
                     headers=headers,
@@ -31,6 +35,8 @@ async def head_with_proxy(url, proxy_pool: ProxyPool | None, headers=None, timeo
                     allow_redirects=True,
                     timeout=timeout,
                 ) as resp:
+                    log.debug("HEAD headers: %s", headers)
+                    log.debug("HEAD cookies: %s", cookie_jar.filter_cookies(url))
                     log.info("[HEAD] %s -> %s", url, resp.status)
                     return resp.status, dict(resp.headers)
         except Exception as e:
@@ -53,7 +59,7 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
         try:
             log.info("[%s %d/%d] %s via %s", label, attempt, attempts,
                      url, proxy or "DIRECT")
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as s:
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), cookie_jar=cookie_jar) as s:
                 async with s.get(
                     url,
                     headers=headers,
@@ -61,6 +67,8 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
                     timeout=timeout,
                     allow_redirects=True,
                 ) as r:
+                    log.debug("GET headers: %s", headers)
+                    log.debug("GET cookies: %s", cookie_jar.filter_cookies(url))
                     log.info("[HTTP] %s -> %s in %.1fs",
                              url, r.status, time.time() - t0)
                     log.debug("Fetched %s via %s", url, proxy_url if proxy else "DIRECT")
@@ -90,13 +98,15 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
         try:
             log.info("[IMG %d/%d] %s via %s", attempt, attempts, url, proxy or "DIRECT")
             connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar) as session:
                 async with session.get(
                     url,
                     proxy=proxy_url if proxy else None,
                     headers=headers,
                     timeout=15,
                 ) as resp:
+                    log.debug("IMG headers: %s", headers)
+                    log.debug("IMG cookies: %s", cookie_jar.filter_cookies(url))
                     if resp.status == 200 and resp.headers.get("Content-Type", "").startswith("image"):
                         log.info("[IMG] %s -> %s", url, resp.status)
                         with open(out_path, "wb") as f:
