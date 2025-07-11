@@ -418,6 +418,9 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
+    logger.info(
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+    )
     return filtered_entries
 
 
@@ -1051,10 +1054,15 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     galleries require that same page be supplied as the HTTP ``Referer`` when
     fetching the direct image URLs.
     """
-    print(f"[DEBUG] Called get_all_candidate_images_from_album, proxies: {USE_PROXIES}")
+    logger.info(
+        f"[DEBUG] Called get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+    )
     if visited is None:
         visited = set()
     if album_url in visited:
+        logger.info(
+            f"[DEBUG] Returning EMPTY LIST from get_all_candidate_images_from_album (already visited), proxies: {USE_PROXIES}"
+        )
         return []
     visited.add(album_url)
 
@@ -1062,18 +1070,26 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache = {}
 
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
-    print(f"[DEBUG] Got HTML ({len(html)} bytes), proxies: {USE_PROXIES}")
+    logger.info(
+        f"[DEBUG] Got HTML ({len(html)} bytes), proxies: {USE_PROXIES}"
+    )
     with open("hang-debug.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("[DEBUG] Saved hang-debug.html")
-    print(f"[DEBUG] Before soup call, proxies: {USE_PROXIES}")
+    logger.info("[DEBUG] Saved hang-debug.html")
+    logger.info(f"[DEBUG] Before soup call, proxies: {USE_PROXIES}")
     entry = page_cache.get(album_url, {})
+    logger.info(
+        f"[DEBUG] quick_scan={quick_scan}, changed={changed}, entry images={bool(entry.get('images'))}, proxies: {USE_PROXIES}"
+    )
     if quick_scan and not changed and entry.get("images"):
         log(f"[DEBUG] Using cached image list for {album_url}")
+        logger.info(
+            f"[DEBUG] Returning {len(entry.get('images', []))} cached entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        )
         return entry["images"]
 
     soup = safe_soup(html)
-    print(f"[DEBUG] After soup call, proxies: {USE_PROXIES}")
+    logger.info(f"[DEBUG] After soup call, proxies: {USE_PROXIES}")
     log = log or (lambda msg: None)
     image_entries = []
     unique_urls = set()
@@ -1180,6 +1196,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
 
+    logger.info(
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+    )
     return filtered_entries
 
 async def download_image_candidates(
