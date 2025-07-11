@@ -5,7 +5,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 ## Features
 
 - Point-and-click GUI — No command line needed, always-on dark mode
-- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine, rule-based sites like ThePlace2, and now 4chan boards/threads)
+- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine, rule-based sites like ThePlace2, 4chan boards/threads, and Wix-based Doctor Who archives)
 - Album tree — Finds and displays all real albums for selection, ignoring “Last uploads”, “Most viewed”, and other virtual/special albums
 - Optional special galleries toggle — Include “Last uploads”, “Most viewed”, etc. only when you want them
 - Preserves structure — Downloads images into folders/subfolders that match the gallery’s layout
@@ -13,6 +13,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
 - 4chan support — Browse boards and threads to bulk download all attached media
+- Wix Doctor Who archives — Navigate tbagallery.wixsite.com and related pages
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
 - Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
 - History dropdown — Quickly reopen recently scanned galleries from cache
@@ -32,7 +33,7 @@ Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
 
 ## Limitations
 
-- Supports Coppermine and a small set of rule-based sites (initially ThePlace2): other galleries may fail
+- Supports Coppermine and a few rule-based sites (ThePlace2 and tbagallery.wixsite.com): other galleries may fail
 - No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below
 

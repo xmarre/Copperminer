@@ -8,6 +8,7 @@ from typing import Any
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import urllib.request
+import requests
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import webbrowser
@@ -235,6 +236,8 @@ def select_adapter_for_url(url: str) -> str:
     if url.lower().startswith("4chan"):
         return "4chan"
     domain = urlparse(url).netloc.lower()
+    if "tbagallery.wixsite.com" in domain:
+        return "wix_doctorwho"
     if (
         "4chan.org" in domain
         or "4channel.org" in domain
@@ -466,6 +469,121 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
         f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
     )
     return filtered_entries
+
+
+# -- Wix Doctor Who adapter ---------------------------------------------------
+
+def discover_wix_doctorwho_tree(url, visited=None, depth=0, max_depth=10):
+    """Recursively build a navigation tree for tbagallery.wixsite.com sites."""
+    if visited is None:
+        visited = set()
+    url = url.split("?")[0]
+    if url in visited or depth > max_depth:
+        return None
+    visited.add(url)
+    try:
+        resp = requests.get(url, timeout=25)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        print(f"Failed to fetch {url}: {e}")
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.find("main") or soup
+
+    images = [
+        img.get("src")
+        for img in main.find_all(
+            "img", src=re.compile(r"(imgbox\.com/|images\d+\.imgbox\.com/)")
+        )
+    ]
+    images = [i for i in images if i]
+    if images and len(images) >= 4:
+        name = soup.title.text.strip() if soup.title else url.rstrip("/").split("/")[-1]
+        return {
+            "type": "album",
+            "name": name,
+            "url": url,
+            "image_count": len(images),
+        }
+
+    links = []
+    for a in main.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("mailto:") or "facebook" in href or "twitter" in href:
+            continue
+        if href.startswith("/"):
+            full_url = urljoin(url, href)
+        elif href.startswith("http"):
+            full_url = href
+        else:
+            full_url = urljoin(url, href)
+        if "tbagallery.wixsite.com" not in full_url:
+            continue
+        if full_url in visited:
+            continue
+        links.append(full_url)
+
+    children = []
+    albums = []
+    for link in links:
+        node = discover_wix_doctorwho_tree(link, visited, depth + 1, max_depth)
+        if not node:
+            continue
+        if node["type"] == "album":
+            albums.append(node)
+        else:
+            children.append(node)
+
+    name = soup.title.text.strip() if soup.title else url.rstrip("/").split("/")[-1]
+    return {
+        "type": "category",
+        "name": name,
+        "url": url,
+        "children": children,
+        "albums": albums,
+    }
+
+
+def wix_doctorwho_get_album_images(album_url, log=lambda msg: None, page_cache=None, quick_scan=True):
+    """Return image entries from a wix_doctorwho album."""
+    if page_cache is None:
+        page_cache = {}
+    html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.find("main") or soup
+    urls = []
+    for img in main.find_all("img", src=True):
+        src = img["src"]
+        if src.startswith("//"):
+            src = "https:" + src
+        if src.startswith("/"):
+            src = urljoin(album_url, src)
+        if re.search(r"(imgbox\.com/|images\d+\.imgbox\.com/)", src) or re.search(r"\.(jpe?g|png|gif|webm|mp4)$", src, re.I):
+            urls.append(src)
+    for a in main.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"\.(jpe?g|png|gif|webm|mp4)$", href, re.I):
+            full = urljoin(album_url, href)
+            urls.append(full)
+    unique = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    entries = []
+    for u in unique:
+        fname = os.path.basename(u.split("?")[0])
+        entries.append((fname, [u], album_url))
+    if album_url in page_cache:
+        page_cache[album_url]["images"] = entries
+        page_cache[album_url]["image_hash"] = compute_hash_from_list(unique)
+    return entries
 
 
 # -- 4chan helpers ------------------------------------------------------------
@@ -1084,6 +1202,13 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
         )
+    elif site_type == "wix_doctorwho":
+        tree = discover_wix_doctorwho_tree(
+            root_url,
+            visited=set(),
+            depth=0,
+            max_depth=10,
+        )
     elif site_type == "4chan":
         tree = fourchan_discover_tree(
             root_url,
@@ -1573,6 +1698,10 @@ async def rip_galleries(
         if site_type == "universal":
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
+            )
+        elif site_type == "wix_doctorwho":
+            image_entries = wix_doctorwho_get_album_images(
+                album_url, log=log, page_cache=pages, quick_scan=quick_scan
             )
         elif site_type == "4chan":
             board, tid = album_url.split(":", 1)[-1].split("/", 1)
