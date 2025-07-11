@@ -68,6 +68,9 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
+# Logger for additional debug messages
+logger = logging.getLogger("ripper.download")
+
 # Global flag to control proxy usage
 USE_PROXIES = settings.get("use_proxies", True)
 
@@ -1290,6 +1293,9 @@ async def rip_galleries(
                 album_url, log=log, page_cache=pages, quick_scan=quick_scan
             )
         log(f"  Found {len(image_entries)} images in {album_name}.")
+        logger.info(
+            f"[DEBUG] Queuing {len(image_entries)} images for download, proxies: {USE_PROXIES}"
+        )
         if not image_entries:
             continue
         for entry_name, candidates, referer in image_entries:
@@ -1313,6 +1319,9 @@ async def rip_galleries(
     sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
 
     async def worker(idx, album_name, album_path, candidate_urls, referer):
+        logger.info(
+            f"[DEBUG] Starting download worker, proxies: {USE_PROXIES}, images: {len(candidate_urls)}"
+        )
         if stop_flag and stop_flag.is_set():
             return
         if stats['downloaded'] > 0:
