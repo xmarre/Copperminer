@@ -473,8 +473,11 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
 
 # -- Wix Doctor Who adapter ---------------------------------------------------
 
-def discover_wix_doctorwho_tree(url, visited=None, depth=0, max_depth=10):
-    """Recursively build a navigation tree for tbagallery.wixsite.com sites."""
+def discover_wix_doctorwho_tree(
+    url, visited=None, depth=0, max_depth=10, sleep_min=1.2, sleep_max=2.5
+):
+    """Recursively build a navigation tree for tbagallery.wixsite.com sites,
+    with rate limiting and 429 handling."""
     if visited is None:
         visited = set()
     url = url.split("?")[0]
@@ -485,9 +488,23 @@ def discover_wix_doctorwho_tree(url, visited=None, depth=0, max_depth=10):
         resp = requests.get(url, timeout=25)
         resp.raise_for_status()
         html = resp.text
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 429:
+            print(f"[WIX] 429 Too Many Requests at {url}, sleeping and retrying...")
+            time.sleep(random.uniform(20, 60))
+            return discover_wix_doctorwho_tree(
+                url, visited, depth, max_depth, sleep_min, sleep_max
+            )
+        elif resp.status_code == 404:
+            print(f"[WIX] 404 Not Found: {url}")
+            return None
+        else:
+            print(f"[WIX] Failed to fetch {url}: {e}")
+            return None
     except Exception as e:
-        print(f"Failed to fetch {url}: {e}")
+        print(f"[WIX] Request failed: {e}")
         return None
+    time.sleep(random.uniform(sleep_min, sleep_max))
     soup = BeautifulSoup(html, "html.parser")
     main = soup.find("main") or soup
 
@@ -2104,7 +2121,10 @@ class GalleryRipperApp(tb.Window):
 
     def insert_album_nodes(self, albums):
         """Insert the given albums into the tree under root."""
-        self.tree.delete(*self.tree.get_children())
+        try:
+            self.tree.delete(*self.tree.get_children())
+        except tk.TclError:
+            self.tree.delete(*self.tree.get_children())
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self.item_to_category.clear()
@@ -2163,8 +2183,11 @@ class GalleryRipperApp(tb.Window):
     def insert_tree_root_safe(self, tree_data):
         # Clear any previous items and related state before inserting a new tree
         # to avoid stale item IDs causing TclError callbacks
-        self.tree.selection_remove(self.tree.selection())
-        self.tree.delete(*self.tree.get_children())
+        try:
+            self.tree.selection_remove(self.tree.selection())
+            self.tree.delete(*self.tree.get_children())
+        except tk.TclError:
+            self.tree.delete(*self.tree.get_children())
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self.item_to_category.clear()
@@ -2188,7 +2211,10 @@ class GalleryRipperApp(tb.Window):
             messagebox.showinfo("Discovery running", "Please wait for the current discovery to finish.")
             return
         self.thread_safe_log(f"Discovering albums from: {url}")
-        self.tree.delete(*self.tree.get_children())
+        try:
+            self.tree.delete(*self.tree.get_children())
+        except tk.TclError:
+            self.tree.delete(*self.tree.get_children())
         quick = self.quick_scan_var.get()
         self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
         self.discovery_thread.start()
@@ -2292,26 +2318,46 @@ class GalleryRipperApp(tb.Window):
         self._prev_selection = set(self.tree.selection())
 
     def select_descendants(self, parent):
-        for child in self.tree.get_children(parent):
-            text = self.tree.item(child, "text")
+        try:
+            children = self.tree.get_children(parent)
+        except tk.TclError:
+            return
+        for child in children:
+            try:
+                text = self.tree.item(child, "text")
+            except tk.TclError:
+                continue
             if text.strip().startswith("\u2605") and not self.show_specials_var.get():
                 continue
             if child in self.item_to_album:
                 self.selected_album_urls.add(child)
-                self.tree.selection_add(child)
-                self.tree.set(child, "sel", "\u2611")
+                try:
+                    self.tree.selection_add(child)
+                    self.tree.set(child, "sel", "\u2611")
+                except tk.TclError:
+                    continue
             self.select_descendants(child)
 
     def unselect_descendants(self, parent):
-        for child in self.tree.get_children(parent):
+        try:
+            children = self.tree.get_children(parent)
+        except tk.TclError:
+            return
+        for child in children:
             if child in self.selected_album_urls:
                 self.selected_album_urls.discard(child)
-                self.tree.selection_remove(child)
-                self.tree.set(child, "sel", "\u25A1")
+                try:
+                    self.tree.selection_remove(child)
+                    self.tree.set(child, "sel", "\u25A1")
+                except tk.TclError:
+                    pass
             self.unselect_descendants(child)
 
     def on_tree_doubleclick(self, event):
-        item = self.tree.focus()
+        try:
+            item = self.tree.focus()
+        except tk.TclError:
+            return
         if item in self.item_to_category:
             name, url, _ = self.item_to_category[item]
             after = url.split(":", 1)[-1]
@@ -2325,8 +2371,11 @@ class GalleryRipperApp(tb.Window):
                 self.discover_albums()
                 self.update_nav_buttons()
                 return
-        if self.tree.get_children(item):
-            self.tree.item(item, open=not self.tree.item(item, "open"))
+        try:
+            if self.tree.get_children(item):
+                self.tree.item(item, open=not self.tree.item(item, "open"))
+        except tk.TclError:
+            pass
 
     def on_tree_click(self, event):
         """Allow expand/collapse, but ignore selection when clicking the arrow."""
@@ -2343,7 +2392,10 @@ class GalleryRipperApp(tb.Window):
         item = self.tree.identify_row(event.y)
         if not item:
             return
-        self.tree.selection_set(item)
+        try:
+            self.tree.selection_set(item)
+        except tk.TclError:
+            return
         self._rclick_item = item
         url = None
         if item in self.item_to_album:
@@ -2369,19 +2421,28 @@ class GalleryRipperApp(tb.Window):
         webbrowser.open(web_url)
 
     def select_all_leaf_albums(self):
-        for item in self.item_to_album:
-            label = self.tree.item(item, "text")
+        for item in list(self.item_to_album):
+            try:
+                label = self.tree.item(item, "text")
+            except tk.TclError:
+                continue
             if label.lstrip().startswith("\u2605"):
                 continue
             self.selected_album_urls.add(item)
-            self.tree.selection_add(item)
-            self.tree.set(item, "sel", "\u2611")
+            try:
+                self.tree.selection_add(item)
+                self.tree.set(item, "sel", "\u2611")
+            except tk.TclError:
+                continue
 
     def unselect_all_leaf_albums(self):
         for item in list(self.selected_album_urls):
             self.selected_album_urls.discard(item)
-            self.tree.selection_remove(item)
-            self.tree.set(item, "sel", "\u25A1")
+            try:
+                self.tree.selection_remove(item)
+                self.tree.set(item, "sel", "\u25A1")
+            except tk.TclError:
+                continue
 
     def start_download(self):
         if self.download_thread and self.download_thread.is_alive():
