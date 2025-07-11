@@ -75,6 +75,7 @@ python gallery_ripper.py --min-proxies 50 --validation-concurrency 20 --download
 - `--min-proxies` – minimum number of working proxies to keep in the pool
 - `--validation-concurrency` – how many proxies to validate in parallel
 - `--download-workers` – number of concurrent image download tasks
+- `--proxy` – use a specific HTTP proxy for all requests
 - `--debug` – enable verbose DEBUG-level logging to help diagnose issues
 
 ## License
