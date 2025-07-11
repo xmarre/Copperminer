@@ -63,6 +63,7 @@ MIN_PROXIES = args.min_proxies or settings.get("min_proxies", 40)
 VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
     "proxy_validation_concurrency", 30
 )
+# Default to 1 worker unless provided via CLI or saved settings
 DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
 MANUAL_PROXY = args.proxy
 
@@ -1741,6 +1742,18 @@ class GalleryRipperApp(tb.Window):
             command=self._toggle_verbose,
         ).pack(side="left", padx=(10, 0))
 
+        # Download worker count
+        workers = settings.get("download_workers", DOWNLOAD_WORKERS)
+        self.download_workers_var = tk.IntVar(value=workers)
+        ttk.Label(optionsf, text="Workers:").pack(side="left", padx=(10, 0))
+        tb.Spinbox(
+            optionsf,
+            from_=1,
+            to=32,
+            width=4,
+            textvariable=self.download_workers_var,
+        ).pack(side="left")
+
 
         self.use_proxies_var = tk.BooleanVar(value=False)
         proxies_chk = ttk.Checkbutton(
@@ -2253,6 +2266,13 @@ class GalleryRipperApp(tb.Window):
         if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
+        # Update worker count configuration
+        global DOWNLOAD_WORKERS
+        DOWNLOAD_WORKERS = max(1, self.download_workers_var.get())
+        proxy_pool.fast_fill = DOWNLOAD_WORKERS
+        settings = load_settings()
+        settings["download_workers"] = DOWNLOAD_WORKERS
+        save_settings(settings)
         self.log(f"Starting download of {len(selected)} albums...")
         self.download_thread = threading.Thread(
             target=self.download_worker,

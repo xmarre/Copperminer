@@ -24,6 +24,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Proxy checks load a random gallery, follow an album link, and even grab one image to ensure the proxy truly works. Edit the `VALIDATION_URLS` list in `proxy_manager.py` to customize the rotation.
 - Proxy toolbar buttons — refresh & retest, clear cached proxies, or stop harvesting altogether
 - Verbose checkbox — Toggle DEBUG-level logging on demand while the app runs
+- Workers spinbox — Configure how many images download in parallel
 
 ### 4chan Usage
 
@@ -81,7 +82,8 @@ python gallery_ripper.py --min-proxies 50 --validation-concurrency 20 --download
 
 - `--min-proxies` – minimum number of working proxies to keep in the pool
 - `--validation-concurrency` – how many proxies to validate in parallel
-- `--download-workers` – number of concurrent image download tasks
+- `--download-workers` – number of concurrent image download tasks (also
+  configurable in the GUI)
 - `--proxy` – use a specific HTTP proxy for all requests
 - `--debug` – enable verbose DEBUG-level logging to help diagnose issues
 
