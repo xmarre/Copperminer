@@ -1800,7 +1800,7 @@ class GalleryRipperApp(tb.Window):
             self.after(0, self.insert_tree_root_safe, tree_data)
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
         except Exception as e:
-            self.after(0, lambda: self.log(f"Discovery failed: {e}"))
+            self.after(0, lambda e=e: self.log(f"Discovery failed: {e}"))
 
     def insert_tree_node(self, parent, node, path=None):
         path = path or []
