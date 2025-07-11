@@ -81,6 +81,11 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
         if proxy_pool:
             proxy = await proxy_pool.get_proxy()
             proxy_url = f"http://{proxy}"
+        from gallery_ripper import USE_PROXIES as USE_PROXIES_FLAG
+        log.info(
+            f"[DEBUG] In async HTTP request task, proxies: {USE_PROXIES_FLAG}, proxy: {proxy}"
+        )
+        log.info(f"[DEBUG] About to download image {url} via proxy: {proxy}")
         log.debug("Attempting image %s via %s", url, proxy_url if proxy else "DIRECT")
         try:
             log.info("[IMG %d/%d] %s via %s", attempt, attempts, url, proxy or "DIRECT")
