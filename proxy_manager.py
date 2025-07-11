@@ -118,6 +118,7 @@ class ProxyPool:
         self.pool_ready = False
         self.lock = asyncio.Lock()
         self.refresh_task: asyncio.Task | None = None
+        self.harvest_task: asyncio.Task | None = None
         self.last_checked: float = 0.0
         self.sema = asyncio.Semaphore(validation_concurrency)
         self.ready_event = asyncio.Event()
@@ -356,13 +357,28 @@ class ProxyPool:
     def __len__(self) -> int:
         return len(self.pool)
 
+    async def prune_dead_proxies(self) -> None:
+        """Re-check proxies in the pool and remove any that fail validation."""
+        tasks = []
+        for p in list(self.pool):
+            t = asyncio.create_task(self.validate_proxy(p))
+            t.proxy = p  # type: ignore[attr-defined]
+            tasks.append(t)
+        for t in asyncio.as_completed(tasks):
+            proxy = getattr(t, "proxy", None)
+            try:
+                ok = await t
+            except Exception:
+                ok = False
+            if not ok and proxy:
+                await self.remove_proxy(proxy)
+
     async def start_auto_refresh(self, interval: int = 600) -> None:
         async def auto_refresh():
             while not self.stop_requested:
-                await asyncio.sleep(interval)
-                if self.stop_requested:
-                    break
                 await self.replenish()
+                await self.prune_dead_proxies()
+                await asyncio.sleep(interval)
 
         if self.manual_proxies:
             return

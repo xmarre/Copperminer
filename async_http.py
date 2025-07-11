@@ -51,6 +51,7 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
     attempts = 5 if proxy_pool else 1
     for attempt in range(1, attempts + 1):
         proxy = None
+        proxy_url = None
         if proxy_pool:
             proxy = await proxy_pool.get_proxy()
             proxy_url = f"http://{proxy}"
@@ -73,7 +74,14 @@ async def fetch_html(url, proxy_pool: ProxyPool | None, headers=None,
                              url, r.status, time.time() - t0)
                     log.debug("Fetched %s via %s", url, proxy_url if proxy else "DIRECT")
                     if r.status == 200:
-                        return await r.text(), dict(r.headers)
+                        text = await r.text()
+                        if text.strip():
+                            return text, dict(r.headers), proxy
+                        if proxy_pool and proxy:
+                            await proxy_pool.remove_proxy(proxy)
+                    else:
+                        if proxy_pool and proxy:
+                            await proxy_pool.remove_proxy(proxy)
         except Exception as e:
             log.info("[HTTP-ERR] %s via %s : %s", url, proxy or "DIRECT", e)
             log.debug("Attempt failed for %s via %s", url, proxy_url if proxy else "DIRECT")
@@ -115,6 +123,8 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
                                 f.write(chunk)
                         log.debug("Downloaded %s via %s", url, proxy_url if proxy else "DIRECT")
                         return True
+                    if proxy_pool and proxy:
+                        await proxy_pool.remove_proxy(proxy)
         except Exception as e:
             log.info("[HTTP-ERR] %s via %s : %s", url, proxy or "DIRECT", e)
             log.debug("Image attempt failed for %s via %s", url, proxy_url if proxy else "DIRECT")
