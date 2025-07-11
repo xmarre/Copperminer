@@ -5,13 +5,14 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 ## Features
 
 - Point-and-click GUI — No command line needed, always-on dark mode
-- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine and rule-based sites like ThePlace2)
+- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine, rule-based sites like ThePlace2, and now 4chan boards/threads)
 - Album tree — Finds and displays all real albums for selection, ignoring “Last uploads”, “Most viewed”, and other virtual/special albums
 - Optional special galleries toggle — Include “Last uploads”, “Most viewed”, etc. only when you want them
 - Preserves structure — Downloads images into folders/subfolders that match the gallery’s layout
 - Download progress & log — See what’s happening at every step
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
+- 4chan support — Browse boards and threads to bulk download all attached media
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
 - Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
 - History dropdown — Quickly reopen recently scanned galleries from cache
@@ -23,6 +24,12 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Proxy checks load a random gallery, follow an album link, and even grab one image to ensure the proxy truly works. Edit the `VALIDATION_URLS` list in `proxy_manager.py` to customize the rotation.
 - Proxy toolbar buttons — refresh & retest, clear cached proxies, or stop harvesting altogether
 - Verbose checkbox — Toggle DEBUG-level logging on demand while the app runs
+
+### 4chan Usage
+
+Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
+URL. Boards list their active threads and selecting a thread downloads all
+attached files (images, webms, mp4s).
 
 ## Limitations
 
