@@ -488,6 +488,7 @@ def discover_wix_doctorwho_tree(
         resp = requests.get(url, timeout=25)
         resp.raise_for_status()
         html = resp.text
+        time.sleep(random.uniform(sleep_min, sleep_max))
     except requests.exceptions.HTTPError as e:
         if resp.status_code == 429:
             print(f"[WIX] 429 Too Many Requests at {url}, sleeping and retrying...")
@@ -504,7 +505,6 @@ def discover_wix_doctorwho_tree(
     except Exception as e:
         print(f"[WIX] Request failed: {e}")
         return None
-    time.sleep(random.uniform(sleep_min, sleep_max))
     soup = BeautifulSoup(html, "html.parser")
     main = soup.find("main") or soup
 
