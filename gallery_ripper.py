@@ -1592,6 +1592,8 @@ class GalleryRipperApp(tb.Window):
         ttk.Label(self.proxy_frame, textvariable=self.proxy_status).pack(side="left", padx=4)
         self.proxy_listbox = tk.Listbox(self.proxy_frame, height=4, width=36, font=("Consolas", 8))
         self.proxy_listbox.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(self.proxy_frame, text="Stop Harvest", command=self.stop_proxy_harvest).pack(side="right", padx=6)
+        ttk.Button(self.proxy_frame, text="Clear Cache", command=self.clear_proxy_cache).pack(side="right", padx=6)
         ttk.Button(self.proxy_frame, text="Refresh Proxies", command=self.manual_refresh_proxies).pack(side="right", padx=6)
 
         paned.add(treeframe, weight=3)
@@ -1939,9 +1941,22 @@ class GalleryRipperApp(tb.Window):
     def manual_refresh_proxies(self):
         def do_refresh():
             self.thread_safe_log("Manual proxy pool refresh requested.")
-            run_async(proxy_pool.refresh())
+            run_async(proxy_pool.refresh(force=True))
             self.after(0, self.update_proxy_status)
         threading.Thread(target=do_refresh, daemon=True).start()
+
+    def clear_proxy_cache(self):
+        def do_clear():
+            self.thread_safe_log("Clearing proxy cache...")
+            proxy_pool.clear_cache()
+            self.after(0, self.update_proxy_status)
+        threading.Thread(target=do_clear, daemon=True).start()
+
+    def stop_proxy_harvest(self):
+        def do_stop():
+            self.thread_safe_log("Stopping proxy harvesting...")
+            run_async(proxy_pool.stop_auto_refresh())
+        threading.Thread(target=do_stop, daemon=True).start()
 
     def on_use_proxies_toggle(self):
         """Handle toggling of the Use proxies checkbox."""
