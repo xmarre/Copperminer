@@ -156,43 +156,82 @@ class ProxyPool:
         return proxies
 
     async def validate_proxy(self, proxy: str) -> bool:
-        """Check if *proxy* works with one of the target gallery sites."""
+        """Fully test *proxy* by loading multiple gallery pages."""
         async with self.sema:
             test_url = pick_random_url()
             try:
-                timeout = aiohttp.ClientTimeout(total=10)
+                timeout = aiohttp.ClientTimeout(total=15)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
+                    headers = {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/119.0.0.0 Safari/537.36"
+                        )
+                    }
+
+                    # Step 1: Fetch the main gallery page
                     async with session.get(
-                        test_url,
-                        proxy=f"http://{proxy}",
-                        ssl=False,
-                        headers={
-                            "User-Agent": (
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/119.0.0.0 Safari/537.36"
-                            )
-                        },
+                        test_url, proxy=f"http://{proxy}", ssl=False, headers=headers
                     ) as resp:
                         html = await resp.text()
-                        if any(
-                            kw in html
-                            for kw in [
-                                "Coppermine",
-                                "gallery",
-                                "photo",
-                                "index.php",
-                                "thumbnails",
-                            ]
-                        ):
-                            log.info("[PROXY] OK: %s on %s", proxy, test_url)
-                            return True
+                    if not ("gallery" in html or "Coppermine" in html):
                         log.info(
-                            "[PROXY] BAD content from %s on %s", proxy, test_url
+                            "[PROXY] BAD: %s (no gallery keywords on index)", proxy
                         )
+                        return False
+
+                    # Step 2: Extract an album/thumbnail link
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "html.parser")
+                    thumb_link = None
+                    for a in soup.find_all("a", href=True):
+                        if "thumbnails.php?album=" in a["href"]:
+                            thumb_link = a["href"]
+                            break
+                    if not thumb_link:
+                        log.info(
+                            "[PROXY] BAD: %s (no album links found)", proxy
+                        )
+                        return False
+
+                    # Step 3: Follow the album link
+                    from urllib.parse import urljoin
+                    thumb_url = thumb_link
+                    if not thumb_link.startswith("http"):
+                        thumb_url = urljoin(test_url, thumb_link)
+                    async with session.get(
+                        thumb_url, proxy=f"http://{proxy}", ssl=False, headers=headers
+                    ) as resp2:
+                        page2 = await resp2.text()
+                    if "thumbnails" not in page2 and "album" not in page2:
+                        log.info(
+                            "[PROXY] BAD: %s (no thumbnails/album on album page)", proxy
+                        )
+                        return False
+
+                    # Step 4: Try fetching an image from the album
+                    soup2 = BeautifulSoup(page2, "html.parser")
+                    img = soup2.find("img")
+                    if img and img.get("src"):
+                        img_url = urljoin(thumb_url, img["src"])
+                        async with session.get(
+                            img_url,
+                            proxy=f"http://{proxy}",
+                            ssl=False,
+                            headers=headers,
+                        ) as resp3:
+                            ctype = resp3.headers.get("Content-Type", "")
+                            if resp3.status != 200 or not ctype.startswith("image"):
+                                log.info(
+                                    "[PROXY] BAD: %s (could not load image)", proxy
+                                )
+                                return False
+
+                    log.info("[PROXY] FULLY OK: %s", proxy)
+                    return True
             except Exception as e:
-                log.debug("[PROXY] Error %s on %s: %s", proxy, test_url, e)
-        log.info("[PROXY] BAD: %s", proxy)
+                log.info("[PROXY] BAD: %s (exc: %r)", proxy, e)
         return False
 
     async def _finish_tasks(self, tasks: list[asyncio.Task]) -> None:
