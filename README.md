@@ -20,6 +20,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
 - Dynamic proxy pool with caching — Harvests and validates free proxies automatically, caches results to skip dead proxies, and fast-fills the pool for quick startup; UI shows last check time
+- Proxy checks hit a random gallery URL from `proxy_manager.py` so only proxies that work on real targets are kept. Edit the `VALIDATION_URLS` list there to customize.
 - Verbose checkbox — Toggle DEBUG-level logging on demand while the app runs
 
 ## Limitations
