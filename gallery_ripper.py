@@ -7,6 +7,7 @@ import logging
 from typing import Any
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -227,7 +228,17 @@ def select_universal_rules(url: str):
 
 
 def select_adapter_for_url(url: str) -> str:
-    """Return the adapter key for *url* ("universal" or "coppermine")."""
+    """Return the adapter key for *url* ("universal", "coppermine", or "4chan")."""
+    url = url.strip()
+    if url.lower().startswith("4chan"):
+        return "4chan"
+    domain = urlparse(url).netloc.lower()
+    if (
+        "4chan.org" in domain
+        or "4channel.org" in domain
+        or "4cdn.org" in domain
+    ):
+        return "4chan"
     if select_universal_rules(url):
         return "universal"
     return "coppermine"
@@ -455,6 +466,158 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     return filtered_entries
 
 
+# -- 4chan helpers ------------------------------------------------------------
+
+FOURCHAN_URL_RE = re.compile(
+    r"(?:https?://)?(?:boards|a|i)\.4(?:chan|channel|cdn)\.org/([^/]+)/?(?:thread/(\d+))?",
+    re.IGNORECASE,
+)
+
+
+def normalize_fourchan_url(url: str) -> str:
+    """Return a canonical '4chan:board[/thread]' form for *url*."""
+    url = url.strip()
+    if not url:
+        return "4chan"
+    if url.lower().startswith("4chan"):
+        return url.rstrip("/")
+    m = FOURCHAN_URL_RE.search(url)
+    if m:
+        board = m.group(1)
+        thread = m.group(2)
+        return f"4chan:{board}/{thread}" if thread else f"4chan:{board}"
+    return "4chan"
+
+
+def fourchan_list_boards(log=lambda msg: None):
+    """Return a list of boards from the 4chan API."""
+    try:
+        data = fetch_json_simple("https://a.4cdn.org/boards.json")
+        boards = data.get("boards", [])
+        return boards
+    except Exception as e:
+        log(f"Error fetching boards: {e}")
+        return []
+
+
+def fourchan_list_threads(board, log=lambda msg: None):
+    """Return threads for *board* using the catalog API."""
+    board = board.strip().strip("/")
+    try:
+        data = fetch_json_simple(f"https://a.4cdn.org/{board}/catalog.json")
+    except Exception as e:
+        log(f"Error fetching catalog for /{board}/: {e}")
+        return []
+    threads = []
+    for page in data:
+        for th in page.get("threads", []):
+            subject = th.get("sub") or ""
+            teaser = th.get("com", "")
+            teaser = re.sub(r"<.*?>", "", teaser)[:80] if teaser else ""
+            title = subject or teaser or f"Thread {th['no']}"
+            threads.append({
+                "thread_id": th["no"],
+                "subject": title,
+                "image_count": th.get("images", 0),
+            })
+    return threads
+
+
+def fourchan_thread_images(board, thread_id, log=lambda msg: None):
+    """Return image entries from a specific thread."""
+    board = board.strip().strip("/")
+    try:
+        data = fetch_json_simple(
+            f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
+        )
+    except Exception as e:
+        log(f"Error fetching thread /{board}/{thread_id}: {e}")
+        return []
+    entries = []
+    for post in data.get("posts", []):
+        if "tim" in post and "ext" in post:
+            fname = f"{post.get('filename', str(post['tim']))}{post['ext']}"
+            url = f"https://i.4cdn.org/{board}/{post['tim']}{post['ext']}"
+            entries.append((fname, [url], None))
+    return entries
+
+
+def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
+    """Return a tree of boards and threads for 4chan."""
+    canonical = normalize_fourchan_url(root_url)
+    if canonical.lower() in {"4chan", "4chan:"}:
+        boards = fourchan_list_boards(log=log)
+        root = {
+            "type": "category",
+            "name": "4chan",
+            "url": "4chan",
+            "children": [],
+            "specials": [],
+            "albums": [],
+        }
+        for b in boards:
+            root["children"].append({
+                "type": "category",
+                "name": f"/{b['board']}/ - {b['title']}",
+                "url": f"4chan:{b['board']}",
+                "children": [],
+                "specials": [],
+                "albums": [],
+            })
+        return root
+
+    after_colon = canonical.split(":", 1)[-1]
+    if "/" in after_colon:
+        board, thread_id = after_colon.split("/", 1)
+        thread_id = thread_id.strip()
+        info = fourchan_thread_images(board, thread_id, log=log)
+        subject = f"Thread {thread_id}"
+        try:
+            data = fetch_json_simple(
+                f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
+            )
+            if data.get("posts"):
+                op = data["posts"][0]
+                subject = op.get("sub") or re.sub(r"<.*?>", "", op.get("com", ""))[:80] or subject
+        except Exception:
+            pass
+        node = {
+            "type": "category",
+            "name": f"/{board}/",
+            "url": f"4chan:{board}",
+            "children": [],
+            "specials": [],
+            "albums": [
+                {
+                    "type": "album",
+                    "name": f"{subject} ({thread_id})",
+                    "url": canonical,
+                    "image_count": len(info),
+                }
+            ],
+        }
+        return node
+
+    board = after_colon.strip()
+    threads = fourchan_list_threads(board, log=log)
+    node = {
+        "type": "category",
+        "name": f"/{board}/",
+        "url": canonical,
+        "children": [],
+        "specials": [],
+        "albums": [],
+    }
+    for th in threads:
+        node["albums"].append({
+            "type": "album",
+            "name": f"{th['subject']} ({th['thread_id']})",
+            "url": f"4chan:{board}/{th['thread_id']}",
+            "image_count": th.get("image_count", 0),
+        })
+    return node
+
+
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
@@ -613,6 +776,12 @@ def get_soup(url):
         logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
         run_async(get_pool_or_none().remove_proxy(used_proxy))
     return safe_soup(html)
+
+def fetch_json_simple(url: str) -> Any:
+    """Return parsed JSON from *url* using urllib.request."""
+    req = urllib.request.Request(url, headers=session_headers)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
@@ -888,6 +1057,12 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             page_cache=pages,
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
+        )
+    elif site_type == "4chan":
+        tree = fourchan_discover_tree(
+            root_url,
+            log=log,
+            quick_scan=quick_scan,
         )
     else:
         tree = discover_tree(
@@ -1357,7 +1532,10 @@ async def rip_galleries(
             len(selected_albums), ["/".join(a[2]) for a in selected_albums]
         )
     )
-    pages, tree = load_page_cache(root_url)
+    if select_adapter_for_url(root_url) == "4chan":
+        pages, tree = {}, None
+    else:
+        pages, tree = load_page_cache(root_url)
     site_type = select_adapter_for_url(root_url)
     rules = select_universal_rules(root_url) if site_type == "universal" else None
     download_queue = []
@@ -1370,6 +1548,11 @@ async def rip_galleries(
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
             )
+        elif site_type == "4chan":
+            board, tid = album_url.split(":", 1)[-1].split("/", 1)
+            board = board.strip().strip("/")
+            tid = tid.strip().split("/")[0]
+            image_entries = fourchan_thread_images(board, tid, log=log)
         else:
             image_entries = get_all_candidate_images_from_album(
                 album_url, log=log, page_cache=pages, quick_scan=quick_scan
