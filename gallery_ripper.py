@@ -496,10 +496,12 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
 
     pool = get_pool_or_none()
     log(f"{indent}[DEBUG] Fetching {url} using proxy: {pool}")
-    html, hdrs = run_async(
+    html, hdrs, used_proxy = run_async(
         async_http.fetch_html(url, pool, headers=session_headers, timeout=15)
     )
     log(f"{indent}[DEBUG] Finished fetching {url}")
+    if pool and (not html or not html.strip()):
+        run_async(pool.remove_proxy(used_proxy))
     page_cache[url] = {
         "html": html,
         "timestamp": time.time(),
@@ -538,7 +540,7 @@ def get_pool_or_none():
 def _proxy_thread():
     async def runner():
         await proxy_pool.refresh()
-        await proxy_pool.start_auto_refresh(interval=600)
+        await proxy_pool.start_auto_refresh(interval=60)
         await asyncio.Event().wait()
     asyncio.run(runner())
 
@@ -596,9 +598,11 @@ def safe_soup(html: str, parser: str = "html.parser", timeout: float = 5.0):
 
 
 def get_soup(url):
-    html, _ = run_async(
+    html, _, used_proxy = run_async(
         async_http.fetch_html(url, get_pool_or_none(), headers=session_headers)
     )
+    if get_pool_or_none() and (not html or not html.strip()):
+        run_async(get_pool_or_none().remove_proxy(used_proxy))
     return safe_soup(html)
 
 def sanitize_name(name: str) -> str:
@@ -981,9 +985,11 @@ def get_base_for_relative_images(page_url):
 def _fetch_fullsize_image(full_url, log):
     """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
     try:
-        html, hdrs = run_async(
+        html, hdrs, used_proxy = run_async(
             async_http.fetch_html(full_url, get_pool_or_none(), headers=session_headers)
         )
+        if get_pool_or_none() and (not html or not html.strip()):
+            run_async(get_pool_or_none().remove_proxy(used_proxy))
         if hdrs.get("Content-Type", "").startswith("image"):
             return [full_url]
         sub = safe_soup(html)
