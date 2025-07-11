@@ -581,6 +581,7 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
                 subject = op.get("sub") or re.sub(r"<.*?>", "", op.get("com", ""))[:80] or subject
         except Exception:
             pass
+        safe_subj = sanitize_folder_name(subject.strip()) or thread_id
         node = {
             "type": "category",
             "name": f"/{board}/",
@@ -593,6 +594,7 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
                     "name": f"{subject} ({thread_id})",
                     "url": canonical,
                     "image_count": len(info),
+                    "path": ["4chan", board, f"{safe_subj} ({thread_id})"],
                 }
             ],
         }
@@ -609,12 +611,16 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
         "albums": [],
     }
     for th in threads:
-        node["albums"].append({
-            "type": "album",
-            "name": f"{th['subject']} ({th['thread_id']})",
-            "url": f"4chan:{board}/{th['thread_id']}",
-            "image_count": th.get("image_count", 0),
-        })
+        safe_subj = sanitize_folder_name(th['subject'].strip()) or th['thread_id']
+        node["albums"].append(
+            {
+                "type": "album",
+                "name": f"{th['subject']} ({th['thread_id']})",
+                "url": f"4chan:{board}/{th['thread_id']}",
+                "image_count": th.get("image_count", 0),
+                "path": ["4chan", board, f"{safe_subj} ({th['thread_id']})"],
+            }
+        )
     return node
 
 
@@ -787,6 +793,10 @@ def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
     cleaned = "".join(c for c in name if c.isalnum() or c in " _-").strip()
     return cleaned or "unnamed"
+
+def sanitize_folder_name(name: str) -> str:
+    """Sanitize a folder name by replacing illegal characters."""
+    return re.sub(r'[\\/*?:"<>|]', '_', name)
 
 def get_album_image_count(album_url, page_cache=None):
     """Extract image count from album page (uses cache if present)."""
@@ -977,6 +987,8 @@ def site_cache_path(root_url):
 
 def load_page_cache(root_url):
     """Return the per-page cache and previously saved tree for *root_url*."""
+    if select_adapter_for_url(root_url) == "4chan":
+        return {}, None
     path = site_cache_path(root_url)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -988,6 +1000,8 @@ def load_page_cache(root_url):
 
 
 def save_page_cache(root_url, tree, pages):
+    if select_adapter_for_url(root_url) == "4chan":
+        return
     path = site_cache_path(root_url)
     gallery_title = tree.get("name") if tree else root_url
     with open(path, "w", encoding="utf-8") as f:
@@ -1678,6 +1692,9 @@ class GalleryRipperApp(tb.Window):
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
+        self.back_url = None
+        self.back_btn = ttk.Button(urlf, text="Back", command=self.go_back)
+        self.back_btn.pack_forget()
 
         pathf = ttk.Frame(control_frame)
         pathf.pack(fill="x", pady=(8, 0))
@@ -1766,6 +1783,7 @@ class GalleryRipperApp(tb.Window):
 
         self.selected_album_urls = set()
         self.item_to_album = {}
+        self.item_to_category = {}
         self._prev_selection = set()
 
         logframe = ttk.LabelFrame(paned, text="Log")
@@ -1886,6 +1904,13 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(button_frame, text="Delete Selected", command=do_delete).pack(side="left")
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 5))
 
+    def go_back(self):
+        if self.back_url:
+            self.url_var.set(self.back_url)
+            self.back_btn.pack_forget()
+            self.back_url = None
+            self.discover_albums()
+
     def log(self, msg):
         self.log_box.configure(state='normal')
         self.log_box.insert(tk.END, msg+'\n')
@@ -1902,6 +1927,7 @@ class GalleryRipperApp(tb.Window):
         self.tree.delete(*self.tree.get_children())
         self.selected_album_urls.clear()
         self.item_to_album.clear()
+        self.item_to_category.clear()
         self._prev_selection.clear()
         for alb in albums:
             img_count = alb.get("image_count", "?")
@@ -1912,7 +1938,8 @@ class GalleryRipperApp(tb.Window):
                 open=False,
             )
             self.tree.set(alb_id, "sel", "\u25A1")
-            self.item_to_album[alb_id] = (alb['name'], alb['url'], [alb['name']])
+            album_path = alb.get("path") or [alb['name']]
+            self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
 
     def on_search(self, *args):
         """Filter albums in the tree based on search."""
@@ -1960,6 +1987,7 @@ class GalleryRipperApp(tb.Window):
         self.tree.delete(*self.tree.get_children())
         self.selected_album_urls.clear()
         self.item_to_album.clear()
+        self.item_to_category.clear()
         self._prev_selection.clear()
         if "albums" in tree_data and not tree_data.get("children") and not tree_data.get("specials"):
             self._all_albums = tree_data["albums"]
@@ -1984,6 +2012,9 @@ class GalleryRipperApp(tb.Window):
         quick = self.quick_scan_var.get()
         self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
         self.discovery_thread.start()
+        if select_adapter_for_url(url) != "4chan" or "/" not in url.split(":", 1)[-1]:
+            self.back_btn.pack_forget()
+            self.back_url = None
 
     def do_discover(self, url, quick):
         try:
@@ -2002,6 +2033,8 @@ class GalleryRipperApp(tb.Window):
         node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
         self.tree.set(node_id, "sel", "\u25A1")
         node_path = path + [label]
+        if is_cat:
+            self.item_to_category[node_id] = (node["name"], node.get("url"), node_path)
 
         if self.show_specials_var.get():
             for spec in node.get("specials", []):
@@ -2018,7 +2051,8 @@ class GalleryRipperApp(tb.Window):
                 open=False,
             )
             self.tree.set(alb_id, "sel", "\u25A1")
-            self.item_to_album[alb_id] = (alb['name'], alb['url'], node_path + [alb['name']])
+            album_path = alb.get("path") or node_path + [alb['name']]
+            self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
 
         for child in node.get("children", []):
             self.insert_tree_node(node_id, child, node_path)
@@ -2086,6 +2120,15 @@ class GalleryRipperApp(tb.Window):
 
     def on_tree_doubleclick(self, event):
         item = self.tree.focus()
+        if item in self.item_to_category:
+            name, url, _ = self.item_to_category[item]
+            after = url.split(":", 1)[-1]
+            if select_adapter_for_url(url) == "4chan" and "/" not in after:
+                self.url_var.set(url)
+                self.back_url = "4chan"
+                self.back_btn.pack(side="left", padx=(5, 0))
+                self.discover_albums()
+                return
         if self.tree.get_children(item):
             self.tree.item(item, open=not self.tree.item(item, "open"))
 
