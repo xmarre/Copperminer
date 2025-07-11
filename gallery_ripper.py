@@ -41,6 +41,10 @@ def save_settings(settings):
 
 # -- Configuration ------------------------------------------------------------
 settings = load_settings()
+# Force-disable proxy usage regardless of existing settings
+if settings.get("use_proxies"):
+    settings["use_proxies"] = False
+    save_settings(settings)
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--min-proxies", type=int, help="Minimum working proxies")
 parser.add_argument(
@@ -73,8 +77,9 @@ logging.basicConfig(
 # Logger for additional debug messages
 logger = logging.getLogger("ripper.download")
 
-# Global flag to control proxy usage (disabled by default)
-USE_PROXIES = settings.get("use_proxies", False)
+
+# Proxy functionality is disabled for now
+USE_PROXIES = False
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -1520,7 +1525,8 @@ class GalleryRipperApp(tb.Window):
             command=self._toggle_verbose,
         ).pack(side="left", padx=(10, 0))
 
-        self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", False))
+
+        self.use_proxies_var = tk.BooleanVar(value=False)
         proxies_chk = ttk.Checkbutton(
             optionsf,
             text="Use proxies (NOT WORKING)",
