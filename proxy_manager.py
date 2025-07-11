@@ -346,6 +346,7 @@ class ProxyPool:
             return p
 
     async def remove_proxy(self, proxy: str) -> None:
+        log.info("[PROXY] Removing failed proxy: %s", proxy)
         log.debug("[PROXY] ✗ %s", proxy)
         async with self.lock:
             if proxy in self.pool and not self.manual_proxies:
@@ -373,6 +374,12 @@ class ProxyPool:
             if not ok and proxy:
                 await self.remove_proxy(proxy)
 
+    async def keep_harvesting(self, interval: int = 10) -> None:
+        """Continuously replenish proxies regardless of current pool size."""
+        while not self.stop_requested:
+            await self.replenish(force=True)
+            await asyncio.sleep(interval)
+
     async def start_auto_refresh(self, interval: int = 600) -> None:
         async def auto_refresh():
             while not self.stop_requested:
@@ -386,6 +393,9 @@ class ProxyPool:
             self.stop_requested = False
             log.info("[PROXY] Auto refresh every %d seconds", interval)
             self.refresh_task = asyncio.create_task(auto_refresh())
+        if not self.harvest_task or self.harvest_task.done():
+            log.info("[PROXY] Continuous harvesting every %d seconds", 10)
+            self.harvest_task = asyncio.create_task(self.keep_harvesting(10))
 
     async def stop_auto_refresh(self) -> None:
         """Stop any ongoing automatic proxy harvesting."""
@@ -397,6 +407,13 @@ class ProxyPool:
             except Exception:
                 pass
             self.refresh_task = None
+        if self.harvest_task:
+            self.harvest_task.cancel()
+            try:
+                await self.harvest_task
+            except Exception:
+                pass
+            self.harvest_task = None
         log.info("[PROXY] Auto refresh stopped")
 
     def clear_cache(self) -> None:
