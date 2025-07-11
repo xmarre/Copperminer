@@ -13,13 +13,9 @@ log.setLevel(logging.INFO)
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
+# Proxy sources powered by https://github.com/vakhov/fresh-proxy-list
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://proxyspace.pro/http.txt",
-    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
 ]
 
 # URLs used to validate that a proxy works with real target sites
