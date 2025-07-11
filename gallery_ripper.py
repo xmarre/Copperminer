@@ -77,6 +77,7 @@ logging.basicConfig(
 # Logger for additional debug messages
 logger = logging.getLogger("ripper.download")
 
+
 # Proxy functionality is disabled for now
 USE_PROXIES = False
 
@@ -1523,6 +1524,7 @@ class GalleryRipperApp(tb.Window):
             variable=self.verbose_var,
             command=self._toggle_verbose,
         ).pack(side="left", padx=(10, 0))
+
 
         self.use_proxies_var = tk.BooleanVar(value=False)
         proxies_chk = ttk.Checkbutton(
