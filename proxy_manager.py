@@ -22,6 +22,18 @@ PROXY_SOURCES = [
     "https://www.proxy-list.download/api/v1/get?type=http",
 ]
 
+# URLs used to validate that a proxy works with real target sites
+VALIDATION_URLS = [
+    "https://natalie-dormer.com/photos/index.php?cat=39",
+    "https://watson-emma.org/gallery/index.php",
+    "https://sophie-turner.net/gallery/",
+    "https://kristen-stewart.org/index.php?cat=0",
+    "https://theplace-2.com/photos",
+]
+
+def pick_random_url() -> str:
+    return random.choice(VALIDATION_URLS)
+
 MIN_PROXIES = 40
 VALIDATION_CONCURRENCY = 30
 
@@ -139,18 +151,42 @@ class ProxyPool:
         return proxies
 
     async def validate_proxy(self, proxy: str) -> bool:
+        """Check if *proxy* works with one of the target gallery sites."""
         async with self.sema:
-            for test_url in ["http://github.com", "https://github.com"]:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            test_url, proxy=f"http://{proxy}", timeout=15
-                        ) as resp:
-                            if resp.status in {200, 301, 302}:
-                                log.info("[PROXY] OK: %s on %s", proxy, test_url)
-                                return True
-                except Exception:
-                    continue
+            test_url = pick_random_url()
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        test_url,
+                        proxy=f"http://{proxy}",
+                        ssl=False,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/119.0.0.0 Safari/537.36"
+                            )
+                        },
+                    ) as resp:
+                        html = await resp.text()
+                        if any(
+                            kw in html
+                            for kw in [
+                                "Coppermine",
+                                "gallery",
+                                "photo",
+                                "index.php",
+                                "thumbnails",
+                            ]
+                        ):
+                            log.info("[PROXY] OK: %s on %s", proxy, test_url)
+                            return True
+                        log.info(
+                            "[PROXY] BAD content from %s on %s", proxy, test_url
+                        )
+            except Exception as e:
+                log.debug("[PROXY] Error %s on %s: %s", proxy, test_url, e)
         log.info("[PROXY] BAD: %s", proxy)
         return False
 
