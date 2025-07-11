@@ -501,6 +501,7 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     )
     log(f"{indent}[DEBUG] Finished fetching {url}")
     if pool and (not html or not html.strip()):
+        logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
         run_async(pool.remove_proxy(used_proxy))
     page_cache[url] = {
         "html": html,
@@ -602,6 +603,7 @@ def get_soup(url):
         async_http.fetch_html(url, get_pool_or_none(), headers=session_headers)
     )
     if get_pool_or_none() and (not html or not html.strip()):
+        logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
         run_async(get_pool_or_none().remove_proxy(used_proxy))
     return safe_soup(html)
 
@@ -989,6 +991,7 @@ def _fetch_fullsize_image(full_url, log):
             async_http.fetch_html(full_url, get_pool_or_none(), headers=session_headers)
         )
         if get_pool_or_none() and (not html or not html.strip()):
+            logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
             run_async(get_pool_or_none().remove_proxy(used_proxy))
         if hdrs.get("Content-Type", "").startswith("image"):
             return [full_url]
