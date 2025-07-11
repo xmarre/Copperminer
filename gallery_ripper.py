@@ -530,6 +530,7 @@ def safe_soup(html: str, parser: str = "html.parser", timeout: float = 5.0):
     When the builtin ``html.parser`` occasionally hangs on malformed input,
     we fall back to the ``html5lib`` parser instead of blocking indefinitely.
     """
+    print(f"[DEBUG] safe_soup called, len(html): {len(html)}, proxies: {USE_PROXIES}")
 
     result: list[Any] = []
 
@@ -555,6 +556,7 @@ def safe_soup(html: str, parser: str = "html.parser", timeout: float = 5.0):
             "[WARN] html.parser failed (%s); using html5lib", soup_or_exc
         )
         return BeautifulSoup(html, "html5lib")
+    print(f"[DEBUG] Soup loaded, proxies: {USE_PROXIES}")
     return soup_or_exc
 
 
@@ -1058,12 +1060,17 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
     print(f"[DEBUG] Got HTML ({len(html)} bytes), proxies: {USE_PROXIES}")
+    with open("hang-debug.html", "w", encoding="utf-8") as f:
+        f.write(html)
+    print("[DEBUG] Saved hang-debug.html")
+    print(f"[DEBUG] Before soup call, proxies: {USE_PROXIES}")
     entry = page_cache.get(album_url, {})
     if quick_scan and not changed and entry.get("images"):
         log(f"[DEBUG] Using cached image list for {album_url}")
         return entry["images"]
 
     soup = safe_soup(html)
+    print(f"[DEBUG] After soup call, proxies: {USE_PROXIES}")
     log = log or (lambda msg: None)
     image_entries = []
     unique_urls = set()
