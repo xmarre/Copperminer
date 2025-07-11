@@ -798,6 +798,16 @@ def sanitize_folder_name(name: str) -> str:
     """Sanitize a folder name by replacing illegal characters."""
     return re.sub(r'[\\/*?:"<>|]', '_', name)
 
+def get_downloaded_file_count(folder: str) -> int:
+    """Return the number of downloaded media files in *folder*."""
+    if not os.path.isdir(folder):
+        return 0
+    exts = ('*.jpg', '*.jpeg', '*.png', '*.gif', '*.webm', '*.mp4')
+    count = 0
+    for ext in exts:
+        count += len(glob.glob(os.path.join(folder, ext)))
+    return count
+
 def get_album_image_count(album_url, page_cache=None):
     """Extract image count from album page (uses cache if present)."""
     if page_cache is None:
@@ -1675,6 +1685,7 @@ class GalleryRipperApp(tb.Window):
         self.download_thread = None
         self.discovery_thread = None
         self.stop_flag = threading.Event()
+        self.history_stack = []
 
         self.url_var = tk.StringVar()
         self.path_var = tk.StringVar()
@@ -1692,7 +1703,6 @@ class GalleryRipperApp(tb.Window):
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
-        self.back_url = None
         self.back_btn = ttk.Button(urlf, text="Back", command=self.go_back)
         self.back_btn.pack_forget()
 
@@ -1905,11 +1915,12 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 5))
 
     def go_back(self):
-        if self.back_url:
-            self.url_var.set(self.back_url)
-            self.back_btn.pack_forget()
-            self.back_url = None
+        if self.history_stack:
+            prev_url = self.history_stack.pop()
+            self.url_var.set(prev_url)
             self.discover_albums()
+        if not self.history_stack:
+            self.back_btn.pack_forget()
 
     def log(self, msg):
         self.log_box.configure(state='normal')
@@ -2012,9 +2023,8 @@ class GalleryRipperApp(tb.Window):
         quick = self.quick_scan_var.get()
         self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
         self.discovery_thread.start()
-        if select_adapter_for_url(url) != "4chan" or "/" not in url.split(":", 1)[-1]:
+        if not self.history_stack:
             self.back_btn.pack_forget()
-            self.back_url = None
 
     def do_discover(self, url, quick):
         try:
@@ -2044,14 +2054,28 @@ class GalleryRipperApp(tb.Window):
 
         for alb in node.get("albums", []):
             img_count = alb.get("image_count", "?")
+            album_path = alb.get("path") or node_path + [alb['name']]
+            label = alb["name"]
+            if isinstance(img_count, int):
+                dl_folder = os.path.join(
+                    self.path_var.get().strip(),
+                    *[sanitize_name(p) for p in album_path],
+                )
+                existing = get_downloaded_file_count(dl_folder)
+                missing = img_count - existing
+                if missing <= 0:
+                    label = f"{alb['name']} ({img_count}) [\u2713]"
+                else:
+                    label = f"{alb['name']} ({img_count}) [+{missing}]"
+            else:
+                label = f"{alb['name']} ({img_count})"
             alb_id = self.tree.insert(
                 node_id,
                 "end",
-                text=f"\U0001F4F7 {alb['name']} ({img_count})",
+                text=f"\U0001F4F7 {label}",
                 open=False,
             )
             self.tree.set(alb_id, "sel", "\u25A1")
-            album_path = alb.get("path") or node_path + [alb['name']]
             self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
 
         for child in node.get("children", []):
@@ -2124,8 +2148,11 @@ class GalleryRipperApp(tb.Window):
             name, url, _ = self.item_to_category[item]
             after = url.split(":", 1)[-1]
             if select_adapter_for_url(url) == "4chan" and "/" not in after:
+                if url != "4chan" and (
+                    not self.history_stack or self.history_stack[-1] != self.url_var.get()
+                ):
+                    self.history_stack.append(self.url_var.get())
                 self.url_var.set(url)
-                self.back_url = "4chan"
                 self.back_btn.pack(side="left", padx=(5, 0))
                 self.discover_albums()
                 return
@@ -2259,6 +2286,8 @@ class GalleryRipperApp(tb.Window):
             self.thread_safe_log(f"Download error: {e}")
         finally:
             self.stop_flag.clear()
+            # Refresh the tree so completed threads show updated status
+            self.after(0, self.refresh_tree)
 
     def start_git_update(self):
         repo_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
