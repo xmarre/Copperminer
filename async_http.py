@@ -116,7 +116,7 @@ async def download_with_proxy(url, out_path, proxy_pool: ProxyPool | None, refer
                 ) as resp:
                     log.debug("IMG headers: %s", headers)
                     log.debug("IMG cookies: %s", cj.filter_cookies(url))
-                    if resp.status == 200 and resp.headers.get("Content-Type", "").startswith("image"):
+                    if resp.status == 200:
                         log.info("[IMG] %s -> %s", url, resp.status)
                         with open(out_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(16*1024):

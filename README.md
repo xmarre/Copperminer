@@ -28,8 +28,9 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 ### 4chan Usage
 
 Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
-URL. Boards list their active threads and selecting a thread downloads all
-attached files (images, webms, mp4s).
+URL. Double-click a board to list its active threads. Use the new **Back** button
+to return to the board list. Selecting a thread downloads all attached files
+(images, webms, mp4s) into a `4chan/<board>/<subject> (id)` folder structure.
 
 ## Limitations
 
