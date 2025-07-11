@@ -73,8 +73,8 @@ logging.basicConfig(
 # Logger for additional debug messages
 logger = logging.getLogger("ripper.download")
 
-# Global flag to control proxy usage
-USE_PROXIES = settings.get("use_proxies", True)
+# Global flag to control proxy usage (disabled by default)
+USE_PROXIES = settings.get("use_proxies", False)
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -543,9 +543,11 @@ def _proxy_thread():
         await proxy_pool.refresh()
         await proxy_pool.start_auto_refresh(interval=60)
         await asyncio.Event().wait()
+
     asyncio.run(runner())
 
-threading.Thread(target=_proxy_thread, daemon=True).start()
+if USE_PROXIES:
+    threading.Thread(target=_proxy_thread, daemon=True).start()
 
 def run_async(coro):
     """Safely execute *coro* whether or not an event loop is running."""
@@ -1518,12 +1520,13 @@ class GalleryRipperApp(tb.Window):
             command=self._toggle_verbose,
         ).pack(side="left", padx=(10, 0))
 
-        self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", True))
+        self.use_proxies_var = tk.BooleanVar(value=settings.get("use_proxies", False))
         proxies_chk = ttk.Checkbutton(
             optionsf,
-            text="Use proxies",
+            text="Use proxies (NOT WORKING)",
             variable=self.use_proxies_var,
             command=self.on_use_proxies_toggle,
+            state="disabled",
         )
         proxies_chk.pack(side="left", padx=(10, 0))
         btf = ttk.Frame(control_frame)
@@ -1597,13 +1600,13 @@ class GalleryRipperApp(tb.Window):
 
         self.proxy_frame = ttk.LabelFrame(paned, text="Proxy Pool")
         self.proxy_frame.pack(fill="x", padx=10, pady=6)
-        self.proxy_status = tk.StringVar()
+        self.proxy_status = tk.StringVar(value="Proxy feature disabled")
         ttk.Label(self.proxy_frame, textvariable=self.proxy_status).pack(side="left", padx=4)
         self.proxy_listbox = tk.Listbox(self.proxy_frame, height=4, width=36, font=("Consolas", 8))
         self.proxy_listbox.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(self.proxy_frame, text="Stop Harvest", command=self.stop_proxy_harvest).pack(side="right", padx=6)
-        ttk.Button(self.proxy_frame, text="Clear Cache", command=self.clear_proxy_cache).pack(side="right", padx=6)
-        ttk.Button(self.proxy_frame, text="Refresh Proxies", command=self.manual_refresh_proxies).pack(side="right", padx=6)
+        ttk.Button(self.proxy_frame, text="Stop Harvest", command=self.stop_proxy_harvest, state="disabled").pack(side="right", padx=6)
+        ttk.Button(self.proxy_frame, text="Clear Cache", command=self.clear_proxy_cache, state="disabled").pack(side="right", padx=6)
+        ttk.Button(self.proxy_frame, text="Refresh Proxies", command=self.manual_refresh_proxies, state="disabled").pack(side="right", padx=6)
 
         paned.add(treeframe, weight=3)
         paned.add(logframe, weight=1)
@@ -1613,7 +1616,7 @@ class GalleryRipperApp(tb.Window):
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
         self.tree.bind("<Button-1>", self.on_tree_click)
 
-        self.start_proxy_status_updater()
+        # Proxy functionality is disabled for now
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -1969,10 +1972,14 @@ class GalleryRipperApp(tb.Window):
 
     def on_use_proxies_toggle(self):
         """Handle toggling of the Use proxies checkbox."""
+        messagebox.showinfo(
+            "Proxies disabled", "The proxy feature is currently disabled."
+        )
+        self.use_proxies_var.set(False)
         global USE_PROXIES
-        USE_PROXIES = self.use_proxies_var.get()
+        USE_PROXIES = False
         settings = load_settings()
-        settings["use_proxies"] = USE_PROXIES
+        settings["use_proxies"] = False
         save_settings(settings)
 
     def _toggle_verbose(self):
