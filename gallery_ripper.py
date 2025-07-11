@@ -235,6 +235,10 @@ def universal_get_album_pages(album_url, rules, page_cache, log=lambda msg: None
     generate the full list of page URLs.
     """
     html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
     soup = safe_soup(html)
     print(f"[DEBUG] Soup loaded, proxies: {USE_PROXIES}")
 
@@ -274,6 +278,10 @@ def universal_get_album_image_count(album_url, rules, page_cache=None):
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=lambda m: None, quick_scan=False)
+            if not html or not html.strip():
+                raise Exception(
+                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+                )
             current_soup = safe_soup(html)
         if thumb_sel:
             count += len(current_soup.select(thumb_sel))
@@ -284,6 +292,10 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
     soup = safe_soup(html)
     title_tag = soup.find("h1") or soup.find("title")
     gallery_title = title_tag.text.strip() if title_tag else root_url
@@ -333,6 +345,10 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     # (3) For each letter page, fetch and add all celeb albums
     for letter_url in letter_links:
         l_html, _ = fetch_html_cached(letter_url, page_cache, log=log, quick_scan=quick_scan)
+        if not l_html or not l_html.strip():
+            raise Exception(
+                f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+            )
         l_soup = BeautifulSoup(l_html, "html.parser")
         for card in l_soup.select(".model-card__body a.model-card__body__title[href]"):
             alb_url = urljoin(letter_url, card['href'])
@@ -380,11 +396,19 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=log, quick_scan=quick_scan)
+            if not html or not html.strip():
+                raise Exception(
+                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+                )
             current_soup = safe_soup(html)
         for a in current_soup.select(thumb_sel or ""):
             detail_url = urljoin(page, a.get("href", ""))
             # Load the detail page to get the real image (not just the thumb)
             det_html, _ = fetch_html_cached(detail_url, page_cache, log=log, quick_scan=quick_scan)
+            if not det_html or not det_html.strip():
+                raise Exception(
+                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+                )
             det_soup = safe_soup(det_html)
             # Find the <a class="fancybox" href="..."> or the largest <img>
             full_img = None
@@ -582,6 +606,10 @@ def get_album_image_count(album_url, page_cache=None):
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(album_url, page_cache, log=lambda m: None, quick_scan=False)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
     soup = safe_soup(html)
     filecount = None
     info_div = soup.find(string=re.compile(r"files", re.I))
@@ -640,6 +668,10 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         page_cache = {}
 
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
     soup = safe_soup(html)
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
@@ -1070,6 +1102,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache = {}
 
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    if not html or not html.strip():
+        raise Exception(
+            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
+        )
     logger.info(
         f"[DEBUG] Got HTML ({len(html)} bytes), proxies: {USE_PROXIES}"
     )
