@@ -1,6 +1,8 @@
 import os
 import threading
+import asyncio
 import requests
+import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import urllib.request
@@ -575,6 +577,7 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
+DOWNLOAD_WORKERS = 4
 
 def get_soup(url):
     resp = session.get(url)
@@ -781,6 +784,8 @@ def site_cache_path(root_url):
 
 def load_page_cache(root_url):
     """Return the per-page cache and previously saved tree for *root_url*."""
+    if select_adapter_for_url(root_url) == "4chan":
+        return {}, None
     path = site_cache_path(root_url)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -792,6 +797,8 @@ def load_page_cache(root_url):
 
 
 def save_page_cache(root_url, tree, pages):
+    if select_adapter_for_url(root_url) == "4chan":
+        return
     path = site_cache_path(root_url)
     gallery_title = tree.get("name") if tree else root_url
     with open(path, "w", encoding="utf-8") as f:
@@ -876,7 +883,8 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
         )
-    save_page_cache(root_url, tree, pages)
+    if site_type != "4chan":
+        save_page_cache(root_url, tree, pages)
     return tree
 
 def get_image_links_from_js(album_url):
@@ -1282,6 +1290,48 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 album_stats['errors'] += 1
     return False
 
+
+async def download_4chan_image(session, url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
+    """Directly download a single 4chan image without extra logic."""
+    if fname is None:
+        fname = os.path.basename(url)
+    fpath = os.path.join(output_dir, fname)
+    if os.path.exists(fpath):
+        log(f"Already downloaded: {fname}")
+        return False
+    try:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            total_bytes = 0
+            start_time = time.time()
+            with open(fpath, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 16):
+                    if chunk:
+                        f.write(chunk)
+                        total_bytes += len(chunk)
+        elapsed = time.time() - start_time
+        speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
+        size_str = (
+            f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
+        )
+        speed_str = (
+            f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+        )
+        prefix = ""
+        if index is not None and total is not None:
+            prefix = f"File {index} of {total}: "
+        log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
+        if album_stats is not None:
+            album_stats['total_bytes'] += total_bytes
+            album_stats['total_time'] += elapsed
+            album_stats['downloaded'] += 1
+        return True
+    except Exception as e:
+        log(f"Error downloading {url}: {e}")
+        if album_stats is not None:
+            album_stats['errors'] += 1
+    return False
+
 def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
@@ -1289,11 +1339,77 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             len(selected_albums), ["/".join(a[2]) for a in selected_albums]
         )
     )
-    if select_adapter_for_url(root_url) == "4chan":
-        pages, tree = {}, None
-    else:
-        pages, tree = load_page_cache(root_url)
+
     site_type = select_adapter_for_url(root_url)
+    if site_type == "4chan":
+        log("Detected 4chan; using fast download path.")
+
+        async def rip_4chan():
+            stats = {
+                'total_bytes': 0,
+                'total_time': 0.0,
+                'downloaded': 0,
+                'errors': 0,
+                'start_time': time.time(),
+            }
+            async with aiohttp.ClientSession() as aio_sess:
+                for album_name, album_url, album_path in selected_albums:
+                    if stop_flag and stop_flag.is_set():
+                        log("Download stopped by user.")
+                        return
+                    log(f"\nScraping 4chan thread: {album_name}")
+                    board, tid = album_url.split(":", 1)[-1].split("/", 1)
+                    board = board.strip().strip("/")
+                    tid = tid.strip().split("/")[0]
+                    image_entries = fourchan_thread_images(board, tid, log=log)
+                    log(f"  Found {len(image_entries)} images in {album_name}.")
+                    outdir = os.path.join(
+                        output_root,
+                        *[sanitize_name(p) for p in album_path],
+                    )
+                    os.makedirs(outdir, exist_ok=True)
+                    total_images = len(image_entries)
+
+                    sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
+
+                    async def worker(idx, fname, url):
+                        if stop_flag and stop_flag.is_set():
+                            return
+                        async with sem:
+                            await download_4chan_image(
+                                aio_sess,
+                                url,
+                                outdir,
+                                log,
+                                fname=fname,
+                                index=idx,
+                                total=total_images,
+                                album_stats=stats,
+                            )
+                        if mimic_human:
+                            await asyncio.sleep(random.uniform(0.7, 2.5))
+                            if idx % random.randint(18, 28) == 0:
+                                log("...taking a longer break to mimic human behavior...")
+                                await asyncio.sleep(random.uniform(5, 8))
+
+                    tasks = [
+                        asyncio.create_task(worker(idx, fname, urls[0]))
+                        for idx, (fname, urls, _) in enumerate(image_entries, 1)
+                    ]
+                    await asyncio.gather(*tasks)
+
+            total_mb = stats['total_bytes'] / 1024 / 1024
+            elapsed = time.time() - stats['start_time']
+            avg_speed = total_mb / elapsed if elapsed > 0 else 0
+            log(
+                f"\nFinished all downloads!\n",
+                f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n",
+                f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
+            )
+
+        asyncio.run(rip_4chan())
+        return
+    pages, tree = load_page_cache(root_url)
     rules = select_universal_rules(root_url) if site_type == "universal" else None
     download_queue = []
     for album_name, album_url, album_path in selected_albums:
@@ -1305,11 +1421,6 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
             )
-        elif site_type == "4chan":
-            board, tid = album_url.split(":", 1)[-1].split("/", 1)
-            board = board.strip().strip("/")
-            tid = tid.strip().split("/")[0]
-            image_entries = fourchan_thread_images(board, tid, log=log)
         else:
             image_entries = get_all_candidate_images_from_album(
                 album_url, log=log, page_cache=pages, quick_scan=quick_scan
