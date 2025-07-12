@@ -599,6 +599,7 @@ class SmartRateLimiter:
         ramp_window=60,
         increase_factor=0.95,
         backoff_factor=2.0,
+        allow_ramp=True,
     ):
         self.initial_delay = initial_delay
         self.delay = initial_delay
@@ -607,6 +608,7 @@ class SmartRateLimiter:
         self.ramp_window = ramp_window
         self.increase_factor = increase_factor
         self.backoff_factor = backoff_factor
+        self.allow_ramp = allow_ramp
 
         self.lock = threading.Lock()
         self.last_request = 0.0
@@ -639,7 +641,11 @@ class SmartRateLimiter:
             else:
                 window_start = now - self.ramp_window
                 recent = [s for t, s in self.history if t >= window_start]
-                if len(recent) > 20 and all(s != 429 for s in recent):
+                if (
+                    self.allow_ramp
+                    and len(recent) > 20
+                    and all(s != 429 for s in recent)
+                ):
                     self.delay = max(self.min_delay, self.delay * self.increase_factor)
                     self.predicted_safe_delay = self.delay
                 else:
@@ -668,11 +674,13 @@ image_rate_limiter = SmartRateLimiter(
     initial_delay=0.35,  # ~3 req/s start
     min_delay=0.20,
     max_delay=3.0,
+    allow_ramp=True,
 )
 media_rate_limiter = SmartRateLimiter(
     initial_delay=3.0,  # ~0.33 req/s start
     min_delay=2.0,
     max_delay=20.0,
+    allow_ramp=False,
 )
 
 def rate_limiter_for_url(url: str) -> SmartRateLimiter:
