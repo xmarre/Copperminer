@@ -1298,39 +1298,41 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
     return False
 
 
-def download_4chan_image_sync(url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
-    """Download a single 4chan image using a fresh TCP connection."""
+def download_4chan_image_oldschool(url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
+    """Download a single 4chan image using urllib like older versions."""
     if fname is None:
         fname = os.path.basename(url)
     fpath = os.path.join(output_dir, fname)
     if os.path.exists(fpath):
         log(f"Already downloaded: {fname}")
-        return True
+        return False
     try:
-        headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Connection": "close",
-        }
-        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
-            r.raise_for_status()
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        start_time = time.time()
+        with urllib.request.urlopen(req, timeout=60) as resp, open(fpath, "wb") as out:
             total_bytes = 0
-            start_time = time.time()
-            with open(fpath, "wb") as f:
-                for chunk in r.iter_content(1024 * 16):
-                    if chunk:
-                        f.write(chunk)
-                        total_bytes += len(chunk)
+            while True:
+                chunk = resp.read(1024 * 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total_bytes += len(chunk)
         elapsed = time.time() - start_time
         speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
         size_str = (
             f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
         )
-        speed_str = (
-            f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
-        )
-        prefix = ""
-        if index is not None and total is not None:
-            prefix = f"File {index} of {total}: "
+        speed_str = f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+        prefix = f"File {index} of {total}: " if (index and total) else ""
         log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
         if album_stats is not None:
             album_stats['total_bytes'] += total_bytes
@@ -1389,7 +1391,7 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                     async with sem:
                         await loop.run_in_executor(
                             None,
-                            download_4chan_image_sync,
+                            download_4chan_image_oldschool,
                             url,
                             outdir,
                             log,
@@ -1414,11 +1416,10 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             elapsed = time.time() - stats['start_time']
             avg_speed = total_mb / elapsed if elapsed > 0 else 0
             log(
-                f"\nFinished all downloads!\n",
-                f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n",
+                f"\nFinished all downloads!\n"
+                f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n"
                 f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
             )
-
         asyncio.run(rip_4chan())
         return
     pages, tree = load_page_cache(root_url)
