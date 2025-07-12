@@ -465,8 +465,10 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
+    sample_urls = [c[0] for _, c, _ in filtered_entries[:3]]
+    log(f"[DEBUG] Returning {len(filtered_entries)} entries, sample={sample_urls}")
     logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, sample={sample_urls}, proxies: {USE_PROXIES}"
     )
     return filtered_entries
 
@@ -1448,7 +1450,9 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     return unique_candidates
 
 
-def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True):
+def get_all_candidate_images_from_album(
+    album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True
+):
     """Return all candidate image URLs from an album.
 
     The return value is a list of tuples ``(display_title, [url1, url2, ...], referer)``
@@ -1456,8 +1460,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     galleries require that same page be supplied as the HTTP ``Referer`` when
     fetching the direct image URLs.
     """
+    log(f"[DEBUG] Called Coppermine adapter for {album_url}")
     logger.info(
-        f"[DEBUG] Called get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] get_all_candidate_images_from_album for {album_url}, proxies: {USE_PROXIES}"
     )
     if visited is None:
         visited = set()
@@ -1472,7 +1477,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache = {}
 
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
+    log(f"[DEBUG] HTML length: {len(html) if html else 0}")
     if not html or not html.strip():
+        log("[DEBUG] No HTML or empty page returned")
         raise Exception(
             f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
         )
@@ -1495,6 +1502,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         return entry["images"]
 
     soup = safe_soup(html)
+    log("[DEBUG] Parsed album HTML")
     logger.info(f"[DEBUG] After soup call, proxies: {USE_PROXIES}")
     log = log or (lambda msg: None)
     image_entries = []
@@ -1509,7 +1517,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 log(f"[DEBUG] fb_imagelist -> {url}")
                 image_entries.append((f"Image {idx}", [url], album_url))
                 unique_urls.add(url)
-    print(f"[DEBUG] After fb_imagelist discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After fb_imagelist discovery, entries: {len(image_entries)}")
 
     # 2. Try all displayimage.php pages (these are "original" image pages)
     display_links = []
@@ -1519,8 +1527,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         if "displayimage.php" in href and "album=" in href and "pid=" in href:
             display_links.append(urljoin(album_url, href))
     display_links = list(dict.fromkeys(display_links))  # dedupe
-    if display_links:
-        log(f"[DEBUG] Found {len(display_links)} displayimage links")
+    log(f"[DEBUG] Found {len(display_links)} displayimage links")
 
     for n, dlink in enumerate(display_links, 1):
         log(f"[ALBUM] {n}/{len(display_links)} scan {dlink}")
@@ -1529,7 +1536,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         if good_candidates:
             image_entries.append((f"Image (displayimage) {n}", good_candidates, dlink))
             unique_urls.update(good_candidates)
-    print(f"[DEBUG] After displayimage discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After displayimage discovery, entries: {len(image_entries)}")
 
     # 3. Direct <img> links that aren't thumbnails
     for img in soup.find_all("img", src=True):
@@ -1549,7 +1556,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             log(f"[DEBUG] img tag -> {url}")
             image_entries.append((f"Image (img tag)", [url], album_url))
             unique_urls.add(url)
-    print(f"[DEBUG] After img tag discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After img tag discovery, entries: {len(image_entries)}")
 
     # 4. Direct <a> links to image files
     for a in soup.find_all("a", href=True):
@@ -1560,7 +1567,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 log(f"[DEBUG] a tag -> {url}")
                 image_entries.append((f"Image (a tag)", [url], album_url))
                 unique_urls.add(url)
-    print(f"[DEBUG] After a tag discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After a tag discovery, entries: {len(image_entries)}")
 
     # 5. Pagination support (recurse for all "page=" links)
     pagelinks = set()
@@ -1574,13 +1581,13 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 pl, log=log, visited=visited, page_cache=page_cache, quick_scan=quick_scan
             )
         )
-    print(f"[DEBUG] After pagination discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After pagination discovery, entries: {len(image_entries)}")
 
     if image_entries:
         log(f"Found {len(image_entries)} images total after all strategies.")
     else:
         log("No images found in album after all strategies.")
-    print(f"[DEBUG] After all discovery, found {len(image_entries)} entries, proxies: {USE_PROXIES}")
+    log(f"[DEBUG] After all discovery, found {len(image_entries)} entries")
 
     filtered_entries = []
     for name, candidates, referer in image_entries:
@@ -1602,8 +1609,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
 
+    sample_urls = [c[0] for _, c, _ in filtered_entries[:3]]
     logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, sample={sample_urls}, proxies: {USE_PROXIES}"
     )
     return filtered_entries
 
@@ -1712,6 +1720,7 @@ async def rip_galleries(
             log("Download stopped by user.")
             return
         log(f"\nScraping album: {album_name}")
+        log(f"[DEBUG] Adapter: {site_type}, url: {album_url}")
         if site_type == "universal":
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
