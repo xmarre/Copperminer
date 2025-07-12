@@ -975,7 +975,8 @@ def _fetch_fullsize_image(full_url, log):
     try:
         resp = session.get(full_url)
         resp.raise_for_status()
-        if resp.headers.get("Content-Type", "").startswith("image"):
+        ctype = resp.headers.get("Content-Type", "")
+        if ctype.startswith("image") or ctype.startswith("video"):
             return [full_url]
         sub = BeautifulSoup(resp.text, "html.parser")
         base = get_base_for_relative_images(full_url)
@@ -1241,8 +1242,11 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
                 r = session.get(candidate, headers=headers, stream=True, timeout=20)
                 r.raise_for_status()
-                if not r.headers.get("Content-Type", "").startswith("image"):
-                    raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
+                ctype = r.headers.get("Content-Type", "")
+                if not (ctype.startswith("image") or ctype.startswith("video")):
+                    raise Exception(
+                        f"URL does not return media: {candidate} (Content-Type: {ctype})"
+                    )
                 total_bytes = 0
                 start_time = time.time()
                 with open(fpath, "wb") as f:
