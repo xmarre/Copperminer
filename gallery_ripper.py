@@ -465,8 +465,9 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
+    sample_urls = [c[0] for _, c, _ in filtered_entries[:3]]
     logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, sample={sample_urls}, proxies: {USE_PROXIES}"
     )
     return filtered_entries
 
@@ -1457,7 +1458,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     fetching the direct image URLs.
     """
     logger.info(
-        f"[DEBUG] Called get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] get_all_candidate_images_from_album for {album_url}, proxies: {USE_PROXIES}"
     )
     if visited is None:
         visited = set()
@@ -1602,8 +1603,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
 
+    sample_urls = [c[0] for _, c, _ in filtered_entries[:3]]
     logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
+        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, sample={sample_urls}, proxies: {USE_PROXIES}"
     )
     return filtered_entries
 
