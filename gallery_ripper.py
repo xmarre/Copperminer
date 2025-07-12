@@ -1,10 +1,6 @@
 import os
 import threading
-import asyncio
-import warnings
-import argparse
-import logging
-from typing import Any
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import urllib.request
@@ -23,8 +19,6 @@ import subprocess
 import sys
 import glob
 
-warnings.filterwarnings("ignore", category=ResourceWarning)
-
 SETTINGS_FILE = "settings.json"
 
 
@@ -39,50 +33,6 @@ def load_settings():
 def save_settings(settings):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
-
-
-# -- Configuration ------------------------------------------------------------
-settings = load_settings()
-# Force-disable proxy usage regardless of existing settings
-if settings.get("use_proxies"):
-    settings["use_proxies"] = False
-    save_settings(settings)
-parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("--min-proxies", type=int, help="Minimum working proxies")
-parser.add_argument(
-    "--validation-concurrency",
-    type=int,
-    help="Concurrent proxy validation tasks",
-)
-parser.add_argument("--download-workers", type=int, help="Concurrent downloads")
-parser.add_argument("--proxy", help="Use a single HTTP proxy for all requests")
-parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-args, _ = parser.parse_known_args()
-
-MIN_PROXIES = args.min_proxies or settings.get("min_proxies", 40)
-VALIDATION_CONCURRENCY = args.validation_concurrency or settings.get(
-    "proxy_validation_concurrency", 30
-)
-# Default to 1 worker unless provided via CLI or saved settings
-DOWNLOAD_WORKERS = args.download_workers or settings.get("download_workers", 1)
-MANUAL_PROXY = args.proxy
-
-LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
-
-# Configure the root logger early so debug/info messages from imported
-# modules aren't dropped before the GUI attaches its own handler.
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-    stream=sys.stdout,
-)
-
-# Logger for additional debug messages
-logger = logging.getLogger("ripper.download")
-
-
-# Proxy functionality is disabled for now
-USE_PROXIES = False
 
 def compute_child_hash(subcats, albums):
     """Return a stable hash for the discovered subcats/albums list."""
@@ -140,26 +90,6 @@ def ensure_https_remote(repo_dir):
         pass
 
 
-def update_requirements(log=print):
-    """Install or update dependencies listed in requirements.txt."""
-    req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
-    if not os.path.exists(req_path):
-        log("requirements.txt not found.")
-        return
-    log("Installing/updating requirements...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "-r", req_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.stdout:
-        log(result.stdout)
-    if result.returncode != 0:
-        log("Error installing requirements:\n" + result.stderr)
-
-
-
 # --- Filtering helpers -------------------------------------------------------
 
 UI_IMAGE_FILENAMES = {
@@ -186,10 +116,8 @@ def is_ui_image(url: str, name: str) -> bool:
 def is_probably_thumbnail(url: str) -> bool:
     """Return True if the remote resource is very small (<4KB)."""
     try:
-        status, headers = run_async(
-            async_http.head_with_proxy(url, get_pool_or_none(), headers=session_headers, timeout=5)
-        )
-        length = int(headers.get("content-length", 0))
+        r = session.head(url, timeout=5, allow_redirects=True)
+        length = int(r.headers.get("content-length", 0))
         if 0 < length < 4096:
             return True
     except Exception:
@@ -255,12 +183,7 @@ def universal_get_album_pages(album_url, rules, page_cache, log=lambda msg: None
     generate the full list of page URLs.
     """
     html, _ = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
-    if not html or not html.strip():
-        raise Exception(
-            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-        )
-    soup = safe_soup(html)
-    print(f"[DEBUG] Soup loaded, proxies: {USE_PROXIES}")
+    soup = BeautifulSoup(html, "html.parser")
 
     pages = set([album_url])
     selector = rules.get("pagination_selector")
@@ -298,11 +221,7 @@ def universal_get_album_image_count(album_url, rules, page_cache=None):
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=lambda m: None, quick_scan=False)
-            if not html or not html.strip():
-                raise Exception(
-                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-                )
-            current_soup = safe_soup(html)
+            current_soup = BeautifulSoup(html, "html.parser")
         if thumb_sel:
             count += len(current_soup.select(thumb_sel))
     return count
@@ -312,11 +231,7 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan)
-    if not html or not html.strip():
-        raise Exception(
-            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-        )
-    soup = safe_soup(html)
+    soup = BeautifulSoup(html, "html.parser")
     title_tag = soup.find("h1") or soup.find("title")
     gallery_title = title_tag.text.strip() if title_tag else root_url
     node = {
@@ -365,10 +280,6 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     # (3) For each letter page, fetch and add all celeb albums
     for letter_url in letter_links:
         l_html, _ = fetch_html_cached(letter_url, page_cache, log=log, quick_scan=quick_scan)
-        if not l_html or not l_html.strip():
-            raise Exception(
-                f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-            )
         l_soup = BeautifulSoup(l_html, "html.parser")
         for card in l_soup.select(".model-card__body a.model-card__body__title[href]"):
             alb_url = urljoin(letter_url, card['href'])
@@ -416,20 +327,12 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
             current_soup = soup
         else:
             html, _ = fetch_html_cached(page, page_cache, log=log, quick_scan=quick_scan)
-            if not html or not html.strip():
-                raise Exception(
-                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-                )
-            current_soup = safe_soup(html)
+            current_soup = BeautifulSoup(html, "html.parser")
         for a in current_soup.select(thumb_sel or ""):
             detail_url = urljoin(page, a.get("href", ""))
             # Load the detail page to get the real image (not just the thumb)
             det_html, _ = fetch_html_cached(detail_url, page_cache, log=log, quick_scan=quick_scan)
-            if not det_html or not det_html.strip():
-                raise Exception(
-                    f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-                )
-            det_soup = safe_soup(det_html)
+            det_soup = BeautifulSoup(det_html, "html.parser")
             # Find the <a class="fancybox" href="..."> or the largest <img>
             full_img = None
             fancy = det_soup.select_one("a.fancybox[href]")
@@ -462,11 +365,7 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
-    logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
-    )
     return filtered_entries
-
 
 # -- 4chan helpers ------------------------------------------------------------
 
@@ -495,8 +394,7 @@ def fourchan_list_boards(log=lambda msg: None):
     """Return a list of boards from the 4chan API."""
     try:
         data = fetch_json_simple("https://a.4cdn.org/boards.json")
-        boards = data.get("boards", [])
-        return boards
+        return data.get("boards", [])
     except Exception as e:
         log(f"Error fetching boards: {e}")
         return []
@@ -629,33 +527,21 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
-    # Skip the costly HEAD check when proxies are enabled and a cached entry exists
-    if entry and quick_scan and USE_PROXIES:
-        log(f"{indent}Using cached page (skipping proxy HEAD): {url}")
-        return entry["html"], False
     if entry and quick_scan:
-        pool = get_pool_or_none()
-        if USE_PROXIES and pool is None:
-            log(f"{indent}Using cached page (proxy pool not ready): {url}")
-            return entry["html"], False
         headers = {}
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
         if entry.get("last_modified"):
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
-            status, hdrs = run_async(
-                async_http.head_with_proxy(
-                    url, get_pool_or_none(), headers={**session_headers, **headers}, timeout=10
-                )
-            )
-            if status == 304:
+            r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
+            if r.status_code == 304:
                 entry["timestamp"] = time.time()
                 log(f"{indent}Using cached page (304): {url}")
                 return entry["html"], False
-            if status == 200:
-                et = hdrs.get("ETag")
-                lm = hdrs.get("Last-Modified")
+            if r.status_code == 200:
+                et = r.headers.get("ETag")
+                lm = r.headers.get("Last-Modified")
                 if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
                     entry["timestamp"] = time.time()
                     log(f"{indent}Using cached page (headers match): {url}")
@@ -670,124 +556,34 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
-    pool = get_pool_or_none()
-    log(f"{indent}[DEBUG] Fetching {url} using proxy: {pool}")
-    html, hdrs, used_proxy = run_async(
-        async_http.fetch_html(url, pool, headers=session_headers, timeout=15)
-    )
-    log(f"{indent}[DEBUG] Finished fetching {url}")
-    if pool and (not html or not html.strip()):
-        logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
-        run_async(pool.remove_proxy(used_proxy))
+    resp = session.get(url)
+    resp.raise_for_status()
+    html = resp.text
     page_cache[url] = {
         "html": html,
         "timestamp": time.time(),
-        "etag": hdrs.get("ETag"),
-        "last_modified": hdrs.get("Last-Modified"),
+        "etag": resp.headers.get("ETag"),
+        "last_modified": resp.headers.get("Last-Modified"),
     }
     log(f"{indent}Fetched: {url}")
     return html, True
 
 BASE_URL = ""  # Will be set from GUI
-from proxy_manager import ProxyPool
-import async_http
-
-session_headers = {
+session = requests.Session()
+session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-}
-
-proxy_pool = ProxyPool(
-    min_proxies=MIN_PROXIES,
-    fast_fill=DOWNLOAD_WORKERS,
-    validation_concurrency=VALIDATION_CONCURRENCY,
-    manual_proxies=[MANUAL_PROXY] if MANUAL_PROXY else None,
-)
-if MANUAL_PROXY:
-    logging.getLogger("ripper.proxy").info(f"[PROXY] Using manual proxy: {MANUAL_PROXY}")
-
-
-def get_pool_or_none():
-    """Return the proxy pool only when it's ready and proxies are enabled."""
-    if not USE_PROXIES:
-        return None
-    if proxy_pool.pool_ready and proxy_pool.pool:
-        return proxy_pool
-    return None
-
-def _proxy_thread():
-    async def runner():
-        await proxy_pool.refresh()
-        await proxy_pool.start_auto_refresh(interval=60)
-        await asyncio.Event().wait()
-
-    asyncio.run(runner())
-
-if USE_PROXIES:
-    threading.Thread(target=_proxy_thread, daemon=True).start()
-
-def run_async(coro):
-    """Safely execute *coro* whether or not an event loop is running."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No event loop, run a new one
-        return asyncio.run(coro)
-    else:
-        if loop.is_running():
-            fut = asyncio.run_coroutine_threadsafe(coro, loop)
-            return fut.result()
-        return loop.run_until_complete(coro)
+})
 
 CACHE_DIR = ".coppermine_cache"
 
-def safe_soup(html: str, parser: str = "html.parser", timeout: float = 5.0):
-    """Parse *html* safely using BeautifulSoup with a timeout.
-
-    When the builtin ``html.parser`` occasionally hangs on malformed input,
-    we fall back to the ``html5lib`` parser instead of blocking indefinitely.
-    """
-    print(f"[DEBUG] safe_soup called, len(html): {len(html)}, proxies: {USE_PROXIES}")
-
-    result: list[Any] = []
-
-    def _worker() -> None:
-        try:
-            result.append(BeautifulSoup(html, parser))
-        except Exception as e:  # pragma: no cover - best effort
-            result.append(e)
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout)
-
-    if t.is_alive():
-        logging.getLogger("ripper.parser").warning(
-            "[WARN] html.parser timeout; falling back to html5lib"
-        )
-        return BeautifulSoup(html, "html5lib")
-
-    soup_or_exc = result[0]
-    if isinstance(soup_or_exc, Exception):
-        logging.getLogger("ripper.parser").warning(
-            "[WARN] html.parser failed (%s); using html5lib", soup_or_exc
-        )
-        return BeautifulSoup(html, "html5lib")
-    print(f"[DEBUG] Soup loaded, proxies: {USE_PROXIES}")
-    return soup_or_exc
-
-
 def get_soup(url):
-    html, _, used_proxy = run_async(
-        async_http.fetch_html(url, get_pool_or_none(), headers=session_headers)
-    )
-    if get_pool_or_none() and (not html or not html.strip()):
-        logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
-        run_async(get_pool_or_none().remove_proxy(used_proxy))
-    return safe_soup(html)
+    resp = session.get(url)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser")
 
-def fetch_json_simple(url: str) -> Any:
+def fetch_json_simple(url: str):
     """Return parsed JSON from *url* using urllib.request."""
-    req = urllib.request.Request(url, headers=session_headers)
+    req = urllib.request.Request(url, headers=session.headers)
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -815,11 +611,7 @@ def get_album_image_count(album_url, page_cache=None):
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(album_url, page_cache, log=lambda m: None, quick_scan=False)
-    if not html or not html.strip():
-        raise Exception(
-            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-        )
-    soup = safe_soup(html)
+    soup = BeautifulSoup(html, "html.parser")
     filecount = None
     info_div = soup.find(string=re.compile(r"files", re.I))
     if info_div:
@@ -877,17 +669,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         page_cache = {}
 
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
-    if depth == 0:
-        try:
-            with open("latest-proxy-fetch.html", "w", encoding="utf-8") as f:
-                f.write(html)
-        except Exception as e:
-            log(f"{indent}[WARN] Failed to save HTML: {e}")
-    if not html or not html.strip():
-        raise Exception(
-            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-        )
-    soup = safe_soup(html)
+    soup = BeautifulSoup(html, "html.parser")
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
 
@@ -999,8 +781,6 @@ def site_cache_path(root_url):
 
 def load_page_cache(root_url):
     """Return the per-page cache and previously saved tree for *root_url*."""
-    if select_adapter_for_url(root_url) == "4chan":
-        return {}, None
     path = site_cache_path(root_url)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -1012,8 +792,6 @@ def load_page_cache(root_url):
 
 
 def save_page_cache(root_url, tree, pages):
-    if select_adapter_for_url(root_url) == "4chan":
-        return
     path = site_cache_path(root_url)
     gallery_title = tree.get("name") if tree else root_url
     with open(path, "w", encoding="utf-8") as f:
@@ -1139,7 +917,7 @@ def get_image_links_from_js(album_url):
 def extract_album_image_links(html, album_url):
     """Return list of image or displayimage links found in album HTML."""
     links = []
-    soup = safe_soup(html)
+    soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "displayimage.php" in href and "pid=" in href:
@@ -1195,15 +973,11 @@ def get_base_for_relative_images(page_url):
 def _fetch_fullsize_image(full_url, log):
     """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
     try:
-        html, hdrs, used_proxy = run_async(
-            async_http.fetch_html(full_url, get_pool_or_none(), headers=session_headers)
-        )
-        if get_pool_or_none() and (not html or not html.strip()):
-            logger.info(f"[PROXY] Removing failed proxy: {used_proxy}")
-            run_async(get_pool_or_none().remove_proxy(used_proxy))
-        if hdrs.get("Content-Type", "").startswith("image"):
+        resp = session.get(full_url)
+        resp.raise_for_status()
+        if resp.headers.get("Content-Type", "").startswith("image"):
             return [full_url]
-        sub = safe_soup(html)
+        sub = BeautifulSoup(resp.text, "html.parser")
         base = get_base_for_relative_images(full_url)
         img = sub.find("img")
         if img and img.get("src"):
@@ -1314,15 +1088,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     galleries require that same page be supplied as the HTTP ``Referer`` when
     fetching the direct image URLs.
     """
-    logger.info(
-        f"[DEBUG] Called get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
-    )
     if visited is None:
         visited = set()
     if album_url in visited:
-        logger.info(
-            f"[DEBUG] Returning EMPTY LIST from get_all_candidate_images_from_album (already visited), proxies: {USE_PROXIES}"
-        )
         return []
     visited.add(album_url)
 
@@ -1330,30 +1098,12 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache = {}
 
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
-    if not html or not html.strip():
-        raise Exception(
-            f"NO HTML RETURNED: Proxy probably dead/useless for this host. (proxies={USE_PROXIES})"
-        )
-    logger.info(
-        f"[DEBUG] Got HTML ({len(html)} bytes), proxies: {USE_PROXIES}"
-    )
-    with open("hang-debug.html", "w", encoding="utf-8") as f:
-        f.write(html)
-    logger.info("[DEBUG] Saved hang-debug.html")
-    logger.info(f"[DEBUG] Before soup call, proxies: {USE_PROXIES}")
     entry = page_cache.get(album_url, {})
-    logger.info(
-        f"[DEBUG] quick_scan={quick_scan}, changed={changed}, entry images={bool(entry.get('images'))}, proxies: {USE_PROXIES}"
-    )
     if quick_scan and not changed and entry.get("images"):
         log(f"[DEBUG] Using cached image list for {album_url}")
-        logger.info(
-            f"[DEBUG] Returning {len(entry.get('images', []))} cached entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
-        )
         return entry["images"]
 
-    soup = safe_soup(html)
-    logger.info(f"[DEBUG] After soup call, proxies: {USE_PROXIES}")
+    soup = BeautifulSoup(html, "html.parser")
     log = log or (lambda msg: None)
     image_entries = []
     unique_urls = set()
@@ -1367,7 +1117,6 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 log(f"[DEBUG] fb_imagelist -> {url}")
                 image_entries.append((f"Image {idx}", [url], album_url))
                 unique_urls.add(url)
-    print(f"[DEBUG] After fb_imagelist discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
 
     # 2. Try all displayimage.php pages (these are "original" image pages)
     display_links = []
@@ -1380,14 +1129,12 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     if display_links:
         log(f"[DEBUG] Found {len(display_links)} displayimage links")
 
-    for n, dlink in enumerate(display_links, 1):
-        log(f"[ALBUM] {n}/{len(display_links)} scan {dlink}")
+    for idx, dlink in enumerate(display_links, 1):
         candidates = extract_all_displayimage_candidates(dlink, log)
         good_candidates = [url for url in candidates if url not in unique_urls]
         if good_candidates:
-            image_entries.append((f"Image (displayimage) {n}", good_candidates, dlink))
+            image_entries.append((f"Image (displayimage) {idx}", good_candidates, dlink))
             unique_urls.update(good_candidates)
-    print(f"[DEBUG] After displayimage discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
 
     # 3. Direct <img> links that aren't thumbnails
     for img in soup.find_all("img", src=True):
@@ -1407,7 +1154,6 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             log(f"[DEBUG] img tag -> {url}")
             image_entries.append((f"Image (img tag)", [url], album_url))
             unique_urls.add(url)
-    print(f"[DEBUG] After img tag discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
 
     # 4. Direct <a> links to image files
     for a in soup.find_all("a", href=True):
@@ -1418,7 +1164,6 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 log(f"[DEBUG] a tag -> {url}")
                 image_entries.append((f"Image (a tag)", [url], album_url))
                 unique_urls.add(url)
-    print(f"[DEBUG] After a tag discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
 
     # 5. Pagination support (recurse for all "page=" links)
     pagelinks = set()
@@ -1432,13 +1177,11 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 pl, log=log, visited=visited, page_cache=page_cache, quick_scan=quick_scan
             )
         )
-    print(f"[DEBUG] After pagination discovery, entries: {len(image_entries)}, proxies: {USE_PROXIES}")
 
     if image_entries:
         log(f"Found {len(image_entries)} images total after all strategies.")
     else:
         log("No images found in album after all strategies.")
-    print(f"[DEBUG] After all discovery, found {len(image_entries)} entries, proxies: {USE_PROXIES}")
 
     filtered_entries = []
     for name, candidates, referer in image_entries:
@@ -1460,21 +1203,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
 
-    logger.info(
-        f"[DEBUG] Returning {len(filtered_entries)} entries from get_all_candidate_images_from_album, proxies: {USE_PROXIES}"
-    )
     return filtered_entries
 
-async def download_image_candidates(
-    candidate_urls,
-    output_dir,
-    log,
-    index=None,
-    total=None,
-    album_stats=None,
-    max_attempts=3,
-    referer=None,
-):
+def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
+                             album_stats=None, max_attempts=3, referer=None):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -1505,15 +1237,20 @@ async def download_image_candidates(
                 log(f"Already downloaded: {fname}")
                 return False
             try:
+                headers = {'Referer': referer} if referer else {}
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
+                r = session.get(candidate, headers=headers, stream=True, timeout=20)
+                r.raise_for_status()
+                if not r.headers.get("Content-Type", "").startswith("image"):
+                    raise Exception(f"URL does not return image: {candidate} (Content-Type: {r.headers.get('Content-Type')})")
+                total_bytes = 0
                 start_time = time.time()
-                success = await async_http.download_with_proxy(
-                    candidate, fpath, get_pool_or_none(), referer=referer
-                )
-                if not success:
-                    raise Exception("Download failed")
+                with open(fpath, "wb") as f:
+                    for chunk in r.iter_content(1024 * 16):
+                        if chunk:
+                            f.write(chunk)
+                            total_bytes += len(chunk)
                 elapsed = time.time() - start_time
-                total_bytes = os.path.getsize(fpath)
                 speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
                 size_str = (
                     f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
@@ -1533,25 +1270,15 @@ async def download_image_candidates(
             except Exception as e:
                 log(f"Error downloading {candidate}: {e}")
         if block_attempt < max_attempts:
-            log(
-                f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods."
-            )
-            await asyncio.sleep(1.0)
+            log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
+            time.sleep(1.0)
         else:
             log(f"FAILED to download after {max_attempts} attempts: {candidate_urls}")
             if album_stats is not None:
                 album_stats['errors'] += 1
     return False
 
-async def rip_galleries(
-    selected_albums,
-    output_root,
-    log,
-    root_url,
-    quick_scan=True,
-    mimic_human=True,
-    stop_flag=None,
-):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
         "Will download {} album(s): {}".format(
@@ -1584,9 +1311,6 @@ async def rip_galleries(
                 album_url, log=log, page_cache=pages, quick_scan=quick_scan
             )
         log(f"  Found {len(image_entries)} images in {album_name}.")
-        logger.info(
-            f"[DEBUG] Queuing {len(image_entries)} images for download, proxies: {USE_PROXIES}"
-        )
         if not image_entries:
             continue
         for entry_name, candidates, referer in image_entries:
@@ -1607,13 +1331,9 @@ async def rip_galleries(
 
     log(f"Total images in queue: {total_images}")
 
-    sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
-
-    async def worker(idx, album_name, album_path, candidate_urls, referer):
-        logger.info(
-            f"[DEBUG] Starting download worker, proxies: {USE_PROXIES}, images: {len(candidate_urls)}"
-        )
+    for idx, (album_name, album_path, candidate_urls, referer) in enumerate(download_queue, 1):
         if stop_flag and stop_flag.is_set():
+            log("Download stopped by user.")
             return
         if stats['downloaded'] > 0:
             avg_time = stats['total_time'] / stats['downloaded']
@@ -1630,29 +1350,21 @@ async def rip_galleries(
         )
         os.makedirs(outdir, exist_ok=True)
 
-        async with sem:
-            was_downloaded = await download_image_candidates(
-                candidate_urls,
-                outdir,
-                log,
-                index=idx,
-                total=total_images,
-                album_stats=stats,
-                referer=referer,
-            )
+        was_downloaded = download_image_candidates(
+            candidate_urls,
+            outdir,
+            log,
+            index=idx,
+            total=total_images,
+            album_stats=stats,
+            referer=referer,
+        )
 
         if was_downloaded and mimic_human:
-            await asyncio.sleep(random.uniform(0.7, 2.5))
+            time.sleep(random.uniform(0.7, 2.5))
             if idx % random.randint(18, 28) == 0:
                 log("...taking a longer break to mimic human behavior...")
-                await asyncio.sleep(random.uniform(5, 8))
-
-    tasks = [
-        asyncio.create_task(worker(idx, alb, path, urls, ref))
-        for idx, (alb, path, urls, ref) in enumerate(download_queue, 1)
-    ]
-
-    await asyncio.gather(*tasks)
+                time.sleep(random.uniform(5, 8))
 
     total_mb = stats['total_bytes'] / 1024 / 1024
     elapsed = time.time() - stats['start_time']
@@ -1664,24 +1376,11 @@ async def rip_galleries(
     )
     save_page_cache(root_url, tree, pages)
 # ---------- GUI ----------
-
-class _GuiStream:
-    def __init__(self, callback):
-        self.callback = callback
-
-    def write(self, msg):
-        msg = msg.strip()
-        if msg:
-            self.callback(msg)
-
-    def flush(self):
-        pass
-
 class GalleryRipperApp(tb.Window):
     def __init__(self):
         super().__init__(themename="darkly")
         self.title("Coppermine Gallery Ripper")
-        self.geometry("1000x700")
+        self.geometry("980x700")
         self.minsize(700, 480)
         self.albums_tree_data = None
         self.download_thread = None
@@ -1719,51 +1418,17 @@ class GalleryRipperApp(tb.Window):
         ttk.Entry(pathf, textvariable=self.path_var, width=50).pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(pathf, text="Browse...", command=self.select_folder).pack(side="left")
 
-        optionsf = ttk.Frame(control_frame)
-        optionsf.pack(fill="x")
-
         self.mimic_var = tk.BooleanVar(value=True)
-        mimic_chk = ttk.Checkbutton(optionsf, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk = ttk.Checkbutton(pathf, text="Mimic human behavior", variable=self.mimic_var)
         mimic_chk.pack(side="left", padx=(10, 0))
 
         self.show_specials_var = tk.BooleanVar(value=False)
-        specials_chk = ttk.Checkbutton(optionsf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
+        specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
         specials_chk.pack(side="left", padx=(10, 0))
 
         self.quick_scan_var = tk.BooleanVar(value=True)
-        quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
+        quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
-
-        self.verbose_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            optionsf,
-            text="Verbose",
-            variable=self.verbose_var,
-            command=self._toggle_verbose,
-        ).pack(side="left", padx=(10, 0))
-
-        # Download worker count
-        workers = settings.get("download_workers", DOWNLOAD_WORKERS)
-        self.download_workers_var = tk.IntVar(value=workers)
-        ttk.Label(optionsf, text="Workers:").pack(side="left", padx=(10, 0))
-        tb.Spinbox(
-            optionsf,
-            from_=1,
-            to=32,
-            width=4,
-            textvariable=self.download_workers_var,
-        ).pack(side="left")
-
-
-        self.use_proxies_var = tk.BooleanVar(value=False)
-        proxies_chk = ttk.Checkbutton(
-            optionsf,
-            text="Use proxies (NOT WORKING)",
-            variable=self.use_proxies_var,
-            command=self.on_use_proxies_toggle,
-            state="disabled",
-        )
-        proxies_chk.pack(side="left", padx=(10, 0))
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
@@ -1821,43 +1486,12 @@ class GalleryRipperApp(tb.Window):
                                     background="#181818", foreground="#EEEEEE", insertbackground="#EEEEEE")
         self.log_box.pack(fill="both", expand=True)
 
-        self.log_stream = _GuiStream(self.thread_safe_log)
-        root_logger = logging.getLogger()
-        # Replace any existing handlers (e.g. the initial stdout handler) so
-        # log messages are routed to the GUI textbox once it exists.
-        for h in list(root_logger.handlers):
-            root_logger.removeHandler(h)
-        handler = logging.StreamHandler(self.log_stream)
-        handler.setLevel(LOG_LEVEL)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
-        root_logger.addHandler(handler)
-        root_logger.setLevel(LOG_LEVEL)
-
-        self.proxy_frame = ttk.LabelFrame(paned, text="Proxy Pool")
-        self.proxy_frame.pack(fill="x", padx=10, pady=6)
-        self.proxy_status = tk.StringVar(value="Proxy feature disabled")
-        ttk.Label(self.proxy_frame, textvariable=self.proxy_status).pack(side="left", padx=4)
-        self.proxy_listbox = tk.Listbox(self.proxy_frame, height=4, width=36, font=("Consolas", 8))
-        self.proxy_listbox.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(self.proxy_frame, text="Stop Harvest", command=self.stop_proxy_harvest, state="disabled").pack(side="right", padx=6)
-        ttk.Button(self.proxy_frame, text="Clear Cache", command=self.clear_proxy_cache, state="disabled").pack(side="right", padx=6)
-        ttk.Button(self.proxy_frame, text="Refresh Proxies", command=self.manual_refresh_proxies, state="disabled").pack(side="right", padx=6)
-
         paned.add(treeframe, weight=3)
         paned.add(logframe, weight=1)
-        paned.add(self.proxy_frame, weight=0)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_doubleclick)
         self.tree.bind("<Button-1>", self.on_tree_click)
-        self.tree.bind("<Button-3>", self.on_tree_right_click)
-
-        self.rclick_menu = tk.Menu(self, tearoff=0)
-        self.rclick_menu.add_command(label="Open in browser", command=self.open_thread_in_browser)
-        self._rclick_item = None
-
-        # Proxy functionality is disabled for now
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -1982,14 +1616,28 @@ class GalleryRipperApp(tb.Window):
         self._prev_selection.clear()
         for alb in albums:
             img_count = alb.get("image_count", "?")
+            label = alb["name"]
+            album_path = alb.get("path") or [alb["name"]]
+            if isinstance(img_count, int):
+                dl_folder = os.path.join(
+                    self.path_var.get().strip(),
+                    *[sanitize_name(p) for p in album_path],
+                )
+                existing = get_downloaded_file_count(dl_folder)
+                missing = img_count - existing
+                if missing <= 0:
+                    label = f"{alb['name']} ({img_count}) [\u2713]"
+                else:
+                    label = f"{alb['name']} ({img_count}) [+{missing}]"
+            else:
+                label = f"{alb['name']} ({img_count})"
             alb_id = self.tree.insert(
                 "",
                 "end",
-                text=f"\U0001F4F7 {alb['name']} ({img_count})",
+                text=f"\U0001F4F7 {label}",
                 open=False,
             )
             self.tree.set(alb_id, "sel", "\u25A1")
-            album_path = alb.get("path") or [alb['name']]
             self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
 
     def on_search(self, *args):
@@ -2072,7 +1720,7 @@ class GalleryRipperApp(tb.Window):
             self.after(0, self.insert_tree_root_safe, tree_data)
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
         except Exception as e:
-            self.after(0, lambda e=e: self.log(f"Discovery failed: {e}"))
+            self.after(0, lambda: self.log(f"Discovery failed: {e}"))
 
     def insert_tree_node(self, parent, node, path=None):
         path = path or []
@@ -2094,7 +1742,7 @@ class GalleryRipperApp(tb.Window):
         for alb in node.get("albums", []):
             img_count = alb.get("image_count", "?")
             album_path = alb.get("path") or node_path + [alb['name']]
-            label = alb["name"]
+            label = alb['name']
             if isinstance(img_count, int):
                 dl_folder = os.path.join(
                     self.path_var.get().strip(),
@@ -2210,35 +1858,6 @@ class GalleryRipperApp(tb.Window):
                 return
         self._ignore_next_select = False
 
-    def on_tree_right_click(self, event):
-        item = self.tree.identify_row(event.y)
-        if not item:
-            return
-        self.tree.selection_set(item)
-        self._rclick_item = item
-        url = None
-        if item in self.item_to_album:
-            _, album_url, _ = self.item_to_album[item]
-            after = album_url.split(":", 1)[-1]
-            if select_adapter_for_url(album_url) == "4chan" and "/" in after:
-                url = album_url
-        if url:
-            self.rclick_menu.tk_popup(event.x_root, event.y_root)
-        else:
-            self._rclick_item = None
-
-    def open_thread_in_browser(self):
-        item = getattr(self, "_rclick_item", None)
-        if not item or item not in self.item_to_album:
-            return
-        _, album_url, _ = self.item_to_album[item]
-        after = album_url.split(":", 1)[-1]
-        if "/" not in after:
-            return
-        board, tid = after.split("/", 1)
-        web_url = f"https://boards.4chan.org/{board}/thread/{tid}"
-        webbrowser.open(web_url)
-
     def select_all_leaf_albums(self):
         for item in self.item_to_album:
             label = self.tree.item(item, "text")
@@ -2266,13 +1885,6 @@ class GalleryRipperApp(tb.Window):
         if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
-        # Update worker count configuration
-        global DOWNLOAD_WORKERS
-        DOWNLOAD_WORKERS = max(1, self.download_workers_var.get())
-        proxy_pool.fast_fill = DOWNLOAD_WORKERS
-        settings = load_settings()
-        settings["download_workers"] = DOWNLOAD_WORKERS
-        save_settings(settings)
         self.log(f"Starting download of {len(selected)} albums...")
         self.download_thread = threading.Thread(
             target=self.download_worker,
@@ -2285,85 +1897,22 @@ class GalleryRipperApp(tb.Window):
         self.log("Stop requested by user. Attempting to stop current operation...")
         self.stop_flag.set()
 
-    def manual_refresh_proxies(self):
-        def do_refresh():
-            self.thread_safe_log("Manual proxy pool refresh requested.")
-            run_async(proxy_pool.refresh(force=True))
-            self.after(0, self.update_proxy_status)
-        threading.Thread(target=do_refresh, daemon=True).start()
-
-    def clear_proxy_cache(self):
-        def do_clear():
-            self.thread_safe_log("Clearing proxy cache...")
-            proxy_pool.clear_cache()
-            self.after(0, self.update_proxy_status)
-        threading.Thread(target=do_clear, daemon=True).start()
-
-    def stop_proxy_harvest(self):
-        def do_stop():
-            self.thread_safe_log("Stopping proxy harvesting...")
-            run_async(proxy_pool.stop_auto_refresh())
-        threading.Thread(target=do_stop, daemon=True).start()
-
-    def on_use_proxies_toggle(self):
-        """Handle toggling of the Use proxies checkbox."""
-        messagebox.showinfo(
-            "Proxies disabled", "The proxy feature is currently disabled."
-        )
-        self.use_proxies_var.set(False)
-        global USE_PROXIES
-        USE_PROXIES = False
-        settings = load_settings()
-        settings["use_proxies"] = False
-        save_settings(settings)
-
-    def _toggle_verbose(self):
-        lvl = logging.DEBUG if self.verbose_var.get() else logging.INFO
-        root = logging.getLogger()
-        root.setLevel(lvl)
-        for h in root.handlers:
-            h.setLevel(lvl)
-
-    def update_proxy_status(self):
-        count = len(proxy_pool.pool)
-        if count == 0:
-            self.proxy_status.set("Searching for working proxies… (may take a minute)")
-        else:
-            ts = "N/A"
-            if proxy_pool.last_checked:
-                ts = time.strftime("%H:%M:%S", time.localtime(proxy_pool.last_checked))
-            self.proxy_status.set(
-                f"Proxies available: {count} | Last checked: {ts}"
-            )
-        if hasattr(self, "proxy_listbox"):
-            self.proxy_listbox.delete(0, tk.END)
-            for proxy in proxy_pool.pool[:15]:
-                self.proxy_listbox.insert(tk.END, proxy)
-
-    def start_proxy_status_updater(self):
-        self.update_proxy_status()
-        self.after(5000, self.start_proxy_status_updater)
-
     def download_worker(self, selected, output_dir, root_url):
         try:
-            run_async(
-                rip_galleries(
-                    selected,
-                    output_dir,
-                    self.thread_safe_log,
-                    root_url,
-                    quick_scan=self.quick_scan_var.get(),
-                    mimic_human=self.mimic_var.get(),
-                    stop_flag=self.stop_flag,
-                )
+            rip_galleries(
+                selected,
+                output_dir,
+                self.log,
+                root_url,
+                quick_scan=self.quick_scan_var.get(),
+                mimic_human=self.mimic_var.get(),
+                stop_flag=self.stop_flag,
             )
-            self.thread_safe_log("All downloads finished or stopped!")
+            self.log("All downloads finished or stopped!")
         except Exception as e:
-            self.thread_safe_log(f"Download error: {e}")
+            self.log(f"Download error: {e}")
         finally:
             self.stop_flag.clear()
-            # Refresh the tree so completed threads show updated status
-            self.after(0, self.refresh_tree)
 
     def start_git_update(self):
         repo_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -2383,7 +1932,6 @@ class GalleryRipperApp(tb.Window):
             self.log(result.stdout)
             if result.stderr:
                 self.log("Error during git pull:\n" + result.stderr)
-            update_requirements(log=self.log)
             new_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
             ).strip()

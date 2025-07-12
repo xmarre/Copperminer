@@ -5,7 +5,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 ## Features
 
 - Point-and-click GUI — No command line needed, always-on dark mode
-- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine, rule-based sites like ThePlace2, and now 4chan boards/threads)
+- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine and rule-based sites like ThePlace2)
 - Album tree — Finds and displays all real albums for selection, ignoring “Last uploads”, “Most viewed”, and other virtual/special albums
 - Optional special galleries toggle — Include “Last uploads”, “Most viewed”, etc. only when you want them
 - Preserves structure — Downloads images into folders/subfolders that match the gallery’s layout
@@ -20,11 +20,6 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Windows double-click support — via `start_gallery_ripper.bat`
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
-- Dynamic proxy pool with caching — Harvests and validates free proxies automatically, caches results to skip dead proxies, and fast-fills the pool for quick startup; UI shows last check time
-- Proxy checks load a random gallery, follow an album link, and even grab one image to ensure the proxy truly works. Edit the `VALIDATION_URLS` list in `proxy_manager.py` to customize the rotation.
-- Proxy toolbar buttons — refresh & retest, clear cached proxies, or stop harvesting altogether
-- Verbose checkbox — Toggle DEBUG-level logging on demand while the app runs
-- Workers spinbox — Configure how many images download in parallel
 
 ### 4chan Usage
 
@@ -67,25 +62,9 @@ Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
 
    On any platform:
 
-  ```bash
-  python gallery_ripper.py
-  ```
-
-### Command-line options
-
-The ripper now supports a few optional flags to control proxy usage and
-download concurrency:
-
-```bash
-python gallery_ripper.py --min-proxies 50 --validation-concurrency 20 --download-workers 4
-```
-
-- `--min-proxies` – minimum number of working proxies to keep in the pool
-- `--validation-concurrency` – how many proxies to validate in parallel
-- `--download-workers` – number of concurrent image download tasks (also
-  configurable in the GUI)
-- `--proxy` – use a specific HTTP proxy for all requests
-- `--debug` – enable verbose DEBUG-level logging to help diagnose issues
+   ```bash
+   python gallery_ripper.py
+   ```
 
 ## License
 
