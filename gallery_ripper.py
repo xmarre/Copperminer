@@ -677,7 +677,7 @@ image_rate_limiter = SmartRateLimiter(
     allow_ramp=True,
 )
 media_rate_limiter = SmartRateLimiter(
-    initial_delay=3.0,  # ~0.33 req/s start
+    initial_delay=4.0,  # ~0.33 req/s start
     min_delay=2.0,
     max_delay=20.0,
     allow_ramp=False,
