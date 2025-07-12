@@ -659,7 +659,28 @@ class SmartRateLimiter:
             self.predicted_safe_delay = self.initial_delay
 
 
-rate_limiter = SmartRateLimiter()
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+MEDIA_EXTS = ('.webm', '.mp4', '.gif')
+
+# Separate limiters for images vs. videos/gifs. Images can be fetched
+# fairly quickly, but 4chan is much stricter with webm/mp4/gif files.
+image_rate_limiter = SmartRateLimiter(
+    initial_delay=0.35,  # ~3 req/s start
+    min_delay=0.20,
+    max_delay=3.0,
+)
+media_rate_limiter = SmartRateLimiter(
+    initial_delay=3.0,  # ~0.33 req/s start
+    min_delay=2.0,
+    max_delay=20.0,
+)
+
+def rate_limiter_for_url(url: str) -> SmartRateLimiter:
+    """Return the appropriate rate limiter based on file extension."""
+    ext = os.path.splitext(url.split("?")[0])[1].lower()
+    if ext in MEDIA_EXTS:
+        return media_rate_limiter
+    return image_rate_limiter
 
 def get_soup(url):
     resp = session.get(url)
@@ -1330,12 +1351,13 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             try:
                 headers = {'Referer': referer} if referer else {}
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
-                rate_limiter.wait()
+                rlim = rate_limiter_for_url(candidate)
+                rlim.wait()
                 r = session.get(candidate, headers=headers, stream=True, timeout=20)
                 if r.status_code == 429:
                     retry = int(r.headers.get("Retry-After", "5"))
                     log(f"Rate limited. Backing off for {retry}s...")
-                    rate_limiter.record_error(retry_after=retry)
+                    rlim.record_error(retry_after=retry)
                     time.sleep(retry)
                     continue
                 r.raise_for_status()
@@ -1367,11 +1389,12 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     album_stats['total_bytes'] += total_bytes
                     album_stats['total_time'] += elapsed
                     album_stats['downloaded'] += 1
-                rate_limiter.record_success()
+                rlim.record_success()
                 return True
             except Exception as e:
                 log(f"Error downloading {candidate}: {e}")
-                rate_limiter.record_error()
+                rlim = rate_limiter_for_url(candidate)
+                rlim.record_error()
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
             time.sleep(1.0)
@@ -1412,7 +1435,8 @@ def download_4chan_image_oldschool(
                     )
                 },
             )
-            rate_limiter.wait()
+            rlim = rate_limiter_for_url(fname)
+            rlim.wait()
             start_time = time.time()
             with urllib.request.urlopen(req, timeout=60) as resp, open(fpath, "wb") as out:
                 if resp.status == 429:
@@ -1420,7 +1444,7 @@ def download_4chan_image_oldschool(
                     log(
                         f"Rate limited. Backing off for {retry}s... (attempt {attempt}/{max_attempts})"
                     )
-                    rate_limiter.record_error(retry_after=retry)
+                    rlim.record_error(retry_after=retry)
                     time.sleep(retry)
                     continue
                 total_bytes = 0
@@ -1442,11 +1466,12 @@ def download_4chan_image_oldschool(
                 album_stats['total_bytes'] += total_bytes
                 album_stats['total_time'] += elapsed
                 album_stats['downloaded'] += 1
-            rate_limiter.record_success()
+            rlim.record_success()
             return True
         except Exception as e:
             log(f"Error downloading {url}: {e}")
-            rate_limiter.record_error()
+            rlim = rate_limiter_for_url(fname)
+            rlim.record_error()
             if attempt < max_attempts:
                 log(f"Retrying {url} (attempt {attempt + 1}/{max_attempts})")
                 time.sleep(1.0)
