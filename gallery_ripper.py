@@ -593,7 +593,7 @@ class SmartRateLimiter:
 
     def __init__(
         self,
-        initial_delay=3,  # ~0.75 req/s as a safe starting point
+        initial_delay=1.33,  # ~0.75 req/s as a safe starting point
         min_delay=0.25,
         max_delay=20.0,
         ramp_window=60,
