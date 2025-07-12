@@ -582,10 +582,10 @@ def get_soup(url):
     return BeautifulSoup(resp.text, "html.parser")
 
 def fetch_json_simple(url: str):
-    """Return parsed JSON from *url* using urllib.request."""
-    req = urllib.request.Request(url, headers=session.headers)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    """Return parsed JSON from *url* using the requests session."""
+    resp = session.get(url)
+    resp.raise_for_status()
+    return resp.json()
 
 def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
