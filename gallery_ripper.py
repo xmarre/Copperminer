@@ -19,6 +19,7 @@ import hashlib
 import subprocess
 import sys
 import glob
+from collections import deque
 
 SETTINGS_FILE = "settings.json"
 
@@ -585,6 +586,80 @@ session.headers.update({'User-Agent': DEFAULT_USER_AGENT})
 
 CACHE_DIR = ".coppermine_cache"
 DOWNLOAD_WORKERS = 4
+
+
+class SmartRateLimiter:
+    """Predictive backoff that adapts before hitting rate limits."""
+
+    def __init__(
+        self,
+        initial_delay=1.33,  # ~0.75 req/s as a safe starting point
+        min_delay=0.25,
+        max_delay=20.0,
+        ramp_window=60,
+        increase_factor=0.95,
+        backoff_factor=2.0,
+    ):
+        self.initial_delay = initial_delay
+        self.delay = initial_delay
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.ramp_window = ramp_window
+        self.increase_factor = increase_factor
+        self.backoff_factor = backoff_factor
+
+        self.lock = threading.Lock()
+        self.last_request = 0.0
+        self.history = deque(maxlen=1000)  # (timestamp, status)
+        self.last_429 = 0.0
+        self.predicted_safe_delay = initial_delay
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            wait_time = self.delay - (now - self.last_request)
+        if wait_time > 0:
+            time.sleep(wait_time)
+        with self.lock:
+            self.last_request = time.time()
+
+    def record_result(self, status_code, retry_after=None):
+        now = time.time()
+        with self.lock:
+            self.history.append((now, status_code))
+            if status_code == 429:
+                self.last_429 = now
+                self.delay = min(
+                    self.max_delay,
+                    max(self.delay * self.backoff_factor, self.initial_delay),
+                )
+                if retry_after:
+                    self.delay = max(self.delay, retry_after)
+                self.predicted_safe_delay = self.delay
+            else:
+                window_start = now - self.ramp_window
+                recent = [s for t, s in self.history if t >= window_start]
+                if len(recent) > 20 and all(s != 429 for s in recent):
+                    self.delay = max(self.min_delay, self.delay * self.increase_factor)
+                    self.predicted_safe_delay = self.delay
+                else:
+                    self.delay = max(self.delay, self.predicted_safe_delay)
+
+    def record_success(self):
+        self.record_result(200)
+
+    def record_error(self, retry_after=None, status_code=429):
+        self.record_result(status_code, retry_after=retry_after)
+
+    def reset(self):
+        with self.lock:
+            self.delay = self.initial_delay
+            self.history.clear()
+            self.last_429 = 0.0
+            self.predicted_safe_delay = self.initial_delay
+
+
+rate_limiter = SmartRateLimiter()
 
 def get_soup(url):
     resp = session.get(url)
@@ -1255,7 +1330,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             try:
                 headers = {'Referer': referer} if referer else {}
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
+                rate_limiter.wait()
                 r = session.get(candidate, headers=headers, stream=True, timeout=20)
+                if r.status_code == 429:
+                    retry = int(r.headers.get("Retry-After", "5"))
+                    log(f"Rate limited. Backing off for {retry}s...")
+                    rate_limiter.record_error(retry_after=retry)
+                    time.sleep(retry)
+                    continue
                 r.raise_for_status()
                 ctype = r.headers.get("Content-Type", "")
                 if not (ctype.startswith("image") or ctype.startswith("video")):
@@ -1285,9 +1367,11 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     album_stats['total_bytes'] += total_bytes
                     album_stats['total_time'] += elapsed
                     album_stats['downloaded'] += 1
+                rate_limiter.record_success()
                 return True
             except Exception as e:
                 log(f"Error downloading {candidate}: {e}")
+                rate_limiter.record_error()
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
             time.sleep(1.0)
@@ -1298,7 +1382,16 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
     return False
 
 
-def download_4chan_image_oldschool(url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
+def download_4chan_image_oldschool(
+    url,
+    output_dir,
+    log,
+    fname=None,
+    index=None,
+    total=None,
+    album_stats=None,
+    max_attempts=3,
+):
     """Download a single 4chan image using urllib like older versions."""
     if fname is None:
         fname = os.path.basename(url)
@@ -1306,43 +1399,59 @@ def download_4chan_image_oldschool(url, output_dir, log, fname=None, index=None,
     if os.path.exists(fpath):
         log(f"Already downloaded: {fname}")
         return False
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        start_time = time.time()
-        with urllib.request.urlopen(req, timeout=60) as resp, open(fpath, "wb") as out:
-            total_bytes = 0
-            while True:
-                chunk = resp.read(1024 * 16)
-                if not chunk:
-                    break
-                out.write(chunk)
-                total_bytes += len(chunk)
-        elapsed = time.time() - start_time
-        speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
-        size_str = (
-            f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
-        )
-        speed_str = f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
-        prefix = f"File {index} of {total}: " if (index and total) else ""
-        log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
-        if album_stats is not None:
-            album_stats['total_bytes'] += total_bytes
-            album_stats['total_time'] += elapsed
-            album_stats['downloaded'] += 1
-        return True
-    except Exception as e:
-        log(f"Error downloading {url}: {e}")
-        if album_stats is not None:
-            album_stats['errors'] += 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            rate_limiter.wait()
+            start_time = time.time()
+            with urllib.request.urlopen(req, timeout=60) as resp, open(fpath, "wb") as out:
+                if resp.status == 429:
+                    retry = int(resp.headers.get("Retry-After", "5"))
+                    log(
+                        f"Rate limited. Backing off for {retry}s... (attempt {attempt}/{max_attempts})"
+                    )
+                    rate_limiter.record_error(retry_after=retry)
+                    time.sleep(retry)
+                    continue
+                total_bytes = 0
+                while True:
+                    chunk = resp.read(1024 * 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    total_bytes += len(chunk)
+            elapsed = time.time() - start_time
+            speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
+            size_str = (
+                f"{total_bytes / 1024 / 1024:.2f} MB" if total_bytes > 1024 * 1024 else f"{total_bytes / 1024:.1f} KB"
+            )
+            speed_str = f"{speed / 1024:.2f} MB/s" if speed > 1024 else f"{speed:.1f} KB/s"
+            prefix = f"File {index} of {total}: " if (index and total) else ""
+            log(f"{prefix}Downloaded: {fname} ({size_str}) at {speed_str}")
+            if album_stats is not None:
+                album_stats['total_bytes'] += total_bytes
+                album_stats['total_time'] += elapsed
+                album_stats['downloaded'] += 1
+            rate_limiter.record_success()
+            return True
+        except Exception as e:
+            log(f"Error downloading {url}: {e}")
+            rate_limiter.record_error()
+            if attempt < max_attempts:
+                log(f"Retrying {url} (attempt {attempt + 1}/{max_attempts})")
+                time.sleep(1.0)
+    if album_stats is not None:
+        album_stats['errors'] += 1
     return False
 
 def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
