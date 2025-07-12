@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, IntVar
+from ttkbootstrap.tooltip import ToolTip
 import webbrowser
 from tkinter.scrolledtext import ScrolledText
 import ttkbootstrap as tb
@@ -1740,19 +1741,26 @@ class GalleryRipperApp(tb.Window):
         def update_worker_label(value):
             self.worker_label.config(text=f"Workers: {int(float(value))}")
 
-        self.worker_label = ttk.Label(pathf, text=f"Workers: {DOWNLOAD_WORKERS}")
-        self.worker_label.pack(side="left", padx=(10, 0))
+        workerf = ttk.Frame(control_frame)
+        workerf.pack(fill="x", pady=(4, 0))
+
+        self.worker_label = ttk.Label(workerf, text=f"Workers: {DOWNLOAD_WORKERS}")
+        self.worker_label.pack(side="left")
 
         self.worker_slider = ttk.Scale(
-            pathf,
+            workerf,
             from_=1,
             to=16,
             orient="horizontal",
             variable=self.download_workers_var,
             command=update_worker_label,
-            length=120,
+            length=160,
         )
         self.worker_slider.pack(side="left", padx=(5, 0))
+        ToolTip(
+            self.worker_slider,
+            text="Avoid using more than 4 workers on 4chan or other sites to prevent rate limits or bans.",
+        )
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
