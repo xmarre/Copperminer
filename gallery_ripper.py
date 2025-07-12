@@ -1724,16 +1724,19 @@ class GalleryRipperApp(tb.Window):
         ttk.Entry(pathf, textvariable=self.path_var, width=50).pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(pathf, text="Browse...", command=self.select_folder).pack(side="left")
 
+        optionsf = ttk.Frame(control_frame)
+        optionsf.pack(fill="x", pady=(4, 0))
+
         self.mimic_var = tk.BooleanVar(value=True)
-        mimic_chk = ttk.Checkbutton(pathf, text="Mimic human behavior", variable=self.mimic_var)
-        mimic_chk.pack(side="left", padx=(10, 0))
+        mimic_chk = ttk.Checkbutton(optionsf, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk.pack(side="left")
 
         self.show_specials_var = tk.BooleanVar(value=False)
-        specials_chk = ttk.Checkbutton(pathf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
+        specials_chk = ttk.Checkbutton(optionsf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
         specials_chk.pack(side="left", padx=(10, 0))
 
         self.quick_scan_var = tk.BooleanVar(value=True)
-        quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
+        quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
 
         self.download_workers_var = IntVar(value=DOWNLOAD_WORKERS)
@@ -1763,13 +1766,19 @@ class GalleryRipperApp(tb.Window):
         )
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
-        ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
-        ttk.Button(btf, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left")
-        ttk.Button(btf, text="Start Download", command=self.start_download).pack(side="left", padx=8)
-        ttk.Button(btf, text="Stop", command=self.stop_download).pack(side="left", padx=8)
-        ttk.Button(btf, text="Update from Git", command=self.start_git_update).pack(side="left", padx=8)
-        self.version_label = ttk.Label(btf, text="Current version: " + get_git_version())
-        self.version_label.pack(side="left", padx=6)
+
+        left_buttons = ttk.Frame(btf)
+        left_buttons.pack(side="left")
+        ttk.Button(left_buttons, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
+        ttk.Button(left_buttons, text="Unselect All", command=self.unselect_all_leaf_albums).pack(side="left", padx=(5, 0))
+
+        right_buttons = ttk.Frame(btf)
+        right_buttons.pack(side="right")
+        self.version_label = ttk.Label(right_buttons, text="Current version: " + get_git_version())
+        self.version_label.pack(side="right", padx=6)
+        ttk.Button(right_buttons, text="Update from Git", command=self.start_git_update).pack(side="right", padx=5)
+        ttk.Button(right_buttons, text="Stop", command=self.stop_download).pack(side="right", padx=5)
+        ttk.Button(right_buttons, text="Start Download", command=self.start_download, width=16).pack(side="right")
 
         # -- Search/filter frame --
         search_frame = ttk.Frame(control_frame)
