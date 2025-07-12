@@ -2,7 +2,6 @@ import os
 import threading
 import asyncio
 import requests
-import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import urllib.request
@@ -571,10 +570,18 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     return html, True
 
 BASE_URL = ""  # Will be set from GUI
+
+# Single User-Agent used for all outbound HTTP requests. Some sites,
+# including 4chan, are sensitive to persistent connections or unusual
+# headers, so we keep it simple.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
+
 session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-})
+session.headers.update({'User-Agent': DEFAULT_USER_AGENT})
 
 CACHE_DIR = ".coppermine_cache"
 DOWNLOAD_WORKERS = 4
@@ -1291,21 +1298,25 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
     return False
 
 
-async def download_4chan_image(session, url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
-    """Directly download a single 4chan image without extra logic."""
+def download_4chan_image_sync(url, output_dir, log, fname=None, index=None, total=None, album_stats=None):
+    """Download a single 4chan image using a fresh TCP connection."""
     if fname is None:
         fname = os.path.basename(url)
     fpath = os.path.join(output_dir, fname)
     if os.path.exists(fpath):
         log(f"Already downloaded: {fname}")
-        return False
+        return True
     try:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Connection": "close",
+        }
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+            r.raise_for_status()
             total_bytes = 0
             start_time = time.time()
             with open(fpath, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 16):
+                for chunk in r.iter_content(1024 * 16):
                     if chunk:
                         f.write(chunk)
                         total_bytes += len(chunk)
@@ -1352,51 +1363,52 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                 'errors': 0,
                 'start_time': time.time(),
             }
-            async with aiohttp.ClientSession() as aio_sess:
-                for album_name, album_url, album_path in selected_albums:
+            loop = asyncio.get_event_loop()
+            for album_name, album_url, album_path in selected_albums:
+                if stop_flag and stop_flag.is_set():
+                    log("Download stopped by user.")
+                    return
+                log(f"\nScraping 4chan thread: {album_name}")
+                board, tid = album_url.split(":", 1)[-1].split("/", 1)
+                board = board.strip().strip("/")
+                tid = tid.strip().split("/")[0]
+                image_entries = fourchan_thread_images(board, tid, log=log)
+                log(f"  Found {len(image_entries)} images in {album_name}.")
+                outdir = os.path.join(
+                    output_root,
+                    *[sanitize_name(p) for p in album_path],
+                )
+                os.makedirs(outdir, exist_ok=True)
+                total_images = len(image_entries)
+
+                sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
+
+                async def worker(idx, fname, url):
                     if stop_flag and stop_flag.is_set():
-                        log("Download stopped by user.")
                         return
-                    log(f"\nScraping 4chan thread: {album_name}")
-                    board, tid = album_url.split(":", 1)[-1].split("/", 1)
-                    board = board.strip().strip("/")
-                    tid = tid.strip().split("/")[0]
-                    image_entries = fourchan_thread_images(board, tid, log=log)
-                    log(f"  Found {len(image_entries)} images in {album_name}.")
-                    outdir = os.path.join(
-                        output_root,
-                        *[sanitize_name(p) for p in album_path],
-                    )
-                    os.makedirs(outdir, exist_ok=True)
-                    total_images = len(image_entries)
+                    async with sem:
+                        await loop.run_in_executor(
+                            None,
+                            download_4chan_image_sync,
+                            url,
+                            outdir,
+                            log,
+                            fname,
+                            idx,
+                            total_images,
+                            stats,
+                        )
+                    if mimic_human:
+                        await asyncio.sleep(random.uniform(0.7, 2.5))
+                        if idx % random.randint(18, 28) == 0:
+                            log("...taking a longer break to mimic human behavior...")
+                            await asyncio.sleep(random.uniform(5, 8))
 
-                    sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
-
-                    async def worker(idx, fname, url):
-                        if stop_flag and stop_flag.is_set():
-                            return
-                        async with sem:
-                            await download_4chan_image(
-                                aio_sess,
-                                url,
-                                outdir,
-                                log,
-                                fname=fname,
-                                index=idx,
-                                total=total_images,
-                                album_stats=stats,
-                            )
-                        if mimic_human:
-                            await asyncio.sleep(random.uniform(0.7, 2.5))
-                            if idx % random.randint(18, 28) == 0:
-                                log("...taking a longer break to mimic human behavior...")
-                                await asyncio.sleep(random.uniform(5, 8))
-
-                    tasks = [
-                        asyncio.create_task(worker(idx, fname, urls[0]))
-                        for idx, (fname, urls, _) in enumerate(image_entries, 1)
-                    ]
-                    await asyncio.gather(*tasks)
+                tasks = [
+                    asyncio.create_task(worker(idx, fname, urls[0]))
+                    for idx, (fname, urls, _) in enumerate(image_entries, 1)
+                ]
+                await asyncio.gather(*tasks)
 
             total_mb = stats['total_bytes'] / 1024 / 1024
             elapsed = time.time() - stats['start_time']
