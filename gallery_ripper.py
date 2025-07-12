@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import urllib.request
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, IntVar
 import webbrowser
 from tkinter.scrolledtext import ScrolledText
 import ttkbootstrap as tb
@@ -19,6 +19,7 @@ import hashlib
 import subprocess
 import sys
 import glob
+import queue
 from collections import deque
 
 SETTINGS_FILE = "settings.json"
@@ -1487,6 +1488,56 @@ def download_4chan_image_oldschool(
         album_stats['errors'] += 1
     return False
 
+
+def threaded_download_worker(download_queue, log, stop_flag):
+    """Worker thread that downloads images from a queue."""
+    while True:
+        try:
+            args = download_queue.get_nowait()
+        except queue.Empty:
+            break
+        if stop_flag and stop_flag.is_set():
+            download_queue.task_done()
+            break
+        (
+            idx,
+            album_name,
+            outdir,
+            candidate_urls,
+            referer,
+            total_images,
+            mimic_human,
+            stats,
+        ) = args
+
+        if stats['downloaded'] > 0:
+            avg_time = stats['total_time'] / stats['downloaded']
+            eta = avg_time * (total_images - idx + 1)
+            eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
+        else:
+            eta_str = ""
+
+        log(f"File {idx} of {total_images}{eta_str}... [{album_name}]")
+        os.makedirs(outdir, exist_ok=True)
+
+        was_downloaded = download_image_candidates(
+            candidate_urls,
+            outdir,
+            log,
+            index=idx,
+            total=total_images,
+            album_stats=stats,
+            referer=referer,
+        )
+
+        if was_downloaded and mimic_human:
+            time.sleep(random.uniform(0.7, 2.5))
+            if idx % random.randint(18, 28) == 0:
+                log("...taking a longer break to mimic human behavior...")
+                time.sleep(random.uniform(5, 8))
+
+        download_queue.task_done()
+
 def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
@@ -1601,40 +1652,24 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
 
     log(f"Total images in queue: {total_images}")
 
+    q = queue.Queue()
     for idx, (album_name, album_path, candidate_urls, referer) in enumerate(download_queue, 1):
-        if stop_flag and stop_flag.is_set():
-            log("Download stopped by user.")
-            return
-        if stats['downloaded'] > 0:
-            avg_time = stats['total_time'] / stats['downloaded']
-            eta = avg_time * (total_images - idx + 1)
-            eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
-        else:
-            eta_str = ""
-
-        log(f"File {idx} of {total_images}{eta_str}... [{album_name}]")
-
         outdir = os.path.join(
             output_root,
             *[sanitize_name(p) for p in album_path],
         )
-        os.makedirs(outdir, exist_ok=True)
+        q.put((idx, album_name, outdir, candidate_urls, referer, total_images, mimic_human, stats))
 
-        was_downloaded = download_image_candidates(
-            candidate_urls,
-            outdir,
-            log,
-            index=idx,
-            total=total_images,
-            album_stats=stats,
-            referer=referer,
-        )
+    threads = []
+    for _ in range(DOWNLOAD_WORKERS):
+        t = threading.Thread(target=threaded_download_worker, args=(q, log, stop_flag))
+        t.daemon = True
+        t.start()
+        threads.append(t)
 
-        if was_downloaded and mimic_human:
-            time.sleep(random.uniform(0.7, 2.5))
-            if idx % random.randint(18, 28) == 0:
-                log("...taking a longer break to mimic human behavior...")
-                time.sleep(random.uniform(5, 8))
+    q.join()
+    for t in threads:
+        t.join()
 
     total_mb = stats['total_bytes'] / 1024 / 1024
     elapsed = time.time() - stats['start_time']
@@ -1699,6 +1734,25 @@ class GalleryRipperApp(tb.Window):
         self.quick_scan_var = tk.BooleanVar(value=True)
         quick_chk = ttk.Checkbutton(pathf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
+
+        self.download_workers_var = IntVar(value=DOWNLOAD_WORKERS)
+
+        def update_worker_label(value):
+            self.worker_label.config(text=f"Workers: {int(float(value))}")
+
+        self.worker_label = ttk.Label(pathf, text=f"Workers: {DOWNLOAD_WORKERS}")
+        self.worker_label.pack(side="left", padx=(10, 0))
+
+        self.worker_slider = ttk.Scale(
+            pathf,
+            from_=1,
+            to=16,
+            orient="horizontal",
+            variable=self.download_workers_var,
+            command=update_worker_label,
+            length=120,
+        )
+        self.worker_slider.pack(side="left", padx=(5, 0))
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
         ttk.Button(btf, text="Select All", command=self.select_all_leaf_albums).pack(side="left")
@@ -2155,7 +2209,9 @@ class GalleryRipperApp(tb.Window):
         if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
-        self.log(f"Starting download of {len(selected)} albums...")
+        global DOWNLOAD_WORKERS
+        DOWNLOAD_WORKERS = self.download_workers_var.get()
+        self.log(f"Starting download of {len(selected)} albums with {DOWNLOAD_WORKERS} workers...")
         self.download_thread = threading.Thread(
             target=self.download_worker,
             args=(selected, output_dir, self.url_var.get().strip()),
