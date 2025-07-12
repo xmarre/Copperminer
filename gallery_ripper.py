@@ -1712,6 +1712,7 @@ async def rip_galleries(
             log("Download stopped by user.")
             return
         log(f"\nScraping album: {album_name}")
+        log(f"[DEBUG] Adapter: {site_type}, url: {album_url}")
         if site_type == "universal":
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
