@@ -273,6 +273,24 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     if page_cache is None:
         page_cache = {}
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan)
+    if isinstance(html, bytes):
+        if html.startswith(b"\x1f\x8b"):
+            try:
+                import gzip
+                html = gzip.decompress(html).decode("utf-8", "replace")
+                log("[DEBUG] Decompressed gzipped body")
+            except Exception as exc:
+                log(f"WARNING: failed to decompress body: {exc}")
+                html = html.decode("utf-8", "replace")
+        else:
+            html = html.decode("utf-8", "replace")
+    if "livejournal.com" in root_url:
+        log(f"[DEBUG] LiveJournal HTML length: {len(html)} chars")
+        snippet = re.sub(r"\s+", " ", html[:800])
+        log(f"[DEBUG] First 800 chars: {snippet}")
+        low = snippet.lower()
+        if len(html) < 2000 or any(x in low for x in ("enable javascript", "access denied")):
+            log("[DEBUG] Warning: HTML looks like a challenge or error page")
     soup = BeautifulSoup(html, "html.parser")
     title_tag = soup.find("h1") or soup.find("title")
     gallery_title = title_tag.text.strip() if title_tag else root_url
@@ -310,36 +328,70 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
     # ------------------------------------------------------------------- #
     if not albums and "livejournal.com" in urlparse(root_url).netloc:
         data_tag = soup.find("script", id="__NEXT_DATA__")
+        raw_json = None
         if data_tag:
-            raw = (data_tag.string or data_tag.text or "").strip()
-            if raw:
-                try:
-                    state = json.loads(raw)
-                    lj_albums = _find_key(state, "albums") or []
-                    if isinstance(lj_albums, dict):
-                        iterable = lj_albums.values()
-                    else:
-                        iterable = lj_albums
-                    for alb in iterable:
-                        sec = str(alb.get("security", "")).lower()
-                        if sec not in ("", "0", "public"):
-                            continue
-                        a_id = alb.get("id") or alb.get("albumId")
-                        title = alb.get("title") or f"Album {a_id}"
-                        count = alb.get("itemsCount") or "?"
-                        a_url = urljoin(root_url, f"/photo/album/{a_id}/")
-                        if any(x["url"] == a_url for x in albums):
-                            continue
-                        albums.append({
+            raw_json = (data_tag.string or data_tag.text or "").strip()
+        if not raw_json:
+            for scr in soup.find_all("script"):
+                if not scr.string:
+                    continue
+                txt = scr.string
+                m = re.search(r"__INITIAL_STATE__\s*=\s*({.*?});", txt, re.DOTALL)
+                if m:
+                    raw_json = m.group(1)
+                    break
+        if raw_json:
+            try:
+                state = json.loads(raw_json)
+                candidate = (
+                    _find_key(state, "albums")
+                    or _find_key(state, "photoalbums")
+                    or _find_key(state, "albumsList")
+                    or []
+                )
+                if isinstance(candidate, dict):
+                    iterable = candidate.values()
+                else:
+                    iterable = candidate
+                count_before = len(albums)
+                for alb in iterable:
+                    if not isinstance(alb, dict):
+                        continue
+                    sec = str(alb.get("security", "")).lower()
+                    if sec not in ("", "0", "public"):
+                        continue
+                    a_id = alb.get("id") or alb.get("albumId") or alb.get("aid")
+                    if not a_id:
+                        continue
+                    title = (
+                        alb.get("title")
+                        or alb.get("name")
+                        or f"Album {a_id}"
+                    )
+                    count = (
+                        alb.get("itemsCount")
+                        or alb.get("count")
+                        or "?"
+                    )
+                    a_url = urljoin(root_url, f"/photo/album/{a_id}/")
+                    if any(x["url"] == a_url for x in albums):
+                        continue
+                    albums.append(
+                        {
                             "type": "album",
                             "name": title,
                             "url": a_url,
                             "image_count": count,
-                        })
-                    if albums:
-                        log(f"Found {len(albums)} LiveJournal albums via __NEXT_DATA__ JSON.")
-                except Exception as exc:
-                    log(f"WARNING: failed to parse __NEXT_DATA__: {exc}")
+                        }
+                    )
+                if len(albums) > count_before:
+                    log(
+                        f"Found {len(albums) - count_before} LiveJournal albums via embedded JSON."
+                    )
+            except Exception as exc:
+                log(
+                    f"WARNING: LJ JSON parse failed ({len(raw_json)} bytes): {exc}"
+                )
 
     # ------------------------------------------------------------------- #
     # 2) *ThePlace*-specific legacy code (kept unchanged, runs afterwards)
@@ -689,6 +741,12 @@ DEFAULT_USER_AGENT = (
 
 session = requests.Session()
 session.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+session.headers.update({
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.livejournal.com/",
+    "Connection": "keep-alive",
+})
 
 CACHE_DIR = ".coppermine_cache"
 DOWNLOAD_WORKERS = 4
@@ -1076,6 +1134,7 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
         log("Cache found; using quick scan" if quick_scan else "Cache found.")
     cached_nodes = _build_url_map(cached_tree) if cached_tree else None
     site_type = select_adapter_for_url(root_url)
+    log(f"[DEBUG] Adapter chosen: {site_type}")
     if site_type == "universal":
         rules = select_universal_rules(root_url)
         tree = universal_discover_tree(
