@@ -1,11 +1,11 @@
 # Copperminer – A Gallery Ripper
 
-A hassle-free GUI tool to recursively download full-size images from any Coppermine-powered gallery—plus other sites using a simple rules engine (ThePlace2 included). No thumbnails, no junk—just the real full-size images, organized in folders to match the site’s gallery structure. Perfect for backing up fan galleries before they disappear.
+A hassle-free GUI tool to recursively download full-size images from any Coppermine-powered gallery—plus other sites using a simple rules engine (ThePlace2 and LiveJournal photos included). No thumbnails, no junk—just the real full-size images, organized in folders to match the site’s gallery structure. Perfect for backing up fan galleries before they disappear.
 
 ## Features
 
 - Point-and-click GUI — No command line needed, always-on dark mode
-- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine and rule-based sites like ThePlace2)
+- Intelligent discovery — Enter any gallery root or album URL (supports Coppermine and rule-based sites like ThePlace2 or LiveJournal photos)
 - Album tree — Finds and displays all real albums for selection, ignoring “Last uploads”, “Most viewed”, and other virtual/special albums
 - Optional special galleries toggle — Include “Last uploads”, “Most viewed”, etc. only when you want them
 - Preserves structure — Downloads images into folders/subfolders that match the gallery’s layout
@@ -27,7 +27,7 @@ Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
 
 ## Limitations
 
-- Supports Coppermine and a small set of rule-based sites (initially ThePlace2): other galleries may fail
+- Supports Coppermine and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
 - No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below
 
