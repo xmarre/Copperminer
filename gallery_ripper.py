@@ -394,6 +394,38 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
                 )
 
     # ------------------------------------------------------------------- #
+    # 1-ter) LAST RESORT LJ fallback: regex-scan raw HTML for album IDs
+    # ------------------------------------------------------------------- #
+    if not albums and "livejournal.com" in urlparse(root_url).netloc:
+        album_ids = set(re.findall(r"/photo/album/(\d+)", html))
+        album_ids.update(re.findall(r'"albumId"\s*:\s*(\d+)', html))
+        if album_ids:
+            log(f"[DEBUG] Regex fallback found {len(album_ids)} candidate album IDs.")
+            for aid in sorted(album_ids, key=int):
+                a_url = urljoin(root_url, f"/photo/album/{aid}/")
+                if any(x["url"] == a_url for x in albums):
+                    continue
+                name = None
+                m = re.search(rf'(?:albumId"\s*:\s*{aid}[^{{}}]*?"title"\s*:\s*"([^"]+)")', html)
+                if m:
+                    name = m.group(1).strip()
+                else:
+                    m2 = re.search(rf'([A-Za-z0-9 _\-]{{3,80}})/photo/album/{aid}', html)
+                    if m2:
+                        cand = m2.group(1).rsplit('"', 1)[-1].strip()
+                        if 3 < len(cand) < 80:
+                            name = cand
+                if not name:
+                    name = f"Album {aid}"
+                albums.append({
+                    "type": "album",
+                    "name": name,
+                    "url": a_url,
+                    "image_count": "?",
+                })
+            log(f"Added {len(album_ids)} LiveJournal albums via regex fallback.")
+
+    # ------------------------------------------------------------------- #
     # 2) *ThePlace*-specific legacy code (kept unchanged, runs afterwards)
     # ------------------------------------------------------------------- #
 
