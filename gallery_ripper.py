@@ -160,6 +160,34 @@ DEFAULT_RULES = {
     },
 }
 
+# --------------------------------------------------------------------------- #
+#  Small utility: get text for an <a> element even if it has no inner text.
+#  Many LiveJournal album links rely on title or aria-label instead.
+# --------------------------------------------------------------------------- #
+def _link_text(a):
+    return (
+        a.get_text(strip=True)
+        or a.get("title", "").strip()
+        or a.get("aria-label", "").strip()
+        or a.get("alt", "").strip()
+    )
+
+# Recursively search a nested structure for the first occurrence of *key* -------
+def _find_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for v in node.values():
+            result = _find_key(v, key)
+            if result is not None:
+                return result
+    elif isinstance(node, list):
+        for v in node:
+            result = _find_key(v, key)
+            if result is not None:
+                return result
+    return None
+
 
 def select_universal_rules(url: str):
     """Return scraping rules for *url* if the domain is supported."""
@@ -257,6 +285,65 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
         "albums": [],
     }
     albums = []
+
+    # ------------------------------------------------------------------- #
+    # 1) Generic discovery driven by CSS    (works for LiveJournal, etc.)
+    # ------------------------------------------------------------------- #
+    root_sel = rules.get("root_album_selector")
+    if root_sel:
+        for a in soup.select(root_sel):
+            href = a.get("href", "")
+            if not href:
+                continue
+            alb_url = urljoin(root_url, href)
+            if any(x["url"] == alb_url for x in albums):
+                continue
+            albums.append({
+                "type": "album",
+                "name": _link_text(a) or os.path.basename(href.rstrip("/")),
+                "url": alb_url,
+                "image_count": "?",
+            })
+
+    # ------------------------------------------------------------------- #
+    # 1-bis) LiveJournal fallback – parse the JSON in <script id="__NEXT_DATA__">
+    # ------------------------------------------------------------------- #
+    if not albums and "livejournal.com" in urlparse(root_url).netloc:
+        data_tag = soup.find("script", id="__NEXT_DATA__")
+        if data_tag:
+            raw = (data_tag.string or data_tag.text or "").strip()
+            if raw:
+                try:
+                    state = json.loads(raw)
+                    lj_albums = _find_key(state, "albums") or []
+                    if isinstance(lj_albums, dict):
+                        iterable = lj_albums.values()
+                    else:
+                        iterable = lj_albums
+                    for alb in iterable:
+                        sec = str(alb.get("security", "")).lower()
+                        if sec not in ("", "0", "public"):
+                            continue
+                        a_id = alb.get("id") or alb.get("albumId")
+                        title = alb.get("title") or f"Album {a_id}"
+                        count = alb.get("itemsCount") or "?"
+                        a_url = urljoin(root_url, f"/photo/album/{a_id}/")
+                        if any(x["url"] == a_url for x in albums):
+                            continue
+                        albums.append({
+                            "type": "album",
+                            "name": title,
+                            "url": a_url,
+                            "image_count": count,
+                        })
+                    if albums:
+                        log(f"Found {len(albums)} LiveJournal albums via __NEXT_DATA__ JSON.")
+                except Exception as exc:
+                    log(f"WARNING: failed to parse __NEXT_DATA__: {exc}")
+
+    # ------------------------------------------------------------------- #
+    # 2) *ThePlace*-specific legacy code (kept unchanged, runs afterwards)
+    # ------------------------------------------------------------------- #
 
     # (1) If on /photos, get all A-Z letter pages
     letter_links = []
@@ -356,6 +443,13 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
                 img = det_soup.select_one("img")
                 if img and "src" in img.attrs:
                     full_img = urljoin(detail_url, img["src"])
+            if not full_img and rules.get("detail_image_selector"):
+                tag = det_soup.select_one(rules["detail_image_selector"])
+                if tag:
+                    if tag.name == "img" and tag.get("src"):
+                        full_img = urljoin(detail_url, tag["src"])
+                    elif tag.get("href"):
+                        full_img = urljoin(detail_url, tag["href"])
             # Use filename as entry name
             if full_img and full_img not in seen:
                 seen.add(full_img)
