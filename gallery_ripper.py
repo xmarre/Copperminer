@@ -172,6 +172,22 @@ def _link_text(a):
         or a.get("alt", "").strip()
     )
 
+# Recursively search a nested structure for the first occurrence of *key* -------
+def _find_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for v in node.values():
+            result = _find_key(v, key)
+            if result is not None:
+                return result
+    elif isinstance(node, list):
+        for v in node:
+            result = _find_key(v, key)
+            if result is not None:
+                return result
+    return None
+
 
 def select_universal_rules(url: str):
     """Return scraping rules for *url* if the domain is supported."""
@@ -288,6 +304,42 @@ def universal_discover_tree(root_url, rules, log=lambda msg: None, page_cache=No
                 "url": alb_url,
                 "image_count": "?",
             })
+
+    # ------------------------------------------------------------------- #
+    # 1-bis) LiveJournal fallback – parse the JSON in <script id="__NEXT_DATA__">
+    # ------------------------------------------------------------------- #
+    if not albums and "livejournal.com" in urlparse(root_url).netloc:
+        data_tag = soup.find("script", id="__NEXT_DATA__")
+        if data_tag:
+            raw = (data_tag.string or data_tag.text or "").strip()
+            if raw:
+                try:
+                    state = json.loads(raw)
+                    lj_albums = _find_key(state, "albums") or []
+                    if isinstance(lj_albums, dict):
+                        iterable = lj_albums.values()
+                    else:
+                        iterable = lj_albums
+                    for alb in iterable:
+                        sec = str(alb.get("security", "")).lower()
+                        if sec not in ("", "0", "public"):
+                            continue
+                        a_id = alb.get("id") or alb.get("albumId")
+                        title = alb.get("title") or f"Album {a_id}"
+                        count = alb.get("itemsCount") or "?"
+                        a_url = urljoin(root_url, f"/photo/album/{a_id}/")
+                        if any(x["url"] == a_url for x in albums):
+                            continue
+                        albums.append({
+                            "type": "album",
+                            "name": title,
+                            "url": a_url,
+                            "image_count": count,
+                        })
+                    if albums:
+                        log(f"Found {len(albums)} LiveJournal albums via __NEXT_DATA__ JSON.")
+                except Exception as exc:
+                    log(f"WARNING: failed to parse __NEXT_DATA__: {exc}")
 
     # ------------------------------------------------------------------- #
     # 2) *ThePlace*-specific legacy code (kept unchanged, runs afterwards)
