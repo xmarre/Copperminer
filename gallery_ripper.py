@@ -148,6 +148,16 @@ DEFAULT_RULES = {
         "thumb_selector": ".pic-card a.link[href*='pic-']",
         "detail_image_selector": ".big-photo-wrapper a[href]",
     },
+    "livejournal": {
+        "domains": ["livejournal.com"],
+        # Albums use /photo/album/<id>
+        "root_album_selector": "a[href*='/photo/album/']",
+        "pagination_selector": "a[href*='page=']",
+        # Each thumbnail links to a /photo/item/<id> detail page
+        "thumb_selector": "a[href*='/photo/item/']",
+        # Detail pages show the image directly inside an <img>
+        "detail_image_selector": "img[src]",
+    },
 }
 
 
