@@ -1544,6 +1544,66 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     else:
         log("No images found in album after all strategies.")
 
+    # --- Consolidate variants (prefer originals over normal/thumb) ---
+    def _canon_key(u: str):
+        try:
+            pu = urlparse(u)
+            path = pu.path
+            parts = [p for p in path.split("/") if p and p != "thumbs"]
+            base = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+            name = parts[-1] if parts else ""
+            # strip common prefixes
+            for pref in ("normal_", "thumb_", "full_", "orig_"):
+                if name.startswith(pref):
+                    name = name[len(pref):]
+                    break
+            # strip common suffixes before extension
+            stem, ext = os.path.splitext(name)
+            for suf in ("-normal", "_normal", "-thumb", "_thumb"):
+                if stem.endswith(suf):
+                    stem = stem[: -len(suf)]
+                    break
+            norm_path = ppath.join(base, stem + ext)
+            return (pu.scheme, pu.netloc, norm_path.lower())
+        except Exception:
+            return ("", "", u)
+
+    def _quality_rank(u: str) -> int:
+        s = u.lower()
+        r = 0
+        if "/thumbs/" in s or "thumb_" in s or "_thumb" in s or "-thumb" in s:
+            r -= 2
+        if "normal_" in s or "_normal" in s or "-normal" in s:
+            r -= 1
+        if "orig" in s or "full" in s:
+            r += 1
+        return r
+
+    grouped = {}
+    for title, urls, ref in image_entries:
+        for u in urls:
+            k = _canon_key(u)
+            lst = grouped.setdefault(k, [])
+            lst.append((u, ref, _quality_rank(u), title))
+
+    # Build one entry per canonical file. Originals first, fall back to lower-res if needed.
+    consolidated = []
+    for k, items in grouped.items():
+        # de-dup exact URLs, keep highest rank first
+        seen = set()
+        items_sorted = sorted(items, key=lambda t: t[2], reverse=True)
+        ordered_urls, ref, name = [], None, None
+        for u, rref, _, tname in items_sorted:
+            if u in seen:
+                continue
+            seen.add(u)
+            ordered_urls.append(u)
+            ref = ref or rref
+            name = name or tname
+        consolidated.append((name or "Image", ordered_urls, ref or album_url))
+
+    image_entries = consolidated
+
     filtered_entries = []
     for name, candidates, referer in image_entries:
         main_url = candidates[0]
