@@ -1377,7 +1377,7 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
                 candidates.append(urljoin(base, m))
         for attr, val in tag.attrs.items():
             if attr.startswith("data") and isinstance(val, str) and re.search(
-                r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?[^\s'"<>]*)?$",
+                r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?[^\s'\"<>]*)?$",
                 val,
                 re.I,
             ):
