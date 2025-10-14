@@ -3,7 +3,8 @@ import threading
 import asyncio
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
+import posixpath as ppath
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, IntVar
@@ -1238,7 +1239,7 @@ def extract_album_image_links(html, album_url):
         href = a["href"]
         if "displayimage.php" in href and "pid=" in href:
             links.append(urljoin(album_url, href))
-        elif re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+        elif re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?.*)?$", href, re.I):
             links.append(urljoin(album_url, href))
 
     js_var_pattern = re.compile(
@@ -1339,7 +1340,7 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
         rels = a.get("rel", [])
         if "fancybox" in classes or "fancybox-thumb" in classes or "fancybox-thumb" in rels:
             href = a["href"]
-            if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+            if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?.*)?$", href, re.I):
                 candidates.append(urljoin(base, href))
 
     # 2. <img class="image" src="...">
@@ -1361,18 +1362,25 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     # 4. Any <a href="..."> that points directly to an image
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", href, re.I):
+        if re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?.*)?$", href, re.I):
             candidates.append(urljoin(base, href))
 
     # 5. Look for URLs inside onclick handlers or data-* attributes
-    pattern = re.compile(r"['\"]([^'\"]+\.(?:jpe?g|png|gif|webp|bmp|tiff))['\"]", re.I)
+    pattern = re.compile(
+        r"['\"]([^'\"\s]+\.(?:jpe?g|png|gif|webp|bmp|tiff)(?:\?[^\s'\"<>]*)?)['\"]",
+        re.I,
+    )
     for tag in soup.find_all(["a", "img"]):
         oc = tag.get("onclick")
         if oc:
             for m in pattern.findall(oc):
                 candidates.append(urljoin(base, m))
         for attr, val in tag.attrs.items():
-            if attr.startswith("data") and isinstance(val, str) and re.search(r"\.(jpe?g|png|gif|webp|bmp|tiff)$", val, re.I):
+            if attr.startswith("data") and isinstance(val, str) and re.search(
+                r"\.(jpe?g|png|gif|webp|bmp|tiff)(?:\?[^\s'"<>]*)?$",
+                val,
+                re.I,
+            ):
                 candidates.append(urljoin(base, val))
 
     # Deduplicate
@@ -1383,11 +1391,47 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
             unique_candidates.append(c)
             seen.add(c)
 
+    # --- Coppermine originals heuristic ----------------------------------
+    def _coppermine_variants(u: str) -> list[str]:
+        try:
+            pu = urlparse(u)
+            base = ppath.dirname(pu.path)
+            name = ppath.basename(pu.path)
+            variants = [u]
+            # strip normal_/thumb_ prefix
+            for pref in ("normal_", "thumb_"):
+                if name.startswith(pref):
+                    orig_name = name[len(pref):]
+                    orig_path = ppath.join(base, orig_name)
+                    variants.insert(0, urlunparse((pu.scheme, pu.netloc, orig_path, "", pu.query, "")))
+            # some installs use a /thumbs/ segment; drop it rather than hard-replacing
+            if "/thumbs/" in pu.path:
+                parts = [p for p in pu.path.split("/") if p and p != "thumbs"]
+                alt_path = "/" + "/".join(parts)
+                variants.insert(0, urlunparse((pu.scheme, pu.netloc, alt_path, "", pu.query, "")))
+            # return unique in-order
+            out, seen_loc = [], set()
+            for v in variants:
+                if v not in seen_loc:
+                    out.append(v)
+                    seen_loc.add(v)
+            return out
+        except Exception:
+            return [u]
+
+    expanded = []
+    for c in unique_candidates:
+        expanded.extend(_coppermine_variants(c))
+    # drop obvious theme sprites early; album-level filter is a second guard
+    expanded = [u for u in expanded if "/themes/" not in u]
+    unique_candidates = list(dict.fromkeys(expanded))
+
     def score(url):
+        u = url.lower()
         s = 0
-        if "thumb" in url:
+        if "thumb" in u:
             s += 2
-        if "normal_" in url:
+        if "normal_" in u:
             s += 1
         return s
 
@@ -1475,7 +1519,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     # 4. Direct <a> links to image files
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if re.search(r"\.(jpe?g|png|webp|gif)$", href, re.I):
+        if re.search(r"\.(jpe?g|png|webp|gif)(?:\?.*)?$", href, re.I):
             url = urljoin(album_url, href)
             if url and url not in unique_urls:
                 log(f"[DEBUG] a tag -> {url}")
