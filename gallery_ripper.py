@@ -3,7 +3,7 @@ import threading
 import asyncio
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
 import posixpath as ppath
 import urllib.request
 import tkinter as tk
@@ -542,18 +542,20 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     filtered_entries = []
     for name, candidates, referer in image_entries:
         main_url = candidates[0]
-        fname = os.path.basename(main_url.split("?")[0])
-        if is_ui_image(main_url, fname):
+        main_url_clean = main_url.split("#", 1)[0]
+        fname = os.path.basename(main_url_clean.split("?")[0])
+        if is_ui_image(main_url_clean, fname):
             log(f"Skipping UI/icon image: {fname}")
             continue
-        if is_probably_thumbnail(main_url):
-            log(f"Skipping small image (likely icon): {main_url}")
+        if is_probably_thumbnail(main_url_clean):
+            log(f"Skipping small image (likely icon): {main_url_clean}")
             continue
         filtered_entries.append((name, candidates, referer))
 
     entry_urls = []
     for _, candidates, _ in filtered_entries:
-        entry_urls.extend(candidates)
+        for u in candidates:
+            entry_urls.append(u.split("#", 1)[0])  # ignore per-URL referer in hash
     img_hash = compute_hash_from_list(entry_urls)
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
@@ -1597,7 +1599,8 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             if u in seen:
                 continue
             seen.add(u)
-            ordered_urls.append(u)
+            # keep per-URL referer; downloader will extract it
+            ordered_urls.append(f"{u}#__ref__={quote((rref or album_url) or '', safe='')}")
             ref = ref or rref
             name = name or tname
         consolidated.append((name or "Image", ordered_urls, ref or album_url))
@@ -1607,18 +1610,20 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     filtered_entries = []
     for name, candidates, referer in image_entries:
         main_url = candidates[0]
-        fname = os.path.basename(main_url.split("?")[0])
-        if is_ui_image(main_url, fname):
+        main_url_clean = main_url.split("#", 1)[0]
+        fname = os.path.basename(main_url_clean.split("?", 1)[0])
+        if is_ui_image(main_url_clean, fname):
             log(f"Skipping UI/icon image: {fname}")
             continue
-        if is_probably_thumbnail(main_url):
-            log(f"Skipping small image (likely icon): {main_url}")
+        if is_probably_thumbnail(main_url_clean):
+            log(f"Skipping small image (likely icon): {main_url_clean}")
             continue
         filtered_entries.append((name, candidates, referer))
 
     entry_urls = []
     for _, candidates, _ in filtered_entries:
-        entry_urls.extend(candidates)
+        for u in candidates:
+            entry_urls.append(u.split("#", 1)[0])  # ignore per-URL referer in hash
     img_hash = compute_hash_from_list(entry_urls)
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
@@ -1650,16 +1655,37 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         Optional Referer header value to send with the request. Some galleries
         require a valid Referer to allow direct image downloads.
     """
+
+    # Per-URL referer support: URL may be "http...jpg#__ref__=<encoded referer>"
+    def _url_and_ref(u, default_ref):
+        if isinstance(u, tuple):
+            # backward compatibility if callers pass (url, ref)
+            url, r = u[0], (u[1] or default_ref)
+            return url, r
+        if isinstance(u, str) and "#__ref__=" in u:
+            base, frag = u.split("#__ref__=", 1)
+            try:
+                r = unquote(frag)
+            except Exception:
+                r = default_ref
+            return base, (r or default_ref)
+        return u, default_ref
+
+    _paired = [_url_and_ref(u, referer) for u in candidate_urls]
+
     for block_attempt in range(1, max_attempts + 1):
-        for candidate in candidate_urls:
+        for candidate, candidate_ref in _paired:
             fname = os.path.basename(candidate.split("?")[0])
             fpath = os.path.join(output_dir, fname)
             if os.path.exists(fpath):
                 log(f"Already downloaded: {fname}")
                 return False
             try:
-                headers = {'Referer': referer} if referer else {}
-                log(f"[DEBUG] Attempting download: {candidate} (Referer: {referer})")
+                headers = {}
+                ref_to_use = candidate_ref or referer
+                if ref_to_use:
+                    headers['Referer'] = ref_to_use
+                log(f"[DEBUG] Attempting download: {candidate} (Referer: {ref_to_use})")
                 rlim = rate_limiter_for_url(candidate)
                 rlim.wait()
                 r = session.get(candidate, headers=headers, stream=True, timeout=20)
