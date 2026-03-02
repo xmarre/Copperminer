@@ -3,7 +3,7 @@ import threading
 import asyncio
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
+from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs
 import posixpath as ppath
 import urllib.request
 import tkinter as tk
@@ -110,12 +110,68 @@ UI_IMAGE_FILENAMES = {
 def is_ui_image(url: str, name: str) -> bool:
     """Return True if *name* or *url* looks like a UI/icon asset."""
     name = name.lower()
+    url_l = (url or "").lower()
     if name in UI_IMAGE_FILENAMES:
         return True
-    patterns = ["/themes/", "/images/", "/icons/", "/button_", "/star", "/rating"]
-    if any(p in url for p in patterns):
+    patterns = [
+        "/themes/",
+        "/images/",
+        "/icons/",
+        "/button_",
+        "/star",
+        "/rating",
+        "/advertising/",
+        "adview.php",
+        "/ads/",
+    ]
+    if any(p in url_l for p in patterns):
         return True
     return False
+
+
+def coppermine_url_variants(u: str) -> list[str]:
+    """Generate likely Coppermine variants for a thumbnail/normal URL.
+
+    Many Coppermine installs store derivatives as ``thumb_<name>`` or
+    ``normal_<name>`` alongside the original. Some use a ``/thumbs/`` path
+    segment. This helper expands a URL into a best-effort list with the most
+    likely original first.
+    """
+    try:
+        pu = urlparse(u)
+        base = ppath.dirname(pu.path)
+        name = ppath.basename(pu.path)
+        variants = [u]
+
+        # Strip common Coppermine prefixes.
+        for pref in ("normal_", "thumb_"):
+            if name.startswith(pref):
+                orig_name = name[len(pref):]
+                orig_path = ppath.join(base, orig_name)
+                variants.insert(
+                    0,
+                    urlunparse((pu.scheme, pu.netloc, orig_path, "", pu.query, "")),
+                )
+                break
+
+        # Drop a /thumbs/ path segment if present.
+        if "/thumbs/" in pu.path:
+            parts = [p for p in pu.path.split("/") if p and p != "thumbs"]
+            alt_path = "/" + "/".join(parts)
+            variants.insert(
+                0,
+                urlunparse((pu.scheme, pu.netloc, alt_path, "", pu.query, "")),
+            )
+
+        # Unique, stable order
+        out, seen = [], set()
+        for v in variants:
+            if v not in seen:
+                out.append(v)
+                seen.add(v)
+        return out
+    except Exception:
+        return [u]
 
 
 def is_probably_thumbnail(url: str) -> bool:
@@ -560,6 +616,7 @@ def universal_get_all_candidate_images_from_album(album_url, rules, log=lambda m
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
+        page_cache[album_url]["images_v"] = IMAGE_EXTRACTOR_VERSION
     return filtered_entries
 
 # -- 4chan helpers ------------------------------------------------------------
@@ -784,6 +841,7 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
+IMAGE_EXTRACTOR_VERSION = 2
 DOWNLOAD_WORKERS = 4
 
 
@@ -1393,37 +1451,9 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
             unique_candidates.append(c)
             seen.add(c)
 
-    # --- Coppermine originals heuristic ----------------------------------
-    def _coppermine_variants(u: str) -> list[str]:
-        try:
-            pu = urlparse(u)
-            base = ppath.dirname(pu.path)
-            name = ppath.basename(pu.path)
-            variants = [u]
-            # strip normal_/thumb_ prefix
-            for pref in ("normal_", "thumb_"):
-                if name.startswith(pref):
-                    orig_name = name[len(pref):]
-                    orig_path = ppath.join(base, orig_name)
-                    variants.insert(0, urlunparse((pu.scheme, pu.netloc, orig_path, "", pu.query, "")))
-            # some installs use a /thumbs/ segment; drop it rather than hard-replacing
-            if "/thumbs/" in pu.path:
-                parts = [p for p in pu.path.split("/") if p and p != "thumbs"]
-                alt_path = "/" + "/".join(parts)
-                variants.insert(0, urlunparse((pu.scheme, pu.netloc, alt_path, "", pu.query, "")))
-            # return unique in-order
-            out, seen_loc = [], set()
-            for v in variants:
-                if v not in seen_loc:
-                    out.append(v)
-                    seen_loc.add(v)
-            return out
-        except Exception:
-            return [u]
-
     expanded = []
     for c in unique_candidates:
-        expanded.extend(_coppermine_variants(c))
+        expanded.extend(coppermine_url_variants(c))
     # drop obvious theme sprites early; album-level filter is a second guard
     expanded = [u for u in expanded if "/themes/" not in u]
     unique_candidates = list(dict.fromkeys(expanded))
@@ -1463,8 +1493,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     html, changed = fetch_html_cached(album_url, page_cache, log=log, quick_scan=quick_scan)
     entry = page_cache.get(album_url, {})
     if quick_scan and not changed and entry.get("images"):
-        log(f"[DEBUG] Using cached image list for {album_url}")
-        return entry["images"]
+        if entry.get("images_v") == IMAGE_EXTRACTOR_VERSION:
+            log(f"[DEBUG] Using cached image list for {album_url}")
+            return entry["images"]
+        log(f"[DEBUG] Cached image list version mismatch; recomputing for {album_url}")
 
     soup = BeautifulSoup(html, "html.parser")
     log = log or (lambda msg: None)
@@ -1485,9 +1517,19 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     display_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # only consider unique displayimage.php?album=...&pid=...
-        if "displayimage.php" in href and "album=" in href and "pid=" in href:
-            display_links.append(urljoin(album_url, href))
+        # Coppermine installs vary:
+        #   - displayimage.php?pos=-123
+        #   - displayimage.php?pid=123
+        #   - displayimage.php?album=..&pid=..
+        if "displayimage.php" in href:
+            durl = urljoin(album_url, href)
+            # drop fragments; they explode dedupe and don't affect content
+            try:
+                pu = urlparse(durl)
+                durl = urlunparse(pu._replace(fragment=""))
+            except Exception:
+                pass
+            display_links.append(durl)
     display_links = list(dict.fromkeys(display_links))  # dedupe
     if display_links:
         log(f"[DEBUG] Found {len(display_links)} displayimage links")
@@ -1499,7 +1541,34 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             image_entries.append((f"Image (displayimage) {idx}", good_candidates, dlink))
             unique_urls.update(good_candidates)
 
-    # 3. Direct <img> links that aren't thumbnails
+    # 3. Thumbnail <img> sources -> attempt Coppermine "original" variants.
+    # This is a fast path and also a fallback for galleries where thumbnail
+    # links don't include pid/album information.
+    for img in soup.find_all("img", src=True):
+        src = img["src"]
+        src_l = (src or "").lower()
+        if not (
+            "thumb" in src_l
+            or "/thumbs/" in src_l
+            or re.search(r"_(s|t|thumb)\.", src_l)
+            or src_l.startswith("data:")
+        ):
+            continue
+        url = urljoin(album_url, src)
+        if not url:
+            continue
+        fname = os.path.basename(url.split("?", 1)[0])
+        if is_ui_image(url, fname):
+            continue
+        variants = coppermine_url_variants(url)
+        # Prefer dedupe by the most-likely original URL first.
+        key_url = variants[0].split("#", 1)[0]
+        if key_url not in unique_urls:
+            log(f"[DEBUG] thumb img -> {variants}")
+            image_entries.append(("Image (thumb->orig)", variants, album_url))
+            unique_urls.add(key_url)
+
+    # 4. Direct <img> links that aren't thumbnails
     for img in soup.find_all("img", src=True):
         src = img["src"]
         if (
@@ -1513,12 +1582,17 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         if width and height and (width < 300 or height < 200):
             continue
         url = urljoin(album_url, src)
-        if url and url not in unique_urls:
+        if not url or url in unique_urls:
+            continue
+        fname = os.path.basename(url.split("?", 1)[0])
+        if is_ui_image(url, fname):
+            continue
+        if url not in unique_urls:
             log(f"[DEBUG] img tag -> {url}")
             image_entries.append((f"Image (img tag)", [url], album_url))
             unique_urls.add(url)
 
-    # 4. Direct <a> links to image files
+    # 5. Direct <a> links to image files
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if re.search(r"\.(jpe?g|png|webp|gif)(?:\?.*)?$", href, re.I):
@@ -1528,11 +1602,44 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 image_entries.append((f"Image (a tag)", [url], album_url))
                 unique_urls.add(url)
 
-    # 5. Pagination support (recurse for all "page=" links)
+    # 6. Pagination support (recurse only true page navigation; ignore sort links)
     pagelinks = set()
+    try:
+        cur = urlparse(album_url)
+        cur_q = parse_qs(cur.query)
+        cur_album = cur_q.get("album", [None])[0]
+        cur_sort = cur_q.get("sort", [None])[0]
+    except Exception:
+        cur_album, cur_sort = None, None
+
     for a in soup.find_all("a", href=True):
-        if "page=" in a["href"]:
-            pagelinks.add(urljoin(album_url, a["href"]))
+        href = a["href"]
+        if "page=" not in href:
+            continue
+        # Only follow Coppermine thumbnail pages.
+        if "thumbnails.php" not in href:
+            continue
+
+        pl = urljoin(album_url, href)
+        try:
+            pu = urlparse(pl)
+            q = parse_qs(pu.query)
+            page = q.get("page", [None])[0]
+            if not (page and str(page).isdigit()):
+                continue
+            if int(page) <= 1:
+                # Sort links are commonly "page=1&sort=.."; ignore those.
+                continue
+            if cur_album and q.get("album", [None])[0] != cur_album:
+                continue
+            href_sort = q.get("sort", [None])[0]
+            if cur_sort and href_sort and href_sort != cur_sort:
+                continue
+            pl = urlunparse(pu._replace(fragment=""))
+        except Exception:
+            continue
+
+        pagelinks.add(pl)
     for pl in pagelinks:
         log(f"[DEBUG] pagination -> {pl}")
         image_entries.extend(
@@ -1628,6 +1735,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     if album_url in page_cache:
         page_cache[album_url]["images"] = filtered_entries
         page_cache[album_url]["image_hash"] = img_hash
+        page_cache[album_url]["images_v"] = IMAGE_EXTRACTOR_VERSION
 
     return filtered_entries
 
@@ -1673,13 +1781,60 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 
     _paired = [_url_and_ref(u, referer) for u in candidate_urls]
 
+    def _filename_from_headers(default_name: str, headers: dict, content_type: str) -> str:
+        """Best-effort filename inference for endpoints like download.php."""
+        name = os.path.basename(default_name) or "file"
+        cd = headers.get("Content-Disposition", "") or headers.get("content-disposition", "")
+        if cd:
+            # filename*=UTF-8''... or filename="..."
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd, flags=re.I)
+            if m:
+                try:
+                    name = unquote(m.group(1)).strip().strip('"')
+                except Exception:
+                    pass
+            else:
+                m = re.search(r"filename=\"?([^;\"]+)\"?", cd, flags=re.I)
+                if m:
+                    name = m.group(1).strip()
+
+        name = os.path.basename(name)  # strip any path
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTS or ext in MEDIA_EXTS:
+            return name
+
+        # Map content-type -> extension when the URL doesn't carry one.
+        ct = (content_type or "").split(";", 1)[0].strip().lower()
+        ct_map = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "video/webm": ".webm",
+            "video/mp4": ".mp4",
+        }
+        suffix = ct_map.get(ct, "")
+        if not suffix:
+            return name
+
+        stem = os.path.splitext(name)[0] or "file"
+        return stem + suffix
+
     for block_attempt in range(1, max_attempts + 1):
         for candidate, candidate_ref in _paired:
-            fname = os.path.basename(candidate.split("?")[0])
-            fpath = os.path.join(output_dir, fname)
-            if os.path.exists(fpath):
-                log(f"Already downloaded: {fname}")
-                return False
+            # Use the URL path name as a default; some Coppermine endpoints are PHP
+            # but still return images (we'll fix the extension after headers).
+            parsed = urlparse(candidate)
+            url_name = os.path.basename(parsed.path) or "file"
+            url_ext = os.path.splitext(url_name)[1].lower()
+            prechecked_path = None
+            if url_ext in IMAGE_EXTS or url_ext in MEDIA_EXTS:
+                prechecked_path = os.path.join(output_dir, url_name)
+                if os.path.exists(prechecked_path):
+                    log(f"Already downloaded: {url_name}")
+                    return False
             try:
                 headers = {}
                 ref_to_use = candidate_ref or referer
@@ -1701,6 +1856,11 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     raise Exception(
                         f"URL does not return media: {candidate} (Content-Type: {ctype})"
                     )
+                fname = _filename_from_headers(url_name, r.headers, ctype)
+                fpath = os.path.join(output_dir, fname)
+                if os.path.exists(fpath):
+                    log(f"Already downloaded: {fname}")
+                    return False
                 total_bytes = 0
                 start_time = time.time()
                 with open(fpath, "wb") as f:
