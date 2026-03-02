@@ -1612,12 +1612,40 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         cur_q = parse_qs(cur.query)
         cur_album = cur_q.get("album", [None])[0]
 
+        cur_page_raw = cur_q.get("page", [None])[0]
+        implicit_page = cur_page_raw is None
+        has_page0 = False
+        if implicit_page:
+            # If the UI exposes page=0 links, treat the base URL as page 0.
+            for _a in soup.find_all("a", href=True):
+                _href = _a.get("href") or ""
+                if "thumbnails.php" not in _href or "page=" not in _href:
+                    continue
+                try:
+                    _pu = urlparse(urljoin(album_url, _href))
+                    _q = parse_qs(_pu.query)
+                    if cur_album and _q.get("album", [None])[0] != cur_album:
+                        continue
+                    if _q.get("page", [None])[0] == "0":
+                        has_page0 = True
+                        break
+                except Exception:
+                    pass
+
+        if cur_page_raw and str(cur_page_raw).isdigit():
+            cur_page = int(cur_page_raw)
+        else:
+            # If page is implicit:
+            # - page=0 scheme => current is 0 (so we must allow page=1)
+            # - otherwise => current is 1 (so we skip page=1 alias)
+            cur_page = 0 if has_page0 else 1
+
         cur_norm_q = dict(cur_q)
         cur_norm_q.pop("sort", None)
         cur_norm_q.pop("sort_order", None)
         cur_norm = urlunparse(cur._replace(query=urlencode(cur_norm_q, doseq=True), fragment=""))
     except Exception:
-        cur_album, cur_norm = None, album_url
+        cur_album, cur_page, cur_norm = None, 1, album_url
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -1636,6 +1664,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 continue
             page_i = int(page)
             if page_i < 1:
+                continue
+            # Avoid first-page aliases (and any same-page duplicates).
+            if page_i == cur_page:
                 continue
             if cur_album and q.get("album", [None])[0] != cur_album:
                 continue
