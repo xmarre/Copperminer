@@ -3,7 +3,7 @@ import threading
 import asyncio
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs
+from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
 import posixpath as ppath
 import urllib.request
 import tkinter as tk
@@ -1547,11 +1547,12 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     for img in soup.find_all("img", src=True):
         src = img["src"]
         src_l = (src or "").lower()
+        if src_l.startswith("data:"):
+            continue
         if not (
             "thumb" in src_l
             or "/thumbs/" in src_l
             or re.search(r"_(s|t|thumb)\.", src_l)
-            or src_l.startswith("data:")
         ):
             continue
         url = urljoin(album_url, src)
@@ -1571,10 +1572,13 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     # 4. Direct <img> links that aren't thumbnails
     for img in soup.find_all("img", src=True):
         src = img["src"]
+        src_l = (src or "").lower()
+        if src_l.startswith("data:"):
+            continue
         if (
-            "thumb" in src
-            or "/thumbs/" in src
-            or re.search(r"_(s|t|thumb)\.", src)
+            "thumb" in src_l
+            or "/thumbs/" in src_l
+            or re.search(r"_(s|t|thumb)\.", src_l)
         ):
             continue
         width = int(img.get("width", 0))
@@ -1587,10 +1591,9 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         fname = os.path.basename(url.split("?", 1)[0])
         if is_ui_image(url, fname):
             continue
-        if url not in unique_urls:
-            log(f"[DEBUG] img tag -> {url}")
-            image_entries.append((f"Image (img tag)", [url], album_url))
-            unique_urls.add(url)
+        log(f"[DEBUG] img tag -> {url}")
+        image_entries.append((f"Image (img tag)", [url], album_url))
+        unique_urls.add(url)
 
     # 5. Direct <a> links to image files
     for a in soup.find_all("a", href=True):
@@ -1608,9 +1611,13 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         cur = urlparse(album_url)
         cur_q = parse_qs(cur.query)
         cur_album = cur_q.get("album", [None])[0]
-        cur_sort = cur_q.get("sort", [None])[0]
+
+        cur_norm_q = dict(cur_q)
+        cur_norm_q.pop("sort", None)
+        cur_norm_q.pop("sort_order", None)
+        cur_norm = urlunparse(cur._replace(query=urlencode(cur_norm_q, doseq=True), fragment=""))
     except Exception:
-        cur_album, cur_sort = None, None
+        cur_album, cur_norm = None, album_url
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -1627,15 +1634,21 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             page = q.get("page", [None])[0]
             if not (page and str(page).isdigit()):
                 continue
-            if int(page) <= 1:
-                # Sort links are commonly "page=1&sort=.."; ignore those.
+            page_i = int(page)
+            if page_i < 1:
                 continue
             if cur_album and q.get("album", [None])[0] != cur_album:
                 continue
-            href_sort = q.get("sort", [None])[0]
-            if cur_sort and href_sort and href_sort != cur_sort:
+
+            # Canonicalize: drop sort params so "page=1&sort=da/pd/..." collapses to one URL.
+            q.pop("sort", None)
+            q.pop("sort_order", None)
+            pu = pu._replace(query=urlencode(q, doseq=True), fragment="")
+            pl = urlunparse(pu)
+
+            # Skip if it normalizes to the current page URL (prevents loops/duplicates).
+            if pl == cur_norm:
                 continue
-            pl = urlunparse(pu._replace(fragment=""))
         except Exception:
             continue
 
