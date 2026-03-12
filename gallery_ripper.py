@@ -106,26 +106,76 @@ UI_IMAGE_FILENAMES = {
     "spacer.gif",
 }
 
+# Media extensions accepted by the scraper. Kept local to the filtering helpers so
+# they can safely be used before the downloader constants are defined further down.
+MEDIA_FILE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".gif",
+    ".webm", ".mp4",
+}
+
+# Coppermine and similar galleries often store actual media below /albums/ or
+# /userdata/, even if a later path component is named "Images" or "icons".
+MEDIA_CONTAINER_SEGMENTS = {
+    "albums", "album", "alben", "gallery", "galleries", "userdata",
+}
+
+# Theme/UI asset directories that should only be treated as chrome when the URL
+# is not clearly pointing into a media container.
+UI_PATH_SEGMENTS = {
+    "themes", "theme", "images", "image", "icons", "icon", "buttons",
+    "advertising", "ads",
+}
+
+UI_NAME_MARKERS = (
+    "button", "icon", "logo", "spacer", "pixel", "star", "rating", "rate_",
+    "folder", "blank", "sprite", "bullet", "arrow",
+)
+
 
 def is_ui_image(url: str, name: str) -> bool:
-    """Return True if *name* or *url* looks like a UI/icon asset."""
-    name = name.lower()
-    url_l = (url or "").lower()
+    """Return True if *name* or *url* looks like a UI/icon asset.
+
+    The old implementation used substring checks such as ``/images/``. That is
+    too aggressive for real gallery media paths like ``/albums/Images/.../001.jpg``
+    and incorrectly discards valid numbered album photos. This version reasons
+    about decoded path segments and only treats generic ``images``/``icons``
+    directories as UI chrome when the URL is not inside a known media container.
+    """
+    parsed = urlparse(url or "")
+    raw_path = unquote(parsed.path or "")
+    path_l = raw_path.lower()
+
+    name = (name or os.path.basename(raw_path)).lower()
     if name in UI_IMAGE_FILENAMES:
         return True
-    patterns = [
-        "/themes/",
-        "/images/",
-        "/icons/",
-        "/button_",
-        "/star",
-        "/rating",
-        "/advertising/",
-        "adview.php",
-        "/ads/",
-    ]
-    if any(p in url_l for p in patterns):
+
+    ext = os.path.splitext(name)[1].lower()
+    path_segments = [seg for seg in path_l.split("/") if seg]
+
+    in_media_container = any(seg in MEDIA_CONTAINER_SEGMENTS for seg in path_segments)
+
+    # Strong allow-rule for real media living under album/userdata style paths.
+    # This avoids false positives like /albums/Images/Photoshoots/.../001.jpg.
+    if in_media_container and ext in MEDIA_FILE_EXTENSIONS:
+        return False
+
+    if "adview.php" in path_l:
         return True
+
+    if any(seg in {"themes", "theme", "advertising", "ads"} for seg in path_segments):
+        return True
+
+    if any(marker in path_l for marker in ("/button_", "/star", "/rating")):
+        return True
+
+    if any(seg in UI_PATH_SEGMENTS for seg in path_segments) and not in_media_container:
+        # Non-media files in these folders are almost certainly UI assets.
+        if ext and ext not in MEDIA_FILE_EXTENSIONS:
+            return True
+        # Media files in generic UI folders are still often icons/sprites/etc.
+        if any(marker in name for marker in UI_NAME_MARKERS):
+            return True
+
     return False
 
 
@@ -841,7 +891,7 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
-IMAGE_EXTRACTOR_VERSION = 2
+IMAGE_EXTRACTOR_VERSION = 3
 DOWNLOAD_WORKERS = 4
 
 
