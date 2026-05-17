@@ -2,4 +2,4 @@ requests
 beautifulsoup4
 ttkthemes
 ttkbootstrap
-Pillow
+Pillow>=10.3.0
