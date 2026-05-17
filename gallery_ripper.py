@@ -836,14 +836,34 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
     return node
 
 
-# --- Yandex Images reverse-search adapter ------------------------------------
+# --- Yandex Images adapter ----------------------------------------------------
 
 YANDEX_RESULT_PREFIX = "yandex-result:"
 YANDEX_QUERY_PREFIX = "yandex:"
+YANDEX_HTML_PREFIX = "yandex-html:"
 YANDEX_RESULT_LIMIT = 300
+YANDEX_SEARCH_HOSTS = ("yandex.com", "yandex.ru")
+YANDEX_CAPTCHA_MARKERS = (
+    "showcaptcha", "smartcaptcha", "are you not a robot", "not a robot",
+    "captcha", "access to our service has been temporarily restricted",
+)
+YANDEX_CHALLENGE_TITLE_MARKERS = (
+    "are you not a robot", "not a robot", "captcha", "blocked",
+    "access to our service has been temporarily restricted",
+)
 GENERIC_DOWNLOAD_BASENAMES = {
     "orig", "original", "image", "img", "file", "download", "download.php", "proxy",
 }
+
+
+class YandexBlockedError(RuntimeError):
+    """Raised when Yandex returns a CAPTCHA/block page instead of image results."""
+
+    def __init__(self, message, search_url="", captcha_url="", diagnostics=""):
+        super().__init__(message)
+        self.search_url = search_url
+        self.captcha_url = captcha_url
+        self.diagnostics = diagnostics
 
 
 def is_yandex_images_url(url: str) -> bool:
@@ -857,13 +877,20 @@ def is_yandex_images_url(url: str) -> bool:
 
 def is_yandex_query_url(url: str) -> bool:
     low = (url or "").strip().lower()
-    return low.startswith(YANDEX_QUERY_PREFIX) or is_yandex_images_url(url)
+    return (
+        low.startswith(YANDEX_QUERY_PREFIX)
+        or low.startswith(YANDEX_HTML_PREFIX)
+        or is_yandex_images_url(url)
+    )
 
 
 def yandex_query_source_url(url: str) -> str:
-    """Return the image URL or text query behind a yandex: or Yandex Images URL."""
+    """Return the image URL, text query, or local HTML path behind a Yandex input."""
     raw = (url or "").strip()
-    if raw.lower().startswith(YANDEX_QUERY_PREFIX):
+    low = raw.lower()
+    if low.startswith(YANDEX_HTML_PREFIX):
+        return raw[len(YANDEX_HTML_PREFIX):].strip().strip('"')
+    if low.startswith(YANDEX_QUERY_PREFIX):
         return raw.split(":", 1)[1].strip()
     if is_yandex_images_url(raw):
         parsed = urlparse(raw)
@@ -880,8 +907,11 @@ def yandex_query_source_url(url: str) -> str:
 
 
 def yandex_query_mode(url: str) -> str:
-    """Classify a Yandex discovery input as an existing URL, reverse-image search, or text search."""
+    """Classify a Yandex discovery input as HTML import, reverse-image search, or text search."""
     raw = (url or "").strip()
+    low = raw.lower()
+    if low.startswith(YANDEX_HTML_PREFIX):
+        return "html"
     if is_yandex_images_url(raw):
         parsed = urlparse(raw)
         qs = parse_qs(parsed.query)
@@ -896,22 +926,43 @@ def yandex_query_mode(url: str) -> str:
     return "text"
 
 
-def yandex_search_url(url: str) -> str:
-    """Build a Yandex Images search URL for either text search or reverse-image search."""
-    raw = (url or "").strip()
-    if is_yandex_images_url(raw):
-        return raw
-    query = yandex_query_source_url(raw)
+def _yandex_search_params(url: str) -> dict:
+    query = yandex_query_source_url(url)
     if _is_http_url(query):
-        params = {
+        return {
             "rpt": "imageview",
             "url": query,
             "img_url": query,
             "text": query,
         }
-    else:
-        params = {"text": query}
-    return "https://yandex.com/images/search?" + urlencode(params)
+    return {"text": query}
+
+
+def _replace_url_host(url: str, host: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme or "https", host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def yandex_search_urls(url: str) -> list[str]:
+    """Build ordered Yandex Images search URLs for retry/fallback hosts."""
+    raw = (url or "").strip()
+    if is_yandex_images_url(raw):
+        urls = [raw]
+        for host in YANDEX_SEARCH_HOSTS:
+            variant = _replace_url_host(raw, host)
+            if variant not in urls:
+                urls.append(variant)
+        return urls
+
+    params = _yandex_search_params(raw)
+    query = urlencode(params)
+    return [f"https://{host}/images/search?{query}" for host in YANDEX_SEARCH_HOSTS]
+
+
+def yandex_search_url(url: str) -> str:
+    """Build the primary Yandex Images search URL for either text or reverse-image search."""
+    urls = yandex_search_urls(url)
+    return urls[0] if urls else (url or "")
 
 
 def yandex_reverse_search_url(url: str) -> str:
@@ -1260,6 +1311,44 @@ def _yandex_json_objects_near_markers(text: str, markers, max_objects: int = 250
                 return
 
 
+def _yandex_page_title(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        return soup.title.get_text(" ", strip=True) if soup.title else ""
+    except Exception:
+        return ""
+
+
+def _yandex_is_challenge(html: str, response=None) -> bool:
+    final_url = (getattr(response, "url", "") or "").lower() if response is not None else ""
+    title = _yandex_page_title(html).lower()
+    low = (html or "").lower()
+    if "showcaptcha" in final_url or "smartcaptcha" in final_url:
+        return True
+    if any(marker in title for marker in YANDEX_CHALLENGE_TITLE_MARKERS):
+        return True
+    # Body checks stay limited to strong CAPTCHA markers. A normal result page can
+    # contain generic strings like "robot" or "blocked" in scripts or metadata.
+    return any(marker in low for marker in YANDEX_CAPTCHA_MARKERS)
+
+
+def _yandex_has_serp_markers(html: str) -> bool:
+    low = (html or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "serp-item",
+            "images-touch-serp-item",
+            "img_href",
+            "origurl",
+            "originurl",
+            "serp-list",
+            "cbir",
+            "imagescontentimage",
+        )
+    )
+
+
 def _yandex_page_diagnostics(html: str, response=None) -> str:
     parts = []
     if response is not None:
@@ -1269,21 +1358,123 @@ def _yandex_page_diagnostics(html: str, response=None) -> str:
             parts.append(f"final_url={final_url[:180]}")
     if html is not None:
         parts.append(f"bytes={len(html.encode('utf-8', errors='ignore'))}")
-        soup = BeautifulSoup(html or "", "html.parser")
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        title = _yandex_page_title(html)
         if title:
             parts.append(f"title={title[:120]}")
-        low = (html or "").lower()
-        if any(marker in low for marker in ("captcha", "smartcaptcha", "showcaptcha", "robot", "blocked")):
+        if _yandex_is_challenge(html, response=response):
             parts.append("possible_challenge_or_block=1")
         marker_counts = []
-        for marker in ("serp-item", "img_href", "origUrl", "preview"):
+        low = (html or "").lower()
+        for marker in ("serp-item", "img_href", "origUrl", "preview", "serp-list", "cbir"):
             count = low.count(marker.lower())
             if count:
                 marker_counts.append(f"{marker}:{count}")
         if marker_counts:
             parts.append("markers=" + ",".join(marker_counts))
     return "; ".join(parts)
+
+
+def _yandex_browser_cookies(log=lambda msg: None):
+    """Best-effort import of local browser cookies for Yandex challenge sessions."""
+    try:
+        import browser_cookie3  # Optional dependency; see requirements.txt.
+    except Exception as exc:
+        log(f"Yandex browser-cookie retry unavailable: browser_cookie3 is not installed/importable ({exc}).")
+        return None
+
+    jar = requests.cookies.RequestsCookieJar()
+    loaded = []
+    domains = (".yandex.com", "yandex.com", ".yandex.ru", "yandex.ru", ".ya.ru", "ya.ru")
+    loaders = (
+        ("Chrome", getattr(browser_cookie3, "chrome", None)),
+        ("Edge", getattr(browser_cookie3, "edge", None)),
+        ("Firefox", getattr(browser_cookie3, "firefox", None)),
+        ("Brave", getattr(browser_cookie3, "brave", None)),
+        ("Chromium", getattr(browser_cookie3, "chromium", None)),
+        ("Opera", getattr(browser_cookie3, "opera", None)),
+    )
+    for browser_name, loader in loaders:
+        if loader is None:
+            continue
+        before = len(jar)
+        for domain in domains:
+            try:
+                cookie_jar = loader(domain_name=domain)
+            except Exception:
+                continue
+            try:
+                for cookie in cookie_jar:
+                    jar.set_cookie(cookie)
+            except Exception:
+                continue
+        if len(jar) > before:
+            loaded.append(browser_name)
+
+    if loaded:
+        log(f"Yandex browser-cookie retry loaded {len(jar)} cookie(s) from: {', '.join(sorted(set(loaded)))}.")
+        return jar
+    log("Yandex browser-cookie retry found no usable Yandex cookies in local browsers.")
+    return None
+
+
+def _yandex_headers_for(search_url: str) -> dict:
+    parsed = urlparse(search_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://yandex.com"
+    return {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Referer": origin + "/images/",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+    }
+
+
+def _yandex_fetch_search_html(search_urls, log=lambda msg: None):
+    """Fetch a Yandex result page, retrying alternate hosts and optional browser cookies."""
+    blocked = []
+    cookie_modes = [(None, "plain session")]
+
+    for mode_idx, (cookies, label) in enumerate(cookie_modes):
+        for search_url in search_urls:
+            headers = _yandex_headers_for(search_url)
+            try:
+                resp = session.get(search_url, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
+                resp.raise_for_status()
+            except Exception as exc:
+                log(f"Yandex request failed via {label}: {search_url} ({exc})")
+                continue
+
+            if _yandex_is_challenge(resp.text, response=resp):
+                diag = _yandex_page_diagnostics(resp.text, response=resp)
+                blocked.append((search_url, getattr(resp, "url", "") or search_url, diag))
+                log(f"Yandex returned challenge/block page via {label}: {diag}")
+                continue
+
+            if mode_idx > 0:
+                log(f"Yandex request succeeded with {label}: {search_url}")
+            return resp, search_url
+
+        # Only attempt browser cookies after the plain session is blocked/empty.
+        if mode_idx == 0:
+            browser_cookies = _yandex_browser_cookies(log=log)
+            if browser_cookies:
+                cookie_modes.append((browser_cookies, "browser cookies"))
+
+    if blocked:
+        primary_search, captcha_url, diagnostics = blocked[-1]
+        raise YandexBlockedError(
+            "Yandex returned a CAPTCHA/block page instead of image results. "
+            "Open the Yandex request URL in your browser, solve the challenge if shown, then retry. "
+            "If requests are still blocked, save the browser result page as HTML and import it with the Yandex HTML button.",
+            search_url=primary_search,
+            captcha_url=captcha_url,
+            diagnostics=diagnostics,
+        )
+    raise RuntimeError("Yandex request failed for every candidate URL.")
 
 
 def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
@@ -1381,27 +1572,63 @@ def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
 
 
 def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
-    search_url = yandex_search_url(root_url)
     query_url = yandex_query_source_url(root_url)
     mode = yandex_query_mode(root_url)
-    if mode == "text":
-        log(f"Yandex image text search: {query_url}")
-    elif mode == "reverse":
-        log(f"Yandex reverse image search: {query_url}")
+
+    response = None
+    search_url = yandex_search_url(root_url)
+    if mode == "html":
+        html_path = query_url
+        log(f"Yandex HTML import: {html_path}")
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
+                html = f.read()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read Yandex HTML file: {exc}")
+        # Use Yandex as the parser base URL so relative / protocol-relative assets
+        # in browser-saved HTML resolve the same way as a live Yandex page.
+        search_url = "https://yandex.com/images/search?imported_html=1"
     else:
-        log(f"Yandex Images search URL: {search_url}")
-    log(f"Yandex request URL: {search_url}")
-    headers = {
-        "Referer": "https://yandex.com/images/",
-        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    resp = session.get(search_url, headers=headers, timeout=25)
-    resp.raise_for_status()
-    results = yandex_extract_results(resp.text, search_url, log=log)
+        search_urls = yandex_search_urls(root_url)
+        if mode == "text":
+            log(f"Yandex image text search: {query_url}")
+        elif mode == "reverse":
+            log(f"Yandex reverse image search: {query_url}")
+        else:
+            log(f"Yandex Images search URL: {search_url}")
+        for idx, candidate in enumerate(search_urls, 1):
+            suffix = "" if idx == 1 else " (fallback)"
+            log(f"Yandex request URL{suffix}: {candidate}")
+        response, search_url = _yandex_fetch_search_html(search_urls, log=log)
+        html = response.text
+
+    if _yandex_is_challenge(html, response=response):
+        diagnostics = _yandex_page_diagnostics(html, response=response)
+        raise YandexBlockedError(
+            "Yandex returned a CAPTCHA/block page instead of image results.",
+            search_url=search_url,
+            captcha_url=getattr(response, "url", "") if response is not None else search_url,
+            diagnostics=diagnostics,
+        )
+    if mode == "html" and not _yandex_has_serp_markers(html):
+        diagnostics = _yandex_page_diagnostics(html, response=response)
+        raise RuntimeError(
+            "Imported Yandex HTML does not look like a saved Yandex Images result page. "
+            "Open a Yandex Images result page in your browser, save that page as HTML, "
+            "then import the saved file. Diagnostics: " + diagnostics
+        )
+
+    results = yandex_extract_results(html, search_url, log=log)
     if not results:
-        log("Yandex empty-result diagnostics: " + _yandex_page_diagnostics(resp.text, response=resp))
+        diag = _yandex_page_diagnostics(html, response=response)
+        log("Yandex empty-result diagnostics: " + diag)
+        # Do not silently treat a no-result parser path as success when the page
+        # clearly was not a usable image SERP. This is how CAPTCHA pages used to
+        # become a fake successful discovery with zero albums.
+        if mode != "html" and (response is not None) and not _yandex_has_serp_markers(html):
+            raise RuntimeError(
+                "Yandex returned no parseable image results. Diagnostics: " + diag
+            )
 
     query_label = os.path.basename(urlparse(query_url).path) or query_url
     query_label = sanitize_folder_name(unquote(query_label))[:80] or "query"
@@ -2954,6 +3181,7 @@ class GalleryRipperApp(tb.Window):
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
         ttk.Button(urlf, text="Yandex Search", command=self.discover_yandex_from_url).pack(side="left", padx=(5, 0))
+        ttk.Button(urlf, text="Yandex HTML", command=self.import_yandex_html).pack(side="left", padx=(5, 0))
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
 
         pathf = ttk.Frame(control_frame)
@@ -3090,6 +3318,16 @@ class GalleryRipperApp(tb.Window):
             return
         if not is_yandex_query_url(url):
             self.url_var.set(YANDEX_QUERY_PREFIX + url)
+        self.discover_albums()
+
+    def import_yandex_html(self):
+        path = filedialog.askopenfilename(
+            title="Import saved Yandex Images HTML",
+            filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.url_var.set(YANDEX_HTML_PREFIX + path)
         self.discover_albums()
 
     def show_history(self):
@@ -3588,8 +3826,29 @@ class GalleryRipperApp(tb.Window):
                 self.yandex_results = tree_data.get("yandex_results", [])
                 self.after(0, lambda results=self.yandex_results: self.show_yandex_preview(results))
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
+        except YandexBlockedError as e:
+            self.after(0, lambda err=e: self.handle_yandex_blocked(err))
         except Exception as e:
             self.after(0, lambda: self.log(f"Discovery failed: {e}"))
+
+    def handle_yandex_blocked(self, err):
+        details = f"Discovery failed: {err}"
+        if err.diagnostics:
+            details += f"\nDiagnostics: {err.diagnostics}"
+        if err.search_url:
+            details += f"\nRequest URL: {err.search_url}"
+        if err.captcha_url and err.captcha_url != err.search_url:
+            details += f"\nChallenge URL: {err.captcha_url}"
+        details += "\n\nUse the Yandex HTML button after saving a solved browser result page if direct requests remain blocked."
+        self.log(details)
+        if err.search_url and messagebox.askyesno(
+            "Yandex blocked automated request",
+            "Yandex returned a CAPTCHA/block page instead of image results.\n\n"
+            "Open the request URL in your browser now?\n\n"
+            "After solving it, retry the search. If direct requests still fail, "
+            "save the browser result page as HTML and import it with the Yandex HTML button.",
+        ):
+            webbrowser.open(err.search_url)
 
     def insert_tree_node(self, parent, node, path=None):
         path = path or []
