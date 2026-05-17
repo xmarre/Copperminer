@@ -14,6 +14,12 @@ from tkinter.scrolledtext import ScrolledText
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import re
+
+try:
+    from PIL import Image, ImageTk
+except Exception:  # Pillow is optional at import time; thumbnails degrade to text.
+    Image = None
+    ImageTk = None
 import json
 import time
 import random
@@ -22,6 +28,8 @@ import subprocess
 import sys
 import glob
 import queue
+import base64
+import io
 from collections import deque
 
 SETTINGS_FILE = "settings.json"
@@ -307,8 +315,10 @@ def select_universal_rules(url: str):
 
 
 def select_adapter_for_url(url: str) -> str:
-    """Return the adapter key for *url* ("universal", "coppermine", or "4chan")."""
+    """Return the adapter key for *url* ("universal", "coppermine", "4chan", or "yandex")."""
     url = url.strip()
+    if is_yandex_query_url(url):
+        return "yandex"
     if url.lower().startswith("4chan"):
         return "4chan"
     domain = urlparse(url).netloc.lower()
@@ -826,6 +836,458 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
     return node
 
 
+# --- Yandex Images reverse-search adapter ------------------------------------
+
+YANDEX_RESULT_PREFIX = "yandex-result:"
+YANDEX_QUERY_PREFIX = "yandex:"
+YANDEX_RESULT_LIMIT = 300
+GENERIC_DOWNLOAD_BASENAMES = {
+    "orig", "original", "image", "img", "file", "download", "download.php", "proxy",
+}
+
+
+def is_yandex_images_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    return ("yandex." in host or host.endswith("ya.ru")) and "/images" in parsed.path.lower()
+
+
+def is_yandex_query_url(url: str) -> bool:
+    low = (url or "").strip().lower()
+    return low.startswith(YANDEX_QUERY_PREFIX) or is_yandex_images_url(url)
+
+
+def yandex_query_source_url(url: str) -> str:
+    """Return the image URL/query behind a yandex: or Yandex Images URL."""
+    raw = (url or "").strip()
+    if raw.lower().startswith(YANDEX_QUERY_PREFIX):
+        return raw.split(":", 1)[1].strip()
+    if is_yandex_images_url(raw):
+        parsed = urlparse(raw)
+        qs = parse_qs(parsed.query)
+        for key in ("url", "img_url", "cbir_image_url"):
+            vals = qs.get(key)
+            if vals and vals[0]:
+                return vals[0]
+    return raw
+
+
+def yandex_reverse_search_url(url: str) -> str:
+    """Build a Yandex reverse-image search URL from an image URL or pass through an existing search URL."""
+    raw = (url or "").strip()
+    if is_yandex_images_url(raw):
+        return raw
+    query_url = yandex_query_source_url(raw)
+    params = {
+        "rpt": "imageview",
+        "url": query_url,
+        "img_url": query_url,
+        "text": query_url,
+    }
+    return "https://yandex.com/images/search?" + urlencode(params)
+
+
+def yandex_encode_result(result: dict) -> str:
+    payload = dict(result)
+    payload.pop("album_url", None)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return YANDEX_RESULT_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def yandex_decode_result(album_url: str) -> dict:
+    if not album_url.startswith(YANDEX_RESULT_PREFIX):
+        raise ValueError("not a Yandex result album URL")
+    raw = album_url[len(YANDEX_RESULT_PREFIX):].encode("ascii")
+    return json.loads(base64.urlsafe_b64decode(raw).decode("utf-8"))
+
+
+def _first_present(mapping: dict, keys):
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, "", []):
+            return mapping[key]
+    return None
+
+
+def _to_int(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        m = re.search(r"\d+", value.replace(" ", ""))
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def _format_bytes(num):
+    n = _to_int(num)
+    if not n or n <= 0:
+        return "?"
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.2f} MB"
+    return f"{n / 1024:.1f} KB"
+
+
+def _is_http_url(value) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def _url_looks_media_like(url: str) -> bool:
+    if not _is_http_url(url):
+        return False
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    ext = os.path.splitext(path)[1]
+    if ext in IMAGE_EXTS or ext in MEDIA_EXTS or ext in {".tif", ".tiff"}:
+        return True
+    host = parsed.netloc.lower()
+    # Yandex stores many original image blobs under extension-less /orig endpoints.
+    if "avatars.mds.yandex.net" in host or "yandex.net" in host:
+        return True
+    return False
+
+
+def _json_walk(node):
+    yield node
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _json_walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _json_walk(value)
+
+
+def _collect_urls(value):
+    urls = []
+    if isinstance(value, str):
+        if _is_http_url(value):
+            urls.append(value)
+    elif isinstance(value, dict):
+        for key in (
+            "url", "href", "src", "img_href", "img_url", "imgUrl", "origUrl",
+            "originUrl", "original", "thumb", "thumbnail", "preview", "previewUrl",
+        ):
+            found = value.get(key)
+            if isinstance(found, str) and _is_http_url(found):
+                urls.append(found)
+        for nested in value.values():
+            if isinstance(nested, (list, tuple)):
+                urls.extend(_collect_urls(nested))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            urls.extend(_collect_urls(item))
+    return urls
+
+
+def _dedupe_keep_order(values):
+    seen = set()
+    out = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _parse_dimensions_from_any(value):
+    if not isinstance(value, str):
+        return None, None
+    m = re.search(r"(\d{2,5})\s*[×xX]\s*(\d{2,5})", value)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _extract_yandex_result_from_payload(payload: dict, tag=None, search_url: str = ""):
+    """Convert one Yandex data-bem/data-state payload into a result dict."""
+    if not isinstance(payload, dict):
+        return None
+
+    # Many tags carry {"serp-item": {...}} rather than the item itself.
+    if isinstance(payload.get("serp-item"), dict):
+        payload = payload["serp-item"]
+    elif isinstance(payload.get("images-touch-serp-item"), dict):
+        payload = payload["images-touch-serp-item"]
+
+    direct_keys = (
+        "origUrl", "originUrl", "original", "img_href", "img_url", "imgUrl",
+        "imageUrl", "image_url", "dupsUrl", "preview", "thumb", "thumbnail",
+    )
+    if not any(k in payload for k in direct_keys) and tag is None:
+        return None
+
+    title = _first_present(payload, ("title", "text", "alt", "snippet", "snippetTitle", "rawText"))
+    domain = _first_present(payload, ("domain", "site", "host", "serverName"))
+    source_page = _first_present(payload, ("url", "pageUrl", "hostPageUrl", "link", "serpUrl"))
+
+    width = _to_int(_first_present(payload, ("width", "w", "origWidth", "rawWidth", "imageWidth")))
+    height = _to_int(_first_present(payload, ("height", "h", "origHeight", "rawHeight", "imageHeight")))
+    size_bytes = _to_int(_first_present(payload, ("fileSizeInBytes", "fileSize", "sizeBytes", "bytes")))
+
+    candidates = []
+    preview_candidates = []
+    for key in (
+        "origUrl", "originUrl", "original", "img_href", "img_url", "imgUrl", "imageUrl", "image_url",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and _is_http_url(value):
+            candidates.append(value)
+
+    for key in ("preview", "dups", "dupsList", "sizes", "otherSizes", "thumb", "thumbnail", "previewUrl", "img_src", "src"):
+        value = payload.get(key)
+        urls = _collect_urls(value)
+        if key in ("thumb", "thumbnail", "previewUrl", "img_src", "src"):
+            preview_candidates.extend(urls)
+        else:
+            candidates.extend(urls)
+
+    # Parse nested dicts for dimensions and extra media candidates, but avoid using
+    # arbitrary source pages as first-choice image URLs unless they look media-like.
+    for node in _json_walk(payload):
+        if not isinstance(node, dict):
+            continue
+        if width is None:
+            width = _to_int(_first_present(node, ("width", "w", "origWidth", "rawWidth", "imageWidth")))
+        if height is None:
+            height = _to_int(_first_present(node, ("height", "h", "origHeight", "rawHeight", "imageHeight")))
+        if size_bytes is None:
+            size_bytes = _to_int(_first_present(node, ("fileSizeInBytes", "fileSize", "sizeBytes", "bytes")))
+        for key in ("origUrl", "originUrl", "img_href", "img_url", "imgUrl", "imageUrl", "image_url"):
+            value = node.get(key)
+            if isinstance(value, str) and _is_http_url(value):
+                candidates.append(value)
+        for key in ("thumb", "thumbnail", "previewUrl", "img_src", "src"):
+            value = node.get(key)
+            if isinstance(value, str) and _is_http_url(value):
+                preview_candidates.append(value)
+
+    if tag is not None:
+        for attr in ("href", "src"):
+            value = tag.get(attr)
+            if value:
+                resolved = urljoin(search_url, value)
+                if _url_looks_media_like(resolved):
+                    candidates.append(resolved)
+                elif source_page is None and _is_http_url(resolved):
+                    source_page = resolved
+        img = tag.find("img")
+        if img:
+            for attr in ("src", "data-src", "data-lazy-src"):
+                value = img.get(attr)
+                if value:
+                    preview_candidates.append(urljoin(search_url, value))
+            if not title:
+                title = img.get("alt")
+        text = tag.get_text(" ", strip=True)
+        if not width or not height:
+            w2, h2 = _parse_dimensions_from_any(text)
+            width = width or w2
+            height = height or h2
+
+    # If source_page itself is an image endpoint, include it as a candidate; otherwise keep it only for opening/referrer.
+    if isinstance(source_page, str):
+        source_page = urljoin(search_url, source_page)
+        if _url_looks_media_like(source_page):
+            candidates.append(source_page)
+
+    candidates = _dedupe_keep_order([u for u in candidates if _is_http_url(u)])
+    preview_candidates = _dedupe_keep_order([u for u in preview_candidates if _is_http_url(u)])
+    candidates_media_first = [u for u in candidates if _url_looks_media_like(u)]
+    candidates_other = [u for u in candidates if u not in candidates_media_first]
+    candidates = candidates_media_first + candidates_other
+
+    thumbnail_url = preview_candidates[0] if preview_candidates else (candidates[0] if candidates else None)
+    if not candidates and thumbnail_url:
+        candidates = [thumbnail_url]
+
+    if not candidates and not thumbnail_url:
+        return None
+
+    if isinstance(title, (dict, list)):
+        title = None
+    title = str(title).strip() if title else "Yandex image result"
+    if isinstance(domain, (dict, list)):
+        domain = None
+    domain = str(domain).strip() if domain else (urlparse(source_page).netloc if source_page else "")
+
+    return {
+        "title": title,
+        "domain": domain,
+        "source_page_url": source_page if _is_http_url(source_page) else None,
+        "image_url": candidates[0] if candidates else thumbnail_url,
+        "thumbnail_url": thumbnail_url,
+        "candidate_urls": _dedupe_keep_order(candidates + preview_candidates),
+        "width": width,
+        "height": height,
+        "pixels": (width or 0) * (height or 0),
+        "size_bytes": size_bytes,
+        "search_url": search_url,
+    }
+
+
+def _yandex_result_key(result: dict):
+    primary = result.get("image_url") or result.get("thumbnail_url") or ""
+    if primary:
+        return primary.split("?", 1)[0]
+    return result.get("source_page_url") or result.get("title") or ""
+
+
+def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    seen = set()
+
+    def add_result(result):
+        if not result:
+            return
+        key = _yandex_result_key(result)
+        related_keys = [key]
+        related_keys.extend((result.get("candidate_urls") or []))
+        if result.get("thumbnail_url"):
+            related_keys.append(result["thumbnail_url"])
+        norm_related = [k.split("?", 1)[0] for k in related_keys if k]
+        if not key or any(k in seen for k in norm_related):
+            return
+        seen.update(norm_related)
+        result["result_order"] = len(results) + 1
+        result["index"] = result["result_order"]
+        results.append(result)
+
+    # Primary desktop Yandex path: result cards with embedded data-bem JSON.
+    for tag in soup.find_all(attrs={"data-bem": True}):
+        raw = tag.get("data-bem") or ""
+        if not any(marker in raw for marker in ("serp-item", "img_href", "origUrl", "preview")):
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and ("serp-item" in payload or "images-touch-serp-item" in payload):
+            add_result(_extract_yandex_result_from_payload(payload, tag=tag, search_url=search_url))
+            continue
+        for node in _json_walk(payload):
+            if isinstance(node, dict):
+                add_result(_extract_yandex_result_from_payload(node, tag=tag, search_url=search_url))
+                if len(results) >= YANDEX_RESULT_LIMIT:
+                    break
+        if len(results) >= YANDEX_RESULT_LIMIT:
+            break
+
+    # Secondary path: other inline state holders used by some Yandex layouts.
+    if len(results) < 5:
+        for attr in ("data-state", "data-props", "data-initial-state"):
+            for tag in soup.find_all(attrs={attr: True}):
+                raw = tag.get(attr) or ""
+                if not any(marker in raw for marker in ("serp-item", "img_href", "origUrl", "preview", "thumbnail")):
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                for node in _json_walk(payload):
+                    if isinstance(node, dict):
+                        add_result(_extract_yandex_result_from_payload(node, tag=tag, search_url=search_url))
+                        if len(results) >= YANDEX_RESULT_LIMIT:
+                            break
+                if len(results) >= YANDEX_RESULT_LIMIT:
+                    break
+
+    # Last-resort HTML fallback for cards where only an anchor/img pair is available.
+    if len(results) < 5:
+        for tag in soup.select(".serp-item, a[href]"):
+            add_result(_extract_yandex_result_from_payload({}, tag=tag, search_url=search_url))
+            if len(results) >= YANDEX_RESULT_LIMIT:
+                break
+
+    # Prefer larger-known-resolution results while preserving all extracted entries.
+    results.sort(key=lambda r: (r.get("pixels") or 0, r.get("size_bytes") or 0), reverse=True)
+    for idx, result in enumerate(results, 1):
+        result["index"] = idx
+    log(f"Yandex parser extracted {len(results)} image result(s).")
+    return results[:YANDEX_RESULT_LIMIT]
+
+
+def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
+    search_url = yandex_reverse_search_url(root_url)
+    query_url = yandex_query_source_url(root_url)
+    log(f"Yandex reverse image search: {query_url}")
+    headers = {
+        "Referer": "https://yandex.com/images/",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    }
+    resp = session.get(search_url, headers=headers, timeout=25)
+    resp.raise_for_status()
+    results = yandex_extract_results(resp.text, search_url, log=log)
+
+    query_label = os.path.basename(urlparse(query_url).path) or query_url
+    query_label = sanitize_folder_name(unquote(query_label))[:80] or "query"
+    root = {
+        "type": "category",
+        "name": f"Yandex Images - {query_label}",
+        "url": root_url,
+        "children": [],
+        "specials": [],
+        "albums": [],
+        "adapter": "yandex",
+        "yandex_results": [],
+    }
+
+    for idx, result in enumerate(results, 1):
+        result = dict(result)
+        result["index"] = idx
+        result["search_url"] = search_url
+        width, height = result.get("width"), result.get("height")
+        dim = f"{width}x{height}" if width and height else "unknown"
+        domain = result.get("domain") or urlparse(result.get("source_page_url") or result.get("image_url") or "").netloc
+        domain_safe = sanitize_folder_name(domain or "source")[:60] or "source"
+        title = result.get("title") or "Yandex image result"
+        album_name = f"{idx:03d} - {dim} - {domain or 'unknown'}"
+        if title and title != "Yandex image result":
+            album_name += f" - {title[:90]}"
+        album_url = yandex_encode_result(result)
+        result["album_url"] = album_url
+        root["yandex_results"].append(result)
+        root["albums"].append({
+            "type": "album",
+            "name": album_name,
+            "url": album_url,
+            "image_count": 1,
+            "path": ["Yandex", query_label, f"{idx:03d}_{dim}_{domain_safe}"],
+            "adapter": "yandex",
+            "preview_url": result.get("thumbnail_url"),
+            "width": width,
+            "height": height,
+            "size_bytes": result.get("size_bytes"),
+        })
+    return root
+
+
+def yandex_result_image_entries(album_url, log=lambda msg: None):
+    result = yandex_decode_result(album_url)
+    candidates = _dedupe_keep_order(result.get("candidate_urls") or [])
+    if result.get("image_url"):
+        candidates = _dedupe_keep_order([result["image_url"]] + candidates)
+    if result.get("thumbnail_url"):
+        candidates = _dedupe_keep_order(candidates + [result["thumbnail_url"]])
+    referer = result.get("source_page_url") or result.get("search_url") or "https://yandex.com/images/"
+    encoded = [f"{u}#__ref__={quote(referer or '', safe='')}" for u in candidates if _is_http_url(u)]
+    width, height = result.get("width"), result.get("height")
+    dim = f"{width}x{height}" if width and height else "unknown"
+    domain = sanitize_folder_name(result.get("domain") or urlparse(referer).netloc or "source")[:60]
+    name = f"yandex_{int(result.get('index') or 0):03d}_{dim}_{domain}"
+    return [(name, encoded, referer, name)]
+
+
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
@@ -1202,7 +1664,7 @@ def site_cache_path(root_url):
 
 def load_page_cache(root_url):
     """Return the per-page cache and previously saved tree for *root_url*."""
-    if select_adapter_for_url(root_url) == "4chan":
+    if select_adapter_for_url(root_url) in {"4chan", "yandex"}:
         return {}, None
     path = site_cache_path(root_url)
     if os.path.exists(path):
@@ -1215,7 +1677,7 @@ def load_page_cache(root_url):
 
 
 def save_page_cache(root_url, tree, pages):
-    if select_adapter_for_url(root_url) == "4chan":
+    if select_adapter_for_url(root_url) in {"4chan", "yandex"}:
         return
     path = site_cache_path(root_url)
     gallery_title = tree.get("name") if tree else root_url
@@ -1288,6 +1750,12 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
         )
+    elif site_type == "yandex":
+        tree = yandex_discover_tree(
+            root_url,
+            log=log,
+            quick_scan=quick_scan,
+        )
     elif site_type == "4chan":
         tree = fourchan_discover_tree(
             root_url,
@@ -1302,7 +1770,7 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
         )
-    if site_type != "4chan":
+    if site_type not in {"4chan", "yandex"}:
         save_page_cache(root_url, tree, pages)
     return tree
 
@@ -1834,7 +2302,8 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     return filtered_entries
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
-                             album_stats=None, max_attempts=3, referer=None):
+                             album_stats=None, max_attempts=3, referer=None,
+                             filename_hint=None):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -1875,7 +2344,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 
     _paired = [_url_and_ref(u, referer) for u in candidate_urls]
 
-    def _filename_from_headers(default_name: str, headers: dict, content_type: str) -> str:
+    def _filename_from_headers(default_name: str, headers: dict, content_type: str, filename_hint: str = None) -> str:
         """Best-effort filename inference for endpoints like download.php."""
         name = os.path.basename(default_name) or "file"
         cd = headers.get("Content-Disposition", "") or headers.get("content-disposition", "")
@@ -1894,7 +2363,12 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 
         name = os.path.basename(name)  # strip any path
         ext = os.path.splitext(name)[1].lower()
+        stem = os.path.splitext(name)[0]
+        generic_name = (name.lower() in GENERIC_DOWNLOAD_BASENAMES or stem.lower() in GENERIC_DOWNLOAD_BASENAMES)
         if ext in IMAGE_EXTS or ext in MEDIA_EXTS:
+            if filename_hint and generic_name:
+                hinted_stem = sanitize_name(filename_hint)[:160] or stem or "file"
+                return hinted_stem + ext
             return name
 
         # Map content-type -> extension when the URL doesn't carry one.
@@ -1913,7 +2387,8 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         if not suffix:
             return name
 
-        stem = os.path.splitext(name)[0] or "file"
+        stem = sanitize_name(filename_hint)[:160] if filename_hint else (os.path.splitext(name)[0] or "file")
+        stem = stem or "file"
         return stem + suffix
 
     for block_attempt in range(1, max_attempts + 1):
@@ -1950,7 +2425,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     raise Exception(
                         f"URL does not return media: {candidate} (Content-Type: {ctype})"
                     )
-                fname = _filename_from_headers(url_name, r.headers, ctype)
+                fname = _filename_from_headers(url_name, r.headers, ctype, filename_hint=filename_hint)
                 fpath = os.path.join(output_dir, fname)
                 if os.path.exists(fpath):
                     log(f"Already downloaded: {fname}")
@@ -2085,6 +2560,7 @@ def threaded_download_worker(download_queue, log, stop_flag):
             outdir,
             candidate_urls,
             referer,
+            filename_hint,
             total_images,
             mimic_human,
             stats,
@@ -2108,6 +2584,7 @@ def threaded_download_worker(download_queue, log, stop_flag):
             total=total_images,
             album_stats=stats,
             referer=referer,
+            filename_hint=filename_hint,
         )
 
         if was_downloaded and mimic_human:
@@ -2207,6 +2684,8 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             image_entries = universal_get_all_candidate_images_from_album(
                 album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
             )
+        elif site_type == "yandex":
+            image_entries = yandex_result_image_entries(album_url, log=log)
         else:
             image_entries = get_all_candidate_images_from_album(
                 album_url, log=log, page_cache=pages, quick_scan=quick_scan
@@ -2214,8 +2693,13 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
             continue
-        for entry_name, candidates, referer in image_entries:
-            download_queue.append((album_name, album_path, candidates, referer))
+        for entry in image_entries:
+            if len(entry) == 4:
+                entry_name, candidates, referer, filename_hint = entry
+            else:
+                entry_name, candidates, referer = entry
+                filename_hint = None
+            download_queue.append((album_name, album_path, candidates, referer, filename_hint))
 
     total_images = len(download_queue)
     if total_images == 0:
@@ -2233,12 +2717,12 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
     log(f"Total images in queue: {total_images}")
 
     q = queue.Queue()
-    for idx, (album_name, album_path, candidate_urls, referer) in enumerate(download_queue, 1):
+    for idx, (album_name, album_path, candidate_urls, referer, filename_hint) in enumerate(download_queue, 1):
         outdir = os.path.join(
             output_root,
             *[sanitize_name(p) for p in album_path],
         )
-        q.put((idx, album_name, outdir, candidate_urls, referer, total_images, mimic_human, stats))
+        q.put((idx, album_name, outdir, candidate_urls, referer, filename_hint, total_images, mimic_human, stats))
 
     threads = []
     for _ in range(DOWNLOAD_WORKERS):
@@ -2295,6 +2779,7 @@ class GalleryRipperApp(tb.Window):
         url_entry = ttk.Entry(urlf, textvariable=self.url_var, width=60)
         url_entry.pack(side="left", padx=5, expand=True, fill="x")
         ttk.Button(urlf, text="Discover Galleries", command=self.discover_albums).pack(side="left")
+        ttk.Button(urlf, text="Yandex Search", command=self.discover_yandex_from_url).pack(side="left", padx=(5, 0))
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
 
         pathf = ttk.Frame(control_frame)
@@ -2398,6 +2883,9 @@ class GalleryRipperApp(tb.Window):
         self.selected_album_urls = set()
         self.item_to_album = {}
         self.item_to_category = {}
+        self.album_url_to_item = {}
+        self.yandex_results = []
+        self.yandex_preview_window = None
         self._prev_selection = set()
 
         logframe = ttk.LabelFrame(paned, text="Log")
@@ -2420,6 +2908,15 @@ class GalleryRipperApp(tb.Window):
             settings = load_settings()
             settings["download_folder"] = folder
             save_settings(settings)
+
+    def discover_yandex_from_url(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing image URL", "Paste an image URL or a Yandex Images search URL first.")
+            return
+        if not is_yandex_query_url(url):
+            self.url_var.set(YANDEX_QUERY_PREFIX + url)
+        self.discover_albums()
 
     def show_history(self):
         history = list_cached_galleries()
@@ -2479,6 +2976,7 @@ class GalleryRipperApp(tb.Window):
                 self.albums_tree_data = None
                 self.selected_album_urls.clear()
                 self.item_to_album.clear()
+                self.album_url_to_item.clear()
                 self._prev_selection.clear()
                 self.log(f"Gallery cache for '{title}' deleted and main tree cleared.")
             elif deleted:
@@ -2533,6 +3031,7 @@ class GalleryRipperApp(tb.Window):
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self.item_to_category.clear()
+        self.album_url_to_item.clear()
         self._prev_selection.clear()
         for alb in albums:
             img_count = alb.get("image_count", "?")
@@ -2559,6 +3058,7 @@ class GalleryRipperApp(tb.Window):
             )
             self.tree.set(alb_id, "sel", "\u25A1")
             self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
+            self.album_url_to_item[alb['url']] = alb_id
 
     def on_search(self, *args):
         """Filter albums in the tree based on search."""
@@ -2607,6 +3107,7 @@ class GalleryRipperApp(tb.Window):
         self.selected_album_urls.clear()
         self.item_to_album.clear()
         self.item_to_category.clear()
+        self.album_url_to_item.clear()
         self._prev_selection.clear()
         if "albums" in tree_data and not tree_data.get("children") and not tree_data.get("specials"):
             self._all_albums = tree_data["albums"]
@@ -2617,6 +3118,277 @@ class GalleryRipperApp(tb.Window):
         self._all_albums = None
         self.insert_tree_node("", tree_data, [])
         self.search_all_btn.pack(side="left", padx=5)
+
+    def _select_album_by_url(self, album_url, selected=True):
+        item = self.album_url_to_item.get(album_url)
+        if not item:
+            return False
+        if selected:
+            self.selected_album_urls.add(item)
+            self.tree.selection_add(item)
+            self.tree.set(item, "sel", "\u2611")
+        else:
+            self.selected_album_urls.discard(item)
+            self.tree.selection_remove(item)
+            self.tree.set(item, "sel", "\u25A1")
+        self._prev_selection = set(self.tree.selection())
+        return True
+
+    def _is_album_url_selected(self, album_url):
+        item = self.album_url_to_item.get(album_url)
+        return item in self.selected_album_urls if item else False
+
+    def show_yandex_preview(self, results):
+        """Open/update a sortable thumbnail overview for Yandex image results."""
+        if not results:
+            messagebox.showinfo("Yandex Images", "No Yandex image results were found.")
+            return
+        if self.yandex_preview_window and self.yandex_preview_window.winfo_exists():
+            self.yandex_preview_window.destroy()
+
+        win = tk.Toplevel(self)
+        self.yandex_preview_window = win
+        win.title("Yandex image results")
+        win.geometry("1120x760")
+        win.minsize(820, 520)
+
+        header = ttk.Frame(win)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Label(header, text=f"Yandex results: {len(results)}").pack(side="left")
+
+        sort_var = tk.StringVar(value="resolution")
+        desc_var = tk.BooleanVar(value=True)
+        limit_var = tk.IntVar(value=min(120, len(results)))
+
+        ttk.Label(header, text="Sort:").pack(side="left", padx=(18, 4))
+        sort_box = ttk.Combobox(
+            header,
+            textvariable=sort_var,
+            state="readonly",
+            width=16,
+            values=("resolution", "width", "height", "file size", "domain", "title", "result order"),
+        )
+        sort_box.pack(side="left")
+        ttk.Checkbutton(header, text="Descending", variable=desc_var).pack(side="left", padx=(8, 0))
+        ttk.Label(header, text="Cards:").pack(side="left", padx=(18, 4))
+        ttk.Spinbox(header, from_=20, to=max(20, len(results)), increment=20, textvariable=limit_var, width=6).pack(side="left")
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        canvas = tk.Canvas(body, background="#181818", highlightthickness=0)
+        ysb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=ysb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="right", fill="y")
+        grid = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+
+        def _on_frame_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event=None):
+            if event:
+                canvas.itemconfigure(canvas_window, width=event.width)
+
+        grid.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        footer = ttk.Frame(win)
+        footer.pack(fill="x", padx=10, pady=(0, 10))
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(footer, textvariable=status_var).pack(side="left", fill="x", expand=True)
+
+        def _sort_key(result):
+            mode = sort_var.get()
+            if mode == "resolution":
+                return result.get("pixels") or 0
+            if mode == "width":
+                return result.get("width") or 0
+            if mode == "height":
+                return result.get("height") or 0
+            if mode == "file size":
+                return result.get("size_bytes") or 0
+            if mode == "domain":
+                return (result.get("domain") or "").lower()
+            if mode == "title":
+                return (result.get("title") or "").lower()
+            return result.get("result_order") or result.get("index") or 0
+
+        def _best_image_url(result):
+            urls = result.get("candidate_urls") or []
+            return result.get("image_url") or (urls[0] if urls else result.get("thumbnail_url"))
+
+        def _selected_visible(card_results, selected=True):
+            changed = 0
+            for result in card_results:
+                if self._select_album_by_url(result.get("album_url"), selected=selected):
+                    changed += 1
+            status_var.set(f"{'Selected' if selected else 'Cleared'} {changed} visible result(s).")
+
+        def _probe_sizes(card_results):
+            probe_btn.configure(state="disabled")
+            status_var.set("Probing missing file sizes with HEAD requests...")
+
+            def worker():
+                changed = 0
+                for result in card_results:
+                    if result.get("size_bytes"):
+                        continue
+                    url = _best_image_url(result)
+                    if not url:
+                        continue
+                    try:
+                        r = session.head(url, allow_redirects=True, timeout=10)
+                        size = _to_int(r.headers.get("Content-Length") or r.headers.get("content-length"))
+                        if size:
+                            result["size_bytes"] = size
+                            changed += 1
+                    except Exception:
+                        continue
+                self.after(0, lambda: (status_var.set(f"Probed sizes for {changed} result(s)."), probe_btn.configure(state="normal"), render()))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def render(event=None):
+            for child in grid.winfo_children():
+                child.destroy()
+            ordered = list(results)
+            reverse = desc_var.get()
+            ordered.sort(key=_sort_key, reverse=reverse)
+            try:
+                limit = max(1, min(int(limit_var.get()), len(ordered)))
+            except Exception:
+                limit = min(120, len(ordered))
+            card_results = ordered[:limit]
+            status_var.set(f"Showing {len(card_results)} of {len(results)} result(s).")
+
+            # Approximate responsive card count. Re-rendering on every resize is noisy, so keep this stable.
+            columns = 4
+            for idx, result in enumerate(card_results):
+                row, col = divmod(idx, columns)
+                card = ttk.Frame(grid, padding=6, relief="ridge")
+                card.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
+                grid.columnconfigure(col, weight=1)
+
+                thumb = tk.Label(card, text="thumbnail", width=22, height=9, background="#222222", foreground="#DDDDDD")
+                thumb.pack(fill="x")
+                thumb_url = result.get("thumbnail_url") or _best_image_url(result)
+                if thumb_url:
+                    self._load_preview_thumbnail(thumb, thumb_url)
+
+                dim = "?"
+                if result.get("width") and result.get("height"):
+                    dim = f"{result['width']}×{result['height']}"
+                domain = result.get("domain") or urlparse(result.get("source_page_url") or "").netloc or "unknown"
+                size = _format_bytes(result.get("size_bytes"))
+                title = (result.get("title") or "").strip() or "Yandex image result"
+                title = title[:92] + ("..." if len(title) > 92 else "")
+                ttk.Label(card, text=f"#{result.get('index', '?')}  {dim}  {size}", anchor="w").pack(fill="x", pady=(6, 0))
+                ttk.Label(card, text=domain[:80], anchor="w").pack(fill="x")
+                ttk.Label(card, text=title, anchor="w", wraplength=230).pack(fill="x", pady=(0, 4))
+
+                selected_var = tk.BooleanVar(value=self._is_album_url_selected(result.get("album_url")))
+                ttk.Checkbutton(
+                    card,
+                    text="Select for download",
+                    variable=selected_var,
+                    command=lambda r=result, v=selected_var: self._select_album_by_url(r.get("album_url"), v.get()),
+                ).pack(fill="x")
+
+                buttons = ttk.Frame(card)
+                buttons.pack(fill="x", pady=(4, 0))
+                ttk.Button(
+                    buttons,
+                    text="Similar",
+                    width=8,
+                    command=lambda r=result: self._yandex_search_similar(r),
+                ).pack(side="left")
+                ttk.Button(
+                    buttons,
+                    text="Image",
+                    width=7,
+                    command=lambda r=result: webbrowser.open(_best_image_url(r) or ""),
+                ).pack(side="left", padx=(4, 0))
+                ttk.Button(
+                    buttons,
+                    text="Source",
+                    width=7,
+                    command=lambda r=result: webbrowser.open(r.get("source_page_url") or _best_image_url(r) or ""),
+                ).pack(side="left", padx=(4, 0))
+
+            win._visible_yandex_results = card_results
+
+        def _select_visible_cmd():
+            _selected_visible(getattr(win, "_visible_yandex_results", []), selected=True)
+            render()
+
+        def _clear_visible_cmd():
+            _selected_visible(getattr(win, "_visible_yandex_results", []), selected=False)
+            render()
+
+        ttk.Button(header, text="Refresh view", command=render).pack(side="left", padx=(10, 0))
+        ttk.Button(header, text="Select visible", command=_select_visible_cmd).pack(side="left", padx=(8, 0))
+        ttk.Button(header, text="Clear visible", command=_clear_visible_cmd).pack(side="left", padx=(8, 0))
+        probe_btn = ttk.Button(header, text="Probe sizes", command=lambda: _probe_sizes(getattr(win, "_visible_yandex_results", [])))
+        probe_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(footer, text="Download selected", command=self.start_download).pack(side="right")
+
+        sort_box.bind("<<ComboboxSelected>>", render)
+        desc_var.trace_add("write", lambda *_: render())
+        limit_var.trace_add("write", lambda *_: render())
+        render()
+
+    def _load_preview_thumbnail(self, label, url):
+        if Image is None or ImageTk is None:
+            label.configure(text="Pillow missing\n(no thumbnail)")
+            return
+
+        def worker():
+            try:
+                r = session.get(url, timeout=12)
+                r.raise_for_status()
+                img = Image.open(io.BytesIO(r.content))
+                img.thumbnail((220, 160))
+                img = img.convert("RGBA")
+            except Exception:
+                def apply_failed():
+                    try:
+                        if label.winfo_exists():
+                            label.configure(text="thumbnail failed")
+                    except Exception:
+                        pass
+                self.after(0, apply_failed)
+                return
+
+            def apply_image():
+                try:
+                    if not label.winfo_exists():
+                        return
+                    photo = ImageTk.PhotoImage(img)
+                    label.configure(image=photo, text="")
+                    label.image = photo
+                except Exception:
+                    try:
+                        if label.winfo_exists():
+                            label.configure(text="thumbnail failed")
+                    except Exception:
+                        pass
+
+            self.after(0, apply_image)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _yandex_search_similar(self, result):
+        query = result.get("image_url") or result.get("thumbnail_url")
+        if not query:
+            messagebox.showwarning("Yandex Images", "This result has no searchable image URL.")
+            return
+        if self.yandex_preview_window and self.yandex_preview_window.winfo_exists():
+            self.yandex_preview_window.destroy()
+        self.url_var.set(YANDEX_QUERY_PREFIX + query)
+        self.discover_albums()
+
 
     def discover_albums(self):
         url = self.url_var.get().strip()
@@ -2638,6 +3410,9 @@ class GalleryRipperApp(tb.Window):
             tree_data = discover_or_load_gallery_tree(url, self.thread_safe_log, quick_scan=quick, force_refresh=not quick)
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
+            if tree_data.get("adapter") == "yandex":
+                self.yandex_results = tree_data.get("yandex_results", [])
+                self.after(0, lambda results=self.yandex_results: self.show_yandex_preview(results))
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
         except Exception as e:
             self.after(0, lambda: self.log(f"Discovery failed: {e}"))
@@ -2684,6 +3459,7 @@ class GalleryRipperApp(tb.Window):
             )
             self.tree.set(alb_id, "sel", "\u25A1")
             self.item_to_album[alb_id] = (alb['name'], alb['url'], album_path)
+            self.album_url_to_item[alb['url']] = alb_id
 
         for child in node.get("children", []):
             self.insert_tree_node(node_id, child, node_path)
