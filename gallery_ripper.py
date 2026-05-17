@@ -1434,9 +1434,10 @@ def _yandex_headers_for(search_url: str) -> dict:
     }
 
 
-def _yandex_fetch_search_html(search_urls, log=lambda msg: None):
+def _yandex_fetch_search_html(search_urls, log=lambda msg: None, reuse_browser_cookies=False):
     """Fetch a Yandex result page, retrying alternate hosts and optional browser cookies."""
     blocked = []
+    non_serp = []
     cookie_modes = [(None, "plain session")]
 
     for mode_idx, (cookies, label) in enumerate(cookie_modes):
@@ -1454,16 +1455,23 @@ def _yandex_fetch_search_html(search_urls, log=lambda msg: None):
                 blocked.append((search_url, getattr(resp, "url", "") or search_url, diag))
                 log(f"Yandex returned challenge/block page via {label}: {diag}")
                 continue
+            if not _yandex_has_serp_markers(resp.text):
+                diag = _yandex_page_diagnostics(resp.text, response=resp)
+                non_serp.append((search_url, diag))
+                log(f"Yandex returned a non-SERP page via {label}: {diag}")
+                continue
 
             if mode_idx > 0:
                 log(f"Yandex request succeeded with {label}: {search_url}")
             return resp, search_url
 
         # Only attempt browser cookies after the plain session is blocked/empty.
-        if mode_idx == 0:
+        if mode_idx == 0 and reuse_browser_cookies:
             browser_cookies = _yandex_browser_cookies(log=log)
             if browser_cookies:
                 cookie_modes.append((browser_cookies, "browser cookies"))
+        elif mode_idx == 0:
+            log("Yandex browser-cookie retry skipped; browser cookie reuse is not enabled.")
 
     if blocked:
         primary_search, captcha_url, diagnostics = blocked[-1]
@@ -1475,6 +1483,9 @@ def _yandex_fetch_search_html(search_urls, log=lambda msg: None):
             captcha_url=captcha_url,
             diagnostics=diagnostics,
         )
+    if non_serp:
+        _, diagnostics = non_serp[-1]
+        raise RuntimeError("Yandex returned no usable image result page. Diagnostics: " + diagnostics)
     raise RuntimeError("Yandex request failed for every candidate URL.")
 
 
@@ -1572,7 +1583,7 @@ def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
     return results[:YANDEX_RESULT_LIMIT]
 
 
-def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
+def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True, reuse_browser_cookies=False):
     query_url = yandex_query_source_url(root_url)
     mode = yandex_query_mode(root_url)
 
@@ -1600,11 +1611,21 @@ def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
         for idx, candidate in enumerate(search_urls, 1):
             suffix = "" if idx == 1 else " (fallback)"
             log(f"Yandex request URL{suffix}: {candidate}")
-        response, search_url = _yandex_fetch_search_html(search_urls, log=log)
+        response, search_url = _yandex_fetch_search_html(
+            search_urls,
+            log=log,
+            reuse_browser_cookies=reuse_browser_cookies,
+        )
         html = response.text
 
     if _yandex_is_challenge(html, response=response):
         diagnostics = _yandex_page_diagnostics(html, response=response)
+        if mode == "html":
+            raise RuntimeError(
+                "Imported Yandex HTML is a CAPTCHA/block page, not a saved image result page. "
+                "Open a Yandex Images result page in your browser after solving the challenge, "
+                "save that result page as HTML, then import the saved file. Diagnostics: " + diagnostics
+            )
         raise YandexBlockedError(
             "Yandex returned a CAPTCHA/block page instead of image results.",
             search_url=search_url,
@@ -2131,7 +2152,13 @@ def _build_url_map(node, mapping=None):
     return mapping
 
 
-def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=False):
+def discover_or_load_gallery_tree(
+    root_url,
+    log,
+    quick_scan=True,
+    force_refresh=False,
+    yandex_reuse_browser_cookies=False,
+):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
     if force_refresh:
@@ -2157,6 +2184,7 @@ def discover_or_load_gallery_tree(root_url, log, quick_scan=True, force_refresh=
             root_url,
             log=log,
             quick_scan=quick_scan,
+            reuse_browser_cookies=yandex_reuse_browser_cookies,
         )
     elif site_type == "4chan":
         tree = fourchan_discover_tree(
@@ -3206,6 +3234,27 @@ class GalleryRipperApp(tb.Window):
         quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
 
+        self.yandex_reuse_browser_cookies_var = tk.BooleanVar(
+            value=bool(settings.get("yandex_reuse_browser_cookies", False))
+        )
+
+        def save_yandex_cookie_setting():
+            current = load_settings()
+            current["yandex_reuse_browser_cookies"] = self.yandex_reuse_browser_cookies_var.get()
+            save_settings(current)
+
+        yandex_cookie_chk = ttk.Checkbutton(
+            optionsf,
+            text="Reuse Yandex browser cookies",
+            variable=self.yandex_reuse_browser_cookies_var,
+            command=save_yandex_cookie_setting,
+        )
+        yandex_cookie_chk.pack(side="left", padx=(10, 0))
+        ToolTip(
+            yandex_cookie_chk,
+            text="Opt in to retry blocked Yandex searches with local browser cookies.",
+        )
+
         self.download_workers_var = IntVar(value=DOWNLOAD_WORKERS)
 
         def update_worker_label(value):
@@ -3814,13 +3863,24 @@ class GalleryRipperApp(tb.Window):
         self.thread_safe_log(f"Discovering albums from: {url}")
         self.tree.delete(*self.tree.get_children())
         quick = self.quick_scan_var.get()
-        self.discovery_thread = threading.Thread(target=self.do_discover, args=(url, quick), daemon=True)
+        reuse_browser_cookies = self.yandex_reuse_browser_cookies_var.get()
+        self.discovery_thread = threading.Thread(
+            target=self.do_discover,
+            args=(url, quick, reuse_browser_cookies),
+            daemon=True,
+        )
         self.discovery_thread.start()
         self.update_nav_buttons()
 
-    def do_discover(self, url, quick):
+    def do_discover(self, url, quick, reuse_browser_cookies=False):
         try:
-            tree_data = discover_or_load_gallery_tree(url, self.thread_safe_log, quick_scan=quick, force_refresh=not quick)
+            tree_data = discover_or_load_gallery_tree(
+                url,
+                self.thread_safe_log,
+                quick_scan=quick,
+                force_refresh=not quick,
+                yandex_reuse_browser_cookies=reuse_browser_cookies,
+            )
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
             if tree_data.get("adapter") == "yandex":

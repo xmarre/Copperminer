@@ -34,12 +34,12 @@ Use **Similar** on any card to run a new Yandex reverse-image search from that r
 
 The **Probe sizes** button sends HEAD requests for visible cards that do not expose file-size metadata in Yandex's page data, then updates file-size sorting for those cards.
 
-If Yandex redirects automated requests to a CAPTCHA page, Copperminer now treats that as a blocked search instead of a fake zero-result discovery. It retries alternate Yandex hosts and, when `browser-cookie3` is installed, makes a best-effort retry with local Yandex cookies from Chrome, Edge, Firefox, Brave, Chromium, or Opera. If Yandex still blocks the request, open the logged request URL in your browser, solve the challenge, save the result page as HTML, then use **Yandex HTML** to import that saved page. The imported page uses the same parser, preview grid, sorting, and download pipeline.
+If Yandex redirects automated requests to a CAPTCHA page, Copperminer now treats that as a blocked search instead of a fake zero-result discovery. It retries alternate Yandex hosts by default. If you explicitly enable **Reuse Yandex browser cookies**, and `browser-cookie3` is installed, Copperminer can also make a best-effort retry with local Yandex cookies from Chrome, Edge, Firefox, Brave, Chromium, or Opera. If Yandex still blocks the request, open the logged request URL in your browser, solve the challenge, save the result page as HTML, then use **Yandex HTML** to import that saved page. The imported page uses the same parser, preview grid, sorting, and download pipeline.
 
 ## Limitations
 
 - Supports Coppermine, 4chan, Yandex Images text/reverse search, and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
-- Yandex support depends on Yandex's public HTML and can be rate-limited or CAPTCHA-gated by Yandex. Copperminer detects CAPTCHA/block pages, retries with alternate hosts and optional local browser cookies, and supports saved-HTML import as a manual fallback. Some result file sizes are only available after probing.
+- Yandex support depends on Yandex's public HTML and can be rate-limited or CAPTCHA-gated by Yandex. Copperminer detects CAPTCHA/block pages, retries with alternate hosts, supports explicit opt-in local browser cookie reuse, and supports saved-HTML import as a manual fallback. Some result file sizes are only available after probing.
 - No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below
 
