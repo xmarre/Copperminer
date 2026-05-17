@@ -843,9 +843,10 @@ YANDEX_QUERY_PREFIX = "yandex:"
 YANDEX_HTML_PREFIX = "yandex-html:"
 YANDEX_RESULT_LIMIT = 300
 YANDEX_SEARCH_HOSTS = ("yandex.com", "yandex.ru")
-YANDEX_CAPTCHA_MARKERS = (
-    "showcaptcha", "smartcaptcha", "are you not a robot", "not a robot",
-    "captcha", "access to our service has been temporarily restricted",
+YANDEX_CAPTCHA_BODY_MARKERS = (
+    "showcaptcha", "smartcaptcha", "checkcaptcha", "captcha__",
+    "captcha-form", "advanced-captcha",
+    "access to our service has been temporarily restricted",
 )
 YANDEX_CHALLENGE_TITLE_MARKERS = (
     "are you not a robot", "not a robot", "captcha", "blocked",
@@ -1327,9 +1328,9 @@ def _yandex_is_challenge(html: str, response=None) -> bool:
         return True
     if any(marker in title for marker in YANDEX_CHALLENGE_TITLE_MARKERS):
         return True
-    # Body checks stay limited to strong CAPTCHA markers. A normal result page can
-    # contain generic strings like "robot" or "blocked" in scripts or metadata.
-    return any(marker in low for marker in YANDEX_CAPTCHA_MARKERS)
+    # Body checks stay limited to structural CAPTCHA markers. Normal SERPs can
+    # contain generic query/result text such as "captcha", "robot", or "blocked".
+    return any(marker in low for marker in YANDEX_CAPTCHA_BODY_MARKERS)
 
 
 def _yandex_has_serp_markers(html: str) -> bool:
@@ -3829,7 +3830,7 @@ class GalleryRipperApp(tb.Window):
         except YandexBlockedError as e:
             self.after(0, lambda err=e: self.handle_yandex_blocked(err))
         except Exception as e:
-            self.after(0, lambda: self.log(f"Discovery failed: {e}"))
+            self.after(0, lambda err=e: self.log(f"Discovery failed: {err}"))
 
     def handle_yandex_blocked(self, err):
         details = f"Discovery failed: {err}"
