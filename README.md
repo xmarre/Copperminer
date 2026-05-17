@@ -13,7 +13,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
 - 4chan support — Browse boards and threads to bulk download all attached media
-- Yandex Images reverse-search support — Paste an image URL or Yandex Images search URL, preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, and download the original/highest-resolution candidate URLs Yandex exposes
+- Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, and download the original/highest-resolution candidate URLs Yandex exposes
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
 - Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
 - History dropdown — Quickly reopen recently scanned galleries from cache
@@ -28,7 +28,7 @@ Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread
 
 ### Yandex Images Usage
 
-Paste a direct image URL into **Gallery Root URL** and click **Yandex Search**, or paste an existing `yandex.com/images/search?...` reverse-image result URL and click **Discover Galleries**. Copperminer opens a sortable Yandex result overview with thumbnails, known resolution, known file size, source domain, and result actions.
+Paste a keyword/search phrase such as `forest`, a direct image URL, or an existing `yandex.com/images/search?...` URL into **Gallery Root URL** and click **Yandex Search**. You can also type `yandex:forest` and click **Discover Galleries** directly. Copperminer detects whether the input is text search or reverse-image search, then opens a sortable Yandex result overview with thumbnails, known resolution, known file size, source domain, and result actions.
 
 Use **Similar** on any card to run a new Yandex reverse-image search from that result, matching Yandex's similar-picture workflow. Use **Select for download**, **Select visible**, or the normal album tree selection to choose results, then start the download. Downloads try Yandex's original/direct image candidates first and fall back through lower-priority preview URLs only if the original candidate fails.
 
@@ -36,7 +36,7 @@ The **Probe sizes** button sends HEAD requests for visible cards that do not exp
 
 ## Limitations
 
-- Supports Coppermine, 4chan, Yandex Images reverse search, and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
+- Supports Coppermine, 4chan, Yandex Images text/reverse search, and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
 - Yandex support depends on Yandex's public HTML. If Yandex changes its result markup, extraction may need parser updates. Some result file sizes are only available after probing.
 - No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below

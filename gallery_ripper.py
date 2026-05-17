@@ -861,7 +861,7 @@ def is_yandex_query_url(url: str) -> bool:
 
 
 def yandex_query_source_url(url: str) -> str:
-    """Return the image URL/query behind a yandex: or Yandex Images URL."""
+    """Return the image URL or text query behind a yandex: or Yandex Images URL."""
     raw = (url or "").strip()
     if raw.lower().startswith(YANDEX_QUERY_PREFIX):
         return raw.split(":", 1)[1].strip()
@@ -872,22 +872,51 @@ def yandex_query_source_url(url: str) -> str:
             vals = qs.get(key)
             if vals and vals[0]:
                 return vals[0]
+        for key in ("text", "q", "query"):
+            vals = qs.get(key)
+            if vals and vals[0]:
+                return vals[0]
     return raw
 
 
-def yandex_reverse_search_url(url: str) -> str:
-    """Build a Yandex reverse-image search URL from an image URL or pass through an existing search URL."""
+def yandex_query_mode(url: str) -> str:
+    """Classify a Yandex discovery input as an existing URL, reverse-image search, or text search."""
+    raw = (url or "").strip()
+    if is_yandex_images_url(raw):
+        parsed = urlparse(raw)
+        qs = parse_qs(parsed.query)
+        if any(qs.get(key, [""])[0] for key in ("url", "img_url", "cbir_image_url")):
+            return "reverse"
+        if any(qs.get(key, [""])[0] for key in ("text", "q", "query")):
+            return "text"
+        return "existing"
+    query = yandex_query_source_url(raw)
+    if _is_http_url(query):
+        return "reverse"
+    return "text"
+
+
+def yandex_search_url(url: str) -> str:
+    """Build a Yandex Images search URL for either text search or reverse-image search."""
     raw = (url or "").strip()
     if is_yandex_images_url(raw):
         return raw
-    query_url = yandex_query_source_url(raw)
-    params = {
-        "rpt": "imageview",
-        "url": query_url,
-        "img_url": query_url,
-        "text": query_url,
-    }
+    query = yandex_query_source_url(raw)
+    if _is_http_url(query):
+        params = {
+            "rpt": "imageview",
+            "url": query,
+            "img_url": query,
+            "text": query,
+        }
+    else:
+        params = {"text": query}
     return "https://yandex.com/images/search?" + urlencode(params)
+
+
+def yandex_reverse_search_url(url: str) -> str:
+    """Backward-compatible wrapper for callers that build a Yandex Images URL."""
+    return yandex_search_url(url)
 
 
 def yandex_encode_result(result: dict) -> str:
@@ -937,11 +966,28 @@ def _format_bytes(num):
     return f"{n / 1024:.1f} KB"
 
 
+def _normalize_yandex_url(value, base_url: str = "") -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        return "https:" + value
+    if base_url:
+        parsed = urlparse(value)
+        if not parsed.scheme and not parsed.netloc:
+            return urljoin(base_url, value)
+    return value
+
+
 def _is_http_url(value) -> bool:
+    value = _normalize_yandex_url(value)
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
 def _url_looks_media_like(url: str) -> bool:
+    url = _normalize_yandex_url(url)
     if not _is_http_url(url):
         return False
     parsed = urlparse(url)
@@ -966,9 +1012,10 @@ def _json_walk(node):
             yield from _json_walk(value)
 
 
-def _collect_urls(value):
+def _collect_urls(value, base_url: str = ""):
     urls = []
     if isinstance(value, str):
+        value = _normalize_yandex_url(value, base_url)
         if _is_http_url(value):
             urls.append(value)
     elif isinstance(value, dict):
@@ -976,15 +1023,15 @@ def _collect_urls(value):
             "url", "href", "src", "img_href", "img_url", "imgUrl", "origUrl",
             "originUrl", "original", "thumb", "thumbnail", "preview", "previewUrl",
         ):
-            found = value.get(key)
-            if isinstance(found, str) and _is_http_url(found):
+            found = _normalize_yandex_url(value.get(key), base_url)
+            if _is_http_url(found):
                 urls.append(found)
         for nested in value.values():
-            if isinstance(nested, (list, tuple)):
-                urls.extend(_collect_urls(nested))
+            if isinstance(nested, (dict, list, tuple)):
+                urls.extend(_collect_urls(nested, base_url=base_url))
     elif isinstance(value, (list, tuple)):
         for item in value:
-            urls.extend(_collect_urls(item))
+            urls.extend(_collect_urls(item, base_url=base_url))
     return urls
 
 
@@ -1039,14 +1086,14 @@ def _extract_yandex_result_from_payload(payload: dict, tag=None, search_url: str
     for key in (
         "origUrl", "originUrl", "original", "img_href", "img_url", "imgUrl", "imageUrl", "image_url",
     ):
-        value = payload.get(key)
-        if isinstance(value, str) and _is_http_url(value):
+        value = _normalize_yandex_url(payload.get(key), search_url)
+        if _is_http_url(value):
             candidates.append(value)
 
     for key in ("preview", "dups", "dupsList", "sizes", "otherSizes", "thumb", "thumbnail", "previewUrl", "img_src", "src"):
         value = payload.get(key)
-        urls = _collect_urls(value)
-        if key in ("thumb", "thumbnail", "previewUrl", "img_src", "src"):
+        urls = _collect_urls(value, base_url=search_url)
+        if key in ("preview", "thumb", "thumbnail", "previewUrl", "img_src", "src"):
             preview_candidates.extend(urls)
         else:
             candidates.extend(urls)
@@ -1063,12 +1110,12 @@ def _extract_yandex_result_from_payload(payload: dict, tag=None, search_url: str
         if size_bytes is None:
             size_bytes = _to_int(_first_present(node, ("fileSizeInBytes", "fileSize", "sizeBytes", "bytes")))
         for key in ("origUrl", "originUrl", "img_href", "img_url", "imgUrl", "imageUrl", "image_url"):
-            value = node.get(key)
-            if isinstance(value, str) and _is_http_url(value):
+            value = _normalize_yandex_url(node.get(key), search_url)
+            if _is_http_url(value):
                 candidates.append(value)
         for key in ("thumb", "thumbnail", "previewUrl", "img_src", "src"):
-            value = node.get(key)
-            if isinstance(value, str) and _is_http_url(value):
+            value = _normalize_yandex_url(node.get(key), search_url)
+            if _is_http_url(value):
                 preview_candidates.append(value)
 
     if tag is not None:
@@ -1142,6 +1189,103 @@ def _yandex_result_key(result: dict):
     return result.get("source_page_url") or result.get("title") or ""
 
 
+def _yandex_json_objects_near_markers(text: str, markers, max_objects: int = 250):
+    """Yield valid JSON objects found around marker strings in inline Yandex state."""
+    if not text:
+        return
+    yielded = set()
+    positions = []
+    for marker in markers:
+        start = 0
+        while True:
+            pos = text.find(marker, start)
+            if pos < 0:
+                break
+            positions.append(pos)
+            start = pos + len(marker)
+            if len(positions) >= max_objects * 3:
+                break
+        if len(positions) >= max_objects * 3:
+            break
+
+    for pos in sorted(set(positions)):
+        starts = []
+        cursor = pos
+        # Try the nearest few containing object starts. The nearest object is often
+        # the result item itself; the next outer object can contain useful nested state.
+        for _ in range(4):
+            start = text.rfind("{", 0, cursor + 1)
+            if start < 0:
+                break
+            starts.append(start)
+            cursor = start - 1
+
+        for start in starts:
+            if start in yielded:
+                continue
+            depth = 0
+            in_string = False
+            escape = False
+            end = None
+            for idx in range(start, min(len(text), start + 350000)):
+                ch = text[idx]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx + 1
+                        break
+            if end is None:
+                continue
+            raw = text[start:end]
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            yielded.add(start)
+            if isinstance(obj, dict):
+                yield obj
+            if len(yielded) >= max_objects:
+                return
+
+
+def _yandex_page_diagnostics(html: str, response=None) -> str:
+    parts = []
+    if response is not None:
+        parts.append(f"status={getattr(response, 'status_code', '?')}")
+        final_url = getattr(response, "url", "") or ""
+        if final_url:
+            parts.append(f"final_url={final_url[:180]}")
+    if html is not None:
+        parts.append(f"bytes={len(html.encode('utf-8', errors='ignore'))}")
+        soup = BeautifulSoup(html or "", "html.parser")
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        if title:
+            parts.append(f"title={title[:120]}")
+        low = (html or "").lower()
+        if any(marker in low for marker in ("captcha", "smartcaptcha", "showcaptcha", "robot", "blocked")):
+            parts.append("possible_challenge_or_block=1")
+        marker_counts = []
+        for marker in ("serp-item", "img_href", "origUrl", "preview"):
+            count = low.count(marker.lower())
+            if count:
+                marker_counts.append(f"{marker}:{count}")
+        if marker_counts:
+            parts.append("markers=" + ",".join(marker_counts))
+    return "; ".join(parts)
+
+
 def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
     soup = BeautifulSoup(html, "html.parser")
     results = []
@@ -1202,9 +1346,28 @@ def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
                 if len(results) >= YANDEX_RESULT_LIMIT:
                     break
 
+    # Some Yandex responses keep result state in inline scripts rather than data-*
+    # attributes. Parse valid JSON objects near result markers without evaluating JS.
+    if len(results) < 5:
+        markers = ("serp-item", "images-touch-serp-item", "img_href", "origUrl", "originUrl", "preview")
+        for script in soup.find_all("script"):
+            text = script.string or script.get_text(" ", strip=False) or ""
+            if not any(marker in text for marker in markers):
+                continue
+            for payload in _yandex_json_objects_near_markers(text, markers):
+                for node in _json_walk(payload):
+                    if isinstance(node, dict):
+                        add_result(_extract_yandex_result_from_payload(node, tag=None, search_url=search_url))
+                        if len(results) >= YANDEX_RESULT_LIMIT:
+                            break
+                if len(results) >= YANDEX_RESULT_LIMIT:
+                    break
+            if len(results) >= YANDEX_RESULT_LIMIT:
+                break
+
     # Last-resort HTML fallback for cards where only an anchor/img pair is available.
     if len(results) < 5:
-        for tag in soup.select(".serp-item, a[href]"):
+        for tag in soup.select(".serp-item, .serp-item__link, .CbirSites-Item, .ImagesContentImage, a[href]"):
             add_result(_extract_yandex_result_from_payload({}, tag=tag, search_url=search_url))
             if len(results) >= YANDEX_RESULT_LIMIT:
                 break
@@ -1218,16 +1381,27 @@ def yandex_extract_results(html: str, search_url: str, log=lambda msg: None):
 
 
 def yandex_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
-    search_url = yandex_reverse_search_url(root_url)
+    search_url = yandex_search_url(root_url)
     query_url = yandex_query_source_url(root_url)
-    log(f"Yandex reverse image search: {query_url}")
+    mode = yandex_query_mode(root_url)
+    if mode == "text":
+        log(f"Yandex image text search: {query_url}")
+    elif mode == "reverse":
+        log(f"Yandex reverse image search: {query_url}")
+    else:
+        log(f"Yandex Images search URL: {search_url}")
+    log(f"Yandex request URL: {search_url}")
     headers = {
         "Referer": "https://yandex.com/images/",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
     }
     resp = session.get(search_url, headers=headers, timeout=25)
     resp.raise_for_status()
     results = yandex_extract_results(resp.text, search_url, log=log)
+    if not results:
+        log("Yandex empty-result diagnostics: " + _yandex_page_diagnostics(resp.text, response=resp))
 
     query_label = os.path.basename(urlparse(query_url).path) or query_url
     query_label = sanitize_folder_name(unquote(query_label))[:80] or "query"
@@ -2912,7 +3086,7 @@ class GalleryRipperApp(tb.Window):
     def discover_yandex_from_url(self):
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("Missing image URL", "Paste an image URL or a Yandex Images search URL first.")
+            messagebox.showwarning("Missing Yandex query", "Paste an image URL, keyword/search text, or a Yandex Images search URL first.")
             return
         if not is_yandex_query_url(url):
             self.url_var.set(YANDEX_QUERY_PREFIX + url)
