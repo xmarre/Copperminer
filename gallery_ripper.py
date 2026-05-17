@@ -974,8 +974,10 @@ def _normalize_yandex_url(value, base_url: str = "") -> str:
         return ""
     if value.startswith("//"):
         return "https:" + value
-    if base_url and value.startswith("/"):
-        return urljoin(base_url, value)
+    if base_url:
+        parsed = urlparse(value)
+        if not parsed.scheme and not parsed.netloc:
+            return urljoin(base_url, value)
     return value
 
 
@@ -1025,7 +1027,7 @@ def _collect_urls(value, base_url: str = ""):
             if _is_http_url(found):
                 urls.append(found)
         for nested in value.values():
-            if isinstance(nested, (list, tuple)):
+            if isinstance(nested, (dict, list, tuple)):
                 urls.extend(_collect_urls(nested, base_url=base_url))
     elif isinstance(value, (list, tuple)):
         for item in value:
