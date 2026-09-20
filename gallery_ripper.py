@@ -1711,6 +1711,93 @@ def yandex_result_image_entries(album_url, log=lambda msg: None):
     return [(name, encoded, referer, name)]
 
 
+DISCOVERY_MIN_REQUEST_INTERVAL = 0.5
+DISCOVERY_RETRY_DELAY = 2.0
+DISCOVERY_RETRYABLE_STATUSES = {403, 404, 429, 500, 502, 503, 504}
+_discovery_request_lock = threading.Lock()
+_discovery_last_request = {}
+
+
+def _same_origin_referer(url):
+    """Return an origin-level Referer for a discovery target."""
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/"
+    return url
+
+
+def _wait_for_discovery_request(url):
+    """Pace discovery traffic independently per host."""
+    host = urlparse(url).netloc.lower()
+    if not host:
+        return
+
+    with _discovery_request_lock:
+        now = time.monotonic()
+        scheduled = max(
+            now,
+            _discovery_last_request.get(host, 0.0) + DISCOVERY_MIN_REQUEST_INTERVAL,
+        )
+        _discovery_last_request[host] = scheduled
+
+    wait_time = scheduled - now
+    if wait_time > 0:
+        time.sleep(wait_time)
+
+
+def _discovery_retry_delay(response):
+    """Return the cooldown before retrying a transient-looking response."""
+    retry_after = (
+        response.headers.get("Retry-After")
+        if getattr(response, "headers", None)
+        else None
+    )
+    try:
+        if retry_after is not None:
+            return max(DISCOVERY_RETRY_DELAY, float(retry_after))
+    except (TypeError, ValueError):
+        pass
+    return DISCOVERY_RETRY_DELAY
+
+
+def _discovery_request(
+    method,
+    url,
+    headers=None,
+    timeout=20,
+    log=lambda msg: None,
+    indent="",
+):
+    """Issue a paced discovery request and retry one transient-looking failure."""
+    request_headers = {"Referer": _same_origin_referer(url)}
+    if headers:
+        request_headers.update(headers)
+
+    requester = getattr(session, method.lower())
+    for attempt in range(2):
+        _wait_for_discovery_request(url)
+        response = requester(
+            url,
+            headers=request_headers,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        if (
+            response.status_code not in DISCOVERY_RETRYABLE_STATUSES
+            or attempt == 1
+        ):
+            return response
+
+        delay = _discovery_retry_delay(response)
+        log(
+            f"{indent}HTTP {response.status_code} from {url}; "
+            f"retrying after {delay:g}s"
+        )
+        time.sleep(delay)
+
+    return response
+
+
 def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
@@ -1721,7 +1808,14 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         if entry.get("last_modified"):
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
-            r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
+            r = _discovery_request(
+                "head",
+                url,
+                headers=headers,
+                timeout=10,
+                log=log,
+                indent=indent,
+            )
             if r.ok and getattr(r, "url", None):
                 entry["final_url"] = r.url
             if r.status_code == 304:
@@ -1744,7 +1838,13 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     if entry and not quick_scan:
         if not entry.get("final_url"):
             try:
-                r = session.head(url, allow_redirects=True, timeout=10)
+                r = _discovery_request(
+                    "head",
+                    url,
+                    timeout=10,
+                    log=log,
+                    indent=indent,
+                )
                 if r.ok and getattr(r, "url", None):
                     entry["final_url"] = r.url
             except Exception:
@@ -1752,7 +1852,13 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
-    resp = session.get(url)
+    resp = _discovery_request(
+        "get",
+        url,
+        timeout=20,
+        log=log,
+        indent=indent,
+    )
     resp.raise_for_status()
     html = resp.text
     page_cache[url] = {

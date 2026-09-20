@@ -7,12 +7,96 @@ import gallery_ripper as gr
 
 
 class CoppermineDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        gr._discovery_last_request.clear()
+
     @staticmethod
     def _http_error(status, url):
         response = requests.Response()
         response.status_code = status
         response.url = url
         return requests.HTTPError(f"{status} for {url}", response=response)
+
+    def test_discovery_wait_paces_only_the_same_host(self):
+        with patch.object(
+            gr.time, "monotonic", side_effect=[100.0, 100.1, 100.1]
+        ), patch.object(gr.time, "sleep") as sleep:
+            gr._wait_for_discovery_request("http://example.test/one")
+            gr._wait_for_discovery_request("http://example.test/two")
+            gr._wait_for_discovery_request("http://other.test/one")
+
+        sleep.assert_called_once()
+        self.assertAlmostEqual(
+            sleep.call_args.args[0],
+            gr.DISCOVERY_MIN_REQUEST_INTERVAL - 0.1,
+            places=6,
+        )
+
+    def test_discovery_request_uses_same_origin_referer(self):
+        response = Mock()
+        response.status_code = 200
+        response.headers = {}
+
+        with patch.object(gr, "_wait_for_discovery_request"), patch.object(
+            gr.session, "get", return_value=response
+        ) as get:
+            result = gr._discovery_request(
+                "get", "http://example.test/gallery/index.php"
+            )
+
+        self.assertIs(result, response)
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["Referer"],
+            "http://example.test/",
+        )
+
+    def test_discovery_request_retries_transient_404_once(self):
+        first = Mock()
+        first.status_code = 404
+        first.headers = {}
+        second = Mock()
+        second.status_code = 200
+        second.headers = {}
+        logs = []
+
+        with patch.object(gr, "_wait_for_discovery_request"), patch.object(
+            gr.time, "sleep"
+        ) as sleep, patch.object(
+            gr.session, "get", side_effect=[first, second]
+        ) as get:
+            response = gr._discovery_request(
+                "get",
+                "http://example.test/gallery/index.php?cat=14",
+                log=logs.append,
+            )
+
+        self.assertIs(response, second)
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(gr.DISCOVERY_RETRY_DELAY)
+        self.assertTrue(
+            any("HTTP 404" in line and "retrying" in line for line in logs)
+        )
+
+    def test_discovery_request_returns_persistent_404_after_one_retry(self):
+        first = Mock()
+        first.status_code = 404
+        first.headers = {}
+        second = Mock()
+        second.status_code = 404
+        second.headers = {}
+
+        with patch.object(gr, "_wait_for_discovery_request"), patch.object(
+            gr.time, "sleep"
+        ), patch.object(
+            gr.session, "get", side_effect=[first, second]
+        ) as get:
+            response = gr._discovery_request(
+                "get",
+                "http://example.test/gallery/thumbnails.php?album=9",
+            )
+
+        self.assertIs(response, second)
+        self.assertEqual(get.call_count, 2)
 
     def test_fetch_cache_records_effective_response_url(self):
         response = Mock()
