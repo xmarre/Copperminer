@@ -1722,6 +1722,8 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
             r = session.head(url, headers=headers, allow_redirects=True, timeout=10)
+            if r.ok and getattr(r, "url", None):
+                entry["final_url"] = r.url
             if r.status_code == 304:
                 entry["timestamp"] = time.time()
                 log(f"{indent}Using cached page (304): {url}")
@@ -1740,6 +1742,13 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         return entry["html"], False
 
     if entry and not quick_scan:
+        if not entry.get("final_url"):
+            try:
+                r = session.head(url, allow_redirects=True, timeout=10)
+                if r.ok and getattr(r, "url", None):
+                    entry["final_url"] = r.url
+            except Exception:
+                pass
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
@@ -1751,8 +1760,12 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         "timestamp": time.time(),
         "etag": resp.headers.get("ETag"),
         "last_modified": resp.headers.get("Last-Modified"),
+        "final_url": resp.url,
     }
-    log(f"{indent}Fetched: {url}")
+    if resp.url != url:
+        log(f"{indent}Fetched: {url} -> {resp.url}")
+    else:
+        log(f"{indent}Fetched: {url}")
     return html, True
 
 BASE_URL = ""  # Will be set from GUI
@@ -1976,10 +1989,13 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
 
     html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
     soup = BeautifulSoup(html, "html.parser")
+    page_url = page_cache.get(root_url, {}).get("final_url") or root_url
+    base_tag = soup.find("base", href=True)
+    link_base_url = urljoin(page_url, base_tag["href"]) if base_tag else page_url
     cat_title = parent_title or soup.title.text.strip()
     log(f"{indent}   In category: {cat_title}")
 
-    match = re.search(r'cat=(\d+)', root_url)
+    match = re.search(r'cat=(\d+)', page_url)
     cat_id = match.group(1) if match else "0"
 
     node = {
@@ -1993,10 +2009,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     }
 
     for label, key in SPECIALS:
-        special_url = re.sub(
-            r"index\.php(\?cat=\d+)?",
+        special_url = urljoin(
+            link_base_url,
             f"thumbnails.php?album={key}{f'&cat={cat_id}' if cat_id != '0' else ''}",
-            root_url,
         )
         node["specials"].append({"type": "special", "name": label, "url": special_url})
 
@@ -2007,7 +2022,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             name = a.text.strip()
             if not name or name == cat_title:
                 continue
-            subcats.append((name, urljoin(root_url, href)))
+            subcats.append((name, urljoin(link_base_url, href)))
             log(f"{indent}   Found subcategory: {name}")
 
     albums = []
@@ -2021,9 +2036,31 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             album_id = m.group(1)
             if album_id in [key for _, key in SPECIALS]:
                 continue
-            album_url = urljoin(root_url, href)
+            album_url = urljoin(link_base_url, href)
             if cat_id != album_id:
-                img_count = get_album_image_count(album_url, page_cache)
+                try:
+                    img_count = get_album_image_count(album_url, page_cache)
+                except requests.HTTPError as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status in {404, 410}:
+                        log(
+                            f"{indent}     Skipping unavailable album: {name} "
+                            f"({album_url}, HTTP {status})"
+                        )
+                        continue
+                    detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+                    log(
+                        f"{indent}     Could not count album: {name} "
+                        f"({album_url}, {detail}); keeping it with unknown count"
+                    )
+                    img_count = "?"
+                except requests.RequestException as exc:
+                    log(
+                        f"{indent}     Could not count album: {name} "
+                        f"({album_url}, {exc.__class__.__name__}); "
+                        "keeping it with unknown count"
+                    )
+                    img_count = "?"
                 albums.append({
                     "type": "album",
                     "name": name,
@@ -2055,17 +2092,26 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         if cat_num.group(1) in seen_cats:
             continue
         seen_cats.add(cat_num.group(1))
-        child = discover_tree(
-            subcat_url,
-            parent_cat=cat_id,
-            parent_title=name,
-            log=log,
-            depth=depth + 1,
-            visited=visited,
-            page_cache=page_cache,
-            quick_scan=quick_scan,
-            cached_nodes=cached_nodes,
-        )
+        try:
+            child = discover_tree(
+                subcat_url,
+                parent_cat=cat_id,
+                parent_title=name,
+                log=log,
+                depth=depth + 1,
+                visited=visited,
+                page_cache=page_cache,
+                quick_scan=quick_scan,
+                cached_nodes=cached_nodes,
+            )
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+            log(
+                f"{indent}  Skipping unavailable subcategory: {name} "
+                f"({subcat_url}, {detail})"
+            )
+            continue
         if child:
             node['children'].append(child)
 
