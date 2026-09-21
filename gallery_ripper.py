@@ -2966,7 +2966,7 @@ def _decode_candidate_metadata(value, default_referer=None):
     return base, referer, display_url
 
 
-def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True):
+def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True, _implicit_first_page=None):
     """Return all candidate image URLs from an album.
 
     The return value is a list of tuples ``(display_title, [url1, url2, ...], referer)``
@@ -3146,9 +3146,12 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
         cur_page_raw = cur_q.get("page", [None])[0]
         implicit_page = cur_page_raw is None
-        has_page0 = False
-        if implicit_page:
-            # If the UI exposes page=0 links, treat the base URL as page 0.
+        if implicit_page and _implicit_first_page is None:
+            # Determine the album's pagination convention once, from its base
+            # page, then carry it through recursive page fetches. On normal
+            # Coppermine installs the implicit URL is page 1. A few installs
+            # expose page=0 and use the implicit URL as page 0 instead.
+            has_page0 = False
             for _a in soup.find_all("a", href=True):
                 _href = _a.get("href") or ""
                 if "thumbnails.php" not in _href or "page=" not in _href:
@@ -3163,14 +3166,14 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                         break
                 except Exception:
                     pass
+            _implicit_first_page = 0 if has_page0 else 1
 
         if cur_page_raw and str(cur_page_raw).isdigit():
             cur_page = int(cur_page_raw)
+        elif _implicit_first_page is not None:
+            cur_page = _implicit_first_page
         else:
-            # If page is implicit:
-            # - page=0 scheme => current is 0 (so we must allow page=1)
-            # - otherwise => current is 1 (so we skip page=1 alias)
-            cur_page = 0 if has_page0 else 1
+            cur_page = 1
 
         cur_norm_q = dict(cur_q)
         cur_norm_q.pop("sort", None)
@@ -3197,7 +3200,13 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             page_i = int(page)
             if page_i < 1:
                 continue
-            # Avoid first-page aliases (and any same-page duplicates).
+            # The base thumbnails.php?album=... URL is page 1 on normal
+            # Coppermine installs. Once that convention is established at the
+            # album root, never walk back to an explicit page=1 alias from
+            # page=2/3/etc. Some installs use implicit page 0; those retain a
+            # real page=1 and therefore do not take this branch.
+            if _implicit_first_page == 1 and page_i == 1:
+                continue
             if page_i == cur_page:
                 continue
             if cur_album and q.get("album", [None])[0] != cur_album:
@@ -3216,13 +3225,30 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             continue
 
         pagelinks.add(pl)
-    for pl in pagelinks:
+    def _pagination_sort_key(url):
+        try:
+            value = parse_qs(urlparse(url).query).get("page", ["0"])[0]
+            return int(value)
+        except Exception:
+            return 0
+
+    for pl in sorted(pagelinks, key=_pagination_sort_key):
         log(f"[DEBUG] pagination -> {pl}")
-        image_entries.extend(
-            get_all_candidate_images_from_album(
-                pl, log=log, visited=visited, page_cache=page_cache, quick_scan=quick_scan
+        try:
+            page_entries = get_all_candidate_images_from_album(
+                pl,
+                log=log,
+                visited=visited,
+                page_cache=page_cache,
+                quick_scan=quick_scan,
+                _implicit_first_page=_implicit_first_page,
             )
-        )
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+            log(f"[DEBUG] Skipping unavailable pagination page: {pl} ({detail})")
+            continue
+        image_entries.extend(page_entries)
 
     if image_entries:
         log(f"Found {len(image_entries)} images total after all strategies.")
@@ -3725,16 +3751,25 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             log("Download stopped by user.")
             return
         log(f"\nScraping album: {album_name}")
-        if site_type == "universal":
-            image_entries = universal_get_all_candidate_images_from_album(
-                album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
+        try:
+            if site_type == "universal":
+                image_entries = universal_get_all_candidate_images_from_album(
+                    album_url, rules, log=log, page_cache=pages, quick_scan=quick_scan
+                )
+            elif site_type == "yandex":
+                image_entries = yandex_result_image_entries(album_url, log=log)
+            else:
+                image_entries = get_all_candidate_images_from_album(
+                    album_url, log=log, page_cache=pages, quick_scan=quick_scan
+                )
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+            log(
+                f"  Skipping unavailable album: {album_name} "
+                f"({album_url}, {detail})"
             )
-        elif site_type == "yandex":
-            image_entries = yandex_result_image_entries(album_url, log=log)
-        else:
-            image_entries = get_all_candidate_images_from_album(
-                album_url, log=log, page_cache=pages, quick_scan=quick_scan
-            )
+            continue
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
             continue
