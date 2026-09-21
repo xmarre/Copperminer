@@ -8,7 +8,12 @@ import posixpath as ppath
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, IntVar
-from ttkbootstrap.tooltip import ToolTip
+try:
+    # ttkbootstrap 2.x moved shipped widgets below ttkbootstrap.widgets.
+    from ttkbootstrap.widgets import ToolTip
+except ImportError:
+    # Keep compatibility with the 1.x import path.
+    from ttkbootstrap.tooltip import ToolTip
 import webbrowser
 from tkinter.scrolledtext import ScrolledText
 import ttkbootstrap as tb
@@ -124,7 +129,7 @@ MEDIA_FILE_EXTENSIONS = {
 # Coppermine and similar galleries often store actual media below /albums/ or
 # /userdata/, even if a later path component is named "Images" or "icons".
 MEDIA_CONTAINER_SEGMENTS = {
-    "albums", "album", "alben", "gallery", "galleries", "userdata",
+    "albums", "album", "alben", "userdata",
 }
 
 # Theme/UI asset directories that should only be treated as chrome when the URL
@@ -136,7 +141,8 @@ UI_PATH_SEGMENTS = {
 
 UI_NAME_MARKERS = (
     "button", "icon", "logo", "spacer", "pixel", "star", "rating", "rate_",
-    "folder", "blank", "sprite", "bullet", "arrow",
+    "folder", "blank", "sprite", "bullet", "arrow", "header", "footer",
+    "banner", "background",
 )
 
 
@@ -162,16 +168,19 @@ def is_ui_image(url: str, name: str) -> bool:
 
     in_media_container = any(seg in MEDIA_CONTAINER_SEGMENTS for seg in path_segments)
 
+    # Explicit chrome directories always win over broad media-container matches.
+    # A Coppermine install commonly lives under /gallery/, so a theme asset such
+    # as /gallery/themes/.../images/header.jpg must never be allowed merely
+    # because "gallery" appears earlier in the path.
+    if "adview.php" in path_l:
+        return True
+    if any(seg in {"themes", "theme", "advertising", "ads"} for seg in path_segments):
+        return True
+
     # Strong allow-rule for real media living under album/userdata style paths.
     # This avoids false positives like /albums/Images/Photoshoots/.../001.jpg.
     if in_media_container and ext in MEDIA_FILE_EXTENSIONS:
         return False
-
-    if "adview.php" in path_l:
-        return True
-
-    if any(seg in {"themes", "theme", "advertising", "ads"} for seg in path_segments):
-        return True
 
     if any(marker in path_l for marker in ("/button_", "/star", "/rating")):
         return True
@@ -1711,41 +1720,84 @@ def yandex_result_image_entries(album_url, log=lambda msg: None):
     return [(name, encoded, referer, name)]
 
 
-DISCOVERY_MIN_REQUEST_INTERVAL = 0.5
-DISCOVERY_RETRY_DELAY = 2.0
-DISCOVERY_RETRYABLE_STATUSES = {403, 404, 429, 500, 502, 503, 504}
-_discovery_request_lock = threading.Lock()
-_discovery_last_request = {}
+PAGE_CACHE_FRESH_SECONDS = 300
+PAGE_REQUEST_RETRY_DELAY = 1.0
+PAGE_REQUEST_RETRYABLE_STATUSES = {403, 404, 429, 500, 502, 503, 504}
+PAGE_REQUEST_INITIAL_BACKOFF = 0.15
+PAGE_REQUEST_MAX_BACKOFF = 2.0
+PAGE_REQUEST_RECOVERY_SUCCESSES = 8
+_page_request_lock = threading.Lock()
+_page_request_state = {}
 
 
 def _same_origin_referer(url):
-    """Return an origin-level Referer for a discovery target."""
+    """Return an origin-level Referer for a gallery-page request."""
     parsed = urlparse(url)
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}/"
     return url
 
 
-def _wait_for_discovery_request(url):
-    """Pace discovery traffic independently per host."""
+def _page_state(url):
     host = urlparse(url).netloc.lower()
     if not host:
-        return
+        return None, None
+    return host, _page_request_state.setdefault(
+        host,
+        {"delay": 0.0, "last_request": 0.0, "successes": 0},
+    )
 
-    with _discovery_request_lock:
+
+def _wait_for_page_request(url):
+    """Apply adaptive pacing only while a host is recovering from failures."""
+    with _page_request_lock:
+        host, state = _page_state(url)
+        if not host:
+            return
+        delay = state["delay"]
+        if delay <= 0:
+            state["last_request"] = time.monotonic()
+            return
         now = time.monotonic()
-        scheduled = max(
-            now,
-            _discovery_last_request.get(host, 0.0) + DISCOVERY_MIN_REQUEST_INTERVAL,
-        )
-        _discovery_last_request[host] = scheduled
+        scheduled = max(now, state["last_request"] + delay)
+        state["last_request"] = scheduled
 
     wait_time = scheduled - now
     if wait_time > 0:
         time.sleep(wait_time)
 
 
-def _discovery_retry_delay(response):
+def _activate_page_backoff(url, *, severe=False):
+    """Increase host pacing after a confirmed transient failure."""
+    with _page_request_lock:
+        host, state = _page_state(url)
+        if not host:
+            return
+        floor = 0.5 if severe else PAGE_REQUEST_INITIAL_BACKOFF
+        current = state["delay"]
+        state["delay"] = min(
+            PAGE_REQUEST_MAX_BACKOFF,
+            max(floor, current * 2 if current else floor),
+        )
+        state["successes"] = 0
+
+
+def _record_page_success(url):
+    """Gradually return a recovering host to unthrottled operation."""
+    with _page_request_lock:
+        host, state = _page_state(url)
+        if not host or state["delay"] <= 0:
+            return
+        state["successes"] += 1
+        if state["successes"] < PAGE_REQUEST_RECOVERY_SUCCESSES:
+            return
+        state["delay"] *= 0.5
+        state["successes"] = 0
+        if state["delay"] < 0.05:
+            state["delay"] = 0.0
+
+
+def _page_retry_delay(response):
     """Return the cooldown before retrying a transient-looking response."""
     retry_after = (
         response.headers.get("Retry-After")
@@ -1754,10 +1806,10 @@ def _discovery_retry_delay(response):
     )
     try:
         if retry_after is not None:
-            return max(DISCOVERY_RETRY_DELAY, float(retry_after))
+            return max(PAGE_REQUEST_RETRY_DELAY, float(retry_after))
     except (TypeError, ValueError):
         pass
-    return DISCOVERY_RETRY_DELAY
+    return PAGE_REQUEST_RETRY_DELAY
 
 
 def _discovery_request(
@@ -1768,29 +1820,43 @@ def _discovery_request(
     log=lambda msg: None,
     indent="",
 ):
-    """Issue a paced discovery request and retry one transient-looking failure."""
+    """Issue a gallery-page request with adaptive host backoff and one retry."""
     request_headers = {"Referer": _same_origin_referer(url)}
     if headers:
         request_headers.update(headers)
 
     requester = getattr(session, method.lower())
+    first_status = None
     for attempt in range(2):
-        _wait_for_discovery_request(url)
+        _wait_for_page_request(url)
         response = requester(
             url,
             headers=request_headers,
             allow_redirects=True,
             timeout=timeout,
         )
-        if (
-            response.status_code not in DISCOVERY_RETRYABLE_STATUSES
-            or attempt == 1
-        ):
+        status = response.status_code
+        if status not in PAGE_REQUEST_RETRYABLE_STATUSES:
+            if first_status == 404:
+                # A 404 followed by success is direct evidence that this host can
+                # use 404 as a transient anti-burst response.
+                _activate_page_backoff(url)
+            _record_page_success(url)
             return response
 
-        delay = _discovery_retry_delay(response)
+        if attempt == 1:
+            # Two consecutive 404s are treated as a genuinely missing resource;
+            # don't punish the whole host for stale Coppermine links.
+            if status != 404:
+                _activate_page_backoff(url, severe=status in {403, 429})
+            return response
+
+        first_status = status
+        if status != 404:
+            _activate_page_backoff(url, severe=status in {403, 429})
+        delay = _page_retry_delay(response)
         log(
-            f"{indent}HTTP {response.status_code} from {url}; "
+            f"{indent}HTTP {status} from {url}; "
             f"retrying after {delay:g}s"
         )
         time.sleep(delay)
@@ -1802,6 +1868,15 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     """Return HTML for *url* using the cache and indicate if it changed."""
     entry = page_cache.get(url)
     if entry and quick_scan:
+        timestamp = entry.get("timestamp")
+        if (
+            timestamp is not None
+            and entry.get("final_url")
+            and time.time() - timestamp <= PAGE_CACHE_FRESH_SECONDS
+        ):
+            log(f"{indent}Using fresh cached page: {url}")
+            return entry["html"], False
+
         headers = {}
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
@@ -1825,13 +1900,41 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
             if r.status_code == 200:
                 et = r.headers.get("ETag")
                 lm = r.headers.get("Last-Modified")
-                if (et and et == entry.get("etag")) or (lm and lm == entry.get("last_modified")):
+                validators = []
+                if et and entry.get("etag"):
+                    validators.append(et == entry.get("etag"))
+                if lm and entry.get("last_modified"):
+                    validators.append(lm == entry.get("last_modified"))
+                if validators and all(validators):
                     entry["timestamp"] = time.time()
                     log(f"{indent}Using cached page (headers match): {url}")
                     return entry["html"], False
-        except Exception:
+
+                refresh = _discovery_request(
+                    "get",
+                    url,
+                    timeout=20,
+                    log=log,
+                    indent=indent,
+                )
+                refresh.raise_for_status()
+                html = refresh.text
+                page_cache[url] = {
+                    "html": html,
+                    "html_hash": hashlib.sha1(html.encode("utf-8")).hexdigest(),
+                    "timestamp": time.time(),
+                    "etag": refresh.headers.get("ETag"),
+                    "last_modified": refresh.headers.get("Last-Modified"),
+                    "final_url": refresh.url,
+                }
+                if refresh.url != url:
+                    log(f"{indent}Refreshed: {url} -> {refresh.url}")
+                else:
+                    log(f"{indent}Refreshed: {url}")
+                return html, True
+        except requests.RequestException:
             pass
-        # No expiration check: always use cached page if above conditions aren't met
+        # Revalidation failures must not destroy a usable cached page.
         log(f"{indent}Using cached page: {url}")
         return entry["html"], False
 
@@ -1863,6 +1966,7 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     html = resp.text
     page_cache[url] = {
         "html": html,
+        "html_hash": hashlib.sha1(html.encode("utf-8")).hexdigest(),
         "timestamp": time.time(),
         "etag": resp.headers.get("ETag"),
         "last_modified": resp.headers.get("Last-Modified"),
@@ -1895,7 +1999,8 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
-IMAGE_EXTRACTOR_VERSION = 3
+TREE_CACHE_VERSION = 2
+IMAGE_EXTRACTOR_VERSION = 4
 DOWNLOAD_WORKERS = 4
 
 
@@ -2001,8 +2106,15 @@ def rate_limiter_for_url(url: str) -> SmartRateLimiter:
         return media_rate_limiter
     return image_rate_limiter
 
-def get_soup(url):
-    resp = session.get(url)
+def get_soup(url, log=lambda msg: None, referer=None):
+    headers = {"Referer": referer} if referer else None
+    resp = _discovery_request(
+        "get",
+        url,
+        headers=headers,
+        timeout=20,
+        log=log,
+    )
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
@@ -2031,11 +2143,98 @@ def get_downloaded_file_count(folder: str) -> int:
         count += len(glob.glob(os.path.join(folder, ext)))
     return count
 
+def _album_count_from_listing(anchor):
+    """Return the album count exposed beside a Coppermine album link, if any."""
+    def parse_stat(stat):
+        text = " ".join(stat.stripped_strings)
+        total_match = re.search(r"\b(\d+)\s+files?\s+total\b", text, re.I)
+        if total_match:
+            return int(total_match.group(1))
+        match = re.search(r"\b(\d+)\b", text)
+        return int(match.group(1)) if match else None
+
+    def album_stat_in(node):
+        if node is None:
+            return None
+        stat = node.find(
+            class_=lambda value: value
+            and "album_stat" in (
+                value if isinstance(value, list) else str(value).split()
+            )
+        )
+        return parse_stat(stat) if stat else None
+
+    cell = anchor.find_parent("td")
+    if cell is not None:
+        count = album_stat_in(cell)
+        if count is not None:
+            return count
+        for sibling in cell.find_next_siblings("td", limit=3):
+            # Stop before wandering into the next album cell.
+            other_album = sibling.find(
+                "a",
+                href=lambda value: value
+                and "thumbnails.php" in value
+                and "album=" in value,
+            )
+            stat = sibling.find(
+                class_=lambda value: value
+                and "album_stat" in (
+                    value if isinstance(value, list) else str(value).split()
+                )
+            )
+            if stat:
+                return parse_stat(stat)
+            if other_album:
+                break
+
+    # Responsive/custom themes often keep the link and album_stat in a shared
+    # div/li rather than the classic three-cell table layout. Only accept an
+    # ancestor when it contains exactly one album link to avoid cross-album
+    # count attribution on multi-column rows.
+    depth = 0
+    for parent in anchor.parents:
+        if getattr(parent, "name", None) not in {"div", "li", "article", "section"}:
+            continue
+        depth += 1
+        album_links = parent.find_all(
+            "a",
+            href=lambda value: value
+            and "thumbnails.php" in value
+            and "album=" in value,
+        )
+        if len(album_links) == 1:
+            count = album_stat_in(parent)
+            if count is not None:
+                return count
+        if depth >= 4:
+            break
+    return None
+
+
 def get_album_image_count(album_url, page_cache=None):
-    """Extract image count from album page (uses cache if present)."""
+    """Extract an album count tied to the current cached HTML version."""
     if page_cache is None:
         page_cache = {}
-    html, _ = fetch_html_cached(album_url, page_cache, log=lambda m: None, quick_scan=False)
+
+    html, _ = fetch_html_cached(
+        album_url,
+        page_cache,
+        log=lambda m: None,
+        quick_scan=True,
+    )
+    entry = page_cache.setdefault(album_url, {"html": html})
+    html_hash = entry.get("html_hash")
+    if not html_hash:
+        html_hash = hashlib.sha1(html.encode("utf-8")).hexdigest()
+        entry["html_hash"] = html_hash
+
+    if (
+        "image_count" in entry
+        and entry.get("image_count_html_hash") == html_hash
+    ):
+        return entry["image_count"]
+
     soup = BeautifulSoup(html, "html.parser")
     filecount = None
     info_div = soup.find(string=re.compile(r"files", re.I))
@@ -2045,6 +2244,9 @@ def get_album_image_count(album_url, page_cache=None):
             filecount = int(m.group(1))
     if not filecount:
         filecount = len(soup.find_all("a", href=re.compile(r"displayimage\.php")))
+
+    entry["image_count"] = filecount
+    entry["image_count_html_hash"] = html_hash
     return filecount
 
 SPECIALS = [
@@ -2121,59 +2323,199 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         )
         node["specials"].append({"type": "special", "name": label, "url": special_url})
 
-    subcats = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if "index.php?cat=" in href and not href.endswith(f"cat={cat_id}"):
-            name = a.text.strip()
-            if not name or name == cat_title:
+    # Aggregate all pagination pages belonging to this category before
+    # interpreting category/album links. Coppermine page selectors use the same
+    # index.php?cat=<id> URL with page=N; they are navigation, not subcategories.
+    page_contexts = [(root_url, link_base_url, soup)]
+    queued_pages = []
+    seen_page_urls = {root_url}
+    seen_page_numbers = set()
+    try:
+        root_query = parse_qs(urlparse(root_url).query)
+        root_page_raw = root_query.get("page", [None])[0]
+        if root_page_raw is not None and str(root_page_raw).isdigit():
+            seen_page_numbers.add(int(root_page_raw))
+        else:
+            # Coppermine normally treats the implicit category URL as page 1,
+            # but some installs expose page=0 and use the implicit URL for page 0.
+            implicit_page_zero = False
+            for root_link in soup.find_all("a", href=True):
+                candidate = urljoin(link_base_url, root_link.get("href") or "")
+                parsed = urlparse(candidate)
+                if not parsed.path.lower().endswith("index.php"):
+                    continue
+                query = parse_qs(parsed.query)
+                if (
+                    query.get("cat", [None])[0] == cat_id
+                    and query.get("page", [None])[0] == "0"
+                ):
+                    implicit_page_zero = True
+                    break
+            seen_page_numbers.add(0 if implicit_page_zero else 1)
+    except Exception:
+        seen_page_numbers.add(1)
+
+    def enqueue_pagination(page_soup, page_base):
+        for link in page_soup.find_all("a", href=True):
+            href = link.get("href") or ""
+            candidate = urljoin(page_base, href)
+            try:
+                parsed = urlparse(candidate)
+                if not parsed.path.lower().endswith("index.php"):
+                    continue
+                query = parse_qs(parsed.query)
+                linked_cat = query.get("cat", [None])[0]
+                page_num = query.get("page", [None])[0]
+                if linked_cat != cat_id or not (page_num and str(page_num).isdigit()):
+                    continue
+                page_i = int(page_num)
+                if page_i in seen_page_numbers:
+                    continue
+                query.pop("sort", None)
+                query.pop("sort_order", None)
+                candidate = urlunparse(
+                    parsed._replace(
+                        query=urlencode(sorted(query.items()), doseq=True),
+                        fragment="",
+                    )
+                )
+            except Exception:
                 continue
-            subcats.append((name, urljoin(link_base_url, href)))
+            if candidate not in seen_page_urls:
+                seen_page_urls.add(candidate)
+                seen_page_numbers.add(page_i)
+                queued_pages.append(candidate)
+
+    enqueue_pagination(soup, link_base_url)
+    while queued_pages:
+        pagination_url = queued_pages.pop(0)
+        try:
+            page_html, _ = fetch_html_cached(
+                pagination_url,
+                page_cache,
+                log=log,
+                quick_scan=quick_scan,
+                indent=indent + "  ",
+            )
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+            log(
+                f"{indent}   Skipping unavailable category page: "
+                f"{pagination_url} ({detail})"
+            )
+            continue
+        page_soup = BeautifulSoup(page_html, "html.parser")
+        effective_url = page_cache.get(pagination_url, {}).get("final_url") or pagination_url
+        page_base_tag = page_soup.find("base", href=True)
+        page_base = (
+            urljoin(effective_url, page_base_tag["href"])
+            if page_base_tag
+            else effective_url
+        )
+        page_contexts.append((pagination_url, page_base, page_soup))
+        enqueue_pagination(page_soup, page_base)
+
+    subcats = []
+    seen_subcat_ids = set()
+    for _, page_base, page_soup in page_contexts:
+        for a in page_soup.find_all("a", href=True):
+            href = a["href"]
+            subcat_url = urljoin(page_base, href)
+            try:
+                parsed = urlparse(subcat_url)
+                if not parsed.path.lower().endswith("index.php"):
+                    continue
+                query = parse_qs(parsed.query)
+                linked_cat = query.get("cat", [None])[0]
+                if not linked_cat or linked_cat == cat_id or linked_cat == parent_cat:
+                    continue
+                query.pop("page", None)
+                query.pop("sort", None)
+                query.pop("sort_order", None)
+                subcat_url = urlunparse(
+                    parsed._replace(
+                        query=urlencode(sorted(query.items()), doseq=True),
+                        fragment="",
+                    )
+                )
+            except Exception:
+                continue
+            name = a.text.strip()
+            if not name or name == cat_title or linked_cat in seen_subcat_ids:
+                continue
+            seen_subcat_ids.add(linked_cat)
+            subcats.append((name, subcat_url))
             log(f"{indent}   Found subcategory: {name}")
 
     albums = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if 'thumbnails.php?album=' in href:
+    seen_album_ids = set()
+    special_keys = {key for _, key in SPECIALS}
+    for _, page_base, page_soup in page_contexts:
+        for a in page_soup.find_all("a", href=True):
+            href = a["href"]
             name = a.text.strip()
-            m = re.search(r'album=([a-zA-Z0-9_]+)', href)
-            if not m or not name:
+            album_url = urljoin(page_base, href)
+            try:
+                parsed = urlparse(album_url)
+                if not parsed.path.lower().endswith("thumbnails.php"):
+                    continue
+                query = parse_qs(parsed.query)
+                album_id = query.get("album", [None])[0]
+            except Exception:
                 continue
-            album_id = m.group(1)
-            if album_id in [key for _, key in SPECIALS]:
+            if not album_id or not name or album_id in special_keys:
                 continue
-            album_url = urljoin(link_base_url, href)
-            if cat_id != album_id:
-                try:
-                    img_count = get_album_image_count(album_url, page_cache)
-                except requests.HTTPError as exc:
-                    status = getattr(getattr(exc, "response", None), "status_code", None)
-                    if status in {404, 410}:
-                        log(
-                            f"{indent}     Skipping unavailable album: {name} "
-                            f"({album_url}, HTTP {status})"
-                        )
-                        continue
-                    detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
-                    log(
-                        f"{indent}     Could not count album: {name} "
-                        f"({album_url}, {detail}); keeping it with unknown count"
+            if album_id in seen_album_ids:
+                continue
+            seen_album_ids.add(album_id)
+            try:
+                query.pop("page", None)
+                query.pop("sort", None)
+                query.pop("sort_order", None)
+                album_url = urlunparse(
+                    parsed._replace(
+                        query=urlencode(sorted(query.items()), doseq=True),
+                        fragment="",
                     )
-                    img_count = "?"
-                except requests.RequestException as exc:
+                )
+            except Exception:
+                pass
+            listing_count = _album_count_from_listing(a)
+            try:
+                img_count = (
+                    listing_count
+                    if listing_count is not None
+                    else get_album_image_count(album_url, page_cache)
+                )
+            except requests.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status in {404, 410}:
                     log(
-                        f"{indent}     Could not count album: {name} "
-                        f"({album_url}, {exc.__class__.__name__}); "
-                        "keeping it with unknown count"
+                        f"{indent}     Skipping unavailable album: {name} "
+                        f"({album_url}, HTTP {status})"
                     )
-                    img_count = "?"
-                albums.append({
-                    "type": "album",
-                    "name": name,
-                    "url": album_url,
-                    "image_count": img_count,
-                })
-                log(f"{indent}     Found album: {name} ({img_count} images)")
+                    continue
+                detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+                log(
+                    f"{indent}     Could not count album: {name} "
+                    f"({album_url}, {detail}); keeping it with unknown count"
+                )
+                img_count = "?"
+            except requests.RequestException as exc:
+                log(
+                    f"{indent}     Could not count album: {name} "
+                    f"({album_url}, {exc.__class__.__name__}); "
+                    "keeping it with unknown count"
+                )
+                img_count = "?"
+            albums.append({
+                "type": "album",
+                "name": name,
+                "url": album_url,
+                "image_count": img_count,
+            })
+            log(f"{indent}     Found album: {name} ({img_count} images)")
 
     child_hash = compute_child_hash(subcats, albums)
     if root_url in page_cache:
@@ -2246,7 +2588,11 @@ def load_page_cache(root_url):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         pages = data.get("pages", {})
-        tree = data.get("tree")
+        tree = (
+            data.get("tree")
+            if data.get("tree_v") == TREE_CACHE_VERSION
+            else None
+        )
         return pages, tree
     return {}, None
 
@@ -2261,6 +2607,7 @@ def save_page_cache(root_url, tree, pages):
             "timestamp": time.time(),
             "root_url": root_url,
             "gallery_title": gallery_title,
+            "tree_v": TREE_CACHE_VERSION,
             "tree": tree,
             "pages": pages,
         }, f, indent=2)
@@ -2356,10 +2703,11 @@ def discover_or_load_gallery_tree(
         save_page_cache(root_url, tree, pages)
     return tree
 
-def get_image_links_from_js(album_url):
+def get_image_links_from_js(album_url, html=None, log=lambda msg: None):
     """Extract image URLs from the fb_imagelist JavaScript variable."""
-    soup = get_soup(album_url)
-    html = str(soup)
+    if html is None:
+        soup = get_soup(album_url, log=log)
+        html = str(soup)
     js_var_pattern = re.compile(
         r'var\s+js_vars\s*=\s*(\{.*?"fb_imagelist".*?\});',
         re.DOTALL,
@@ -2447,10 +2795,17 @@ def get_base_for_relative_images(page_url):
     return page_url.rsplit('/', 1)[0] + '/'
 
 
-def _fetch_fullsize_image(full_url, log):
+def _fetch_fullsize_image(full_url, log, referer=None):
     """Retrieve <img src> from a fullsize link or return the URL if it's an image."""
     try:
-        resp = session.get(full_url)
+        headers = {"Referer": referer} if referer else None
+        resp = _discovery_request(
+            "get",
+            full_url,
+            headers=headers,
+            timeout=20,
+            log=log,
+        )
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "")
         if ctype.startswith("image") or ctype.startswith("video"):
@@ -2465,14 +2820,18 @@ def _fetch_fullsize_image(full_url, log):
     return []
 
 
-def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
+def extract_all_displayimage_candidates(
+    displayimage_url,
+    log=lambda msg: None,
+    referer=None,
+):
     """Return every plausible original image URL from a displayimage.php page.
 
     Parses fancybox links, <img> tags, onclick handlers and data-* attributes
     to gather potential full-size image URLs.
     """
     try:
-        soup = get_soup(displayimage_url)
+        soup = get_soup(displayimage_url, log=log, referer=referer)
     except Exception as e:
         log(f"[DEBUG] Failed to load {displayimage_url}: {e}")
         return []
@@ -2492,7 +2851,7 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
                 fullsize_links.append(urljoin(base, m.group(1)))
     fullsize_links = list(dict.fromkeys(fullsize_links))
     for fl in fullsize_links:
-        candidates.extend(_fetch_fullsize_image(fl, log))
+        candidates.extend(_fetch_fullsize_image(fl, log, referer=displayimage_url))
 
     # 1. <a class="fancybox" href="...">
     for a in soup.find_all("a", href=True):
@@ -2554,8 +2913,15 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
     expanded = []
     for c in unique_candidates:
         expanded.extend(coppermine_url_variants(c))
-    # drop obvious theme sprites early; album-level filter is a second guard
-    expanded = [u for u in expanded if "/themes/" not in u]
+    # Drop UI chrome before ranking; album-level filtering remains a second guard.
+    expanded = [
+        u
+        for u in expanded
+        if not is_ui_image(
+            u,
+            os.path.basename(u.split("?", 1)[0]),
+        )
+    ]
     unique_candidates = list(dict.fromkeys(expanded))
 
     def score(url):
@@ -2571,6 +2937,33 @@ def extract_all_displayimage_candidates(displayimage_url, log=lambda msg: None):
 
     log(f"[DEBUG] Candidates from {displayimage_url}: {unique_candidates}")
     return unique_candidates
+
+
+def _encode_candidate_metadata(url, referer=None, display_url=None):
+    """Store downloader-only metadata in a URL fragment that is never requested."""
+    base = url.split("#", 1)[0]
+    metadata = []
+    if display_url:
+        metadata.append(("__display__", display_url))
+    if referer:
+        metadata.append(("__ref__", referer))
+    return f"{base}#{urlencode(metadata)}" if metadata else base
+
+
+def _decode_candidate_metadata(value, default_referer=None):
+    """Return (url, referer, lazy display page) from an encoded candidate."""
+    if isinstance(value, tuple):
+        url = value[0]
+        referer = value[1] if len(value) > 1 else default_referer
+        return url, (referer or default_referer), None
+    if not isinstance(value, str) or "#" not in value:
+        return value, default_referer, None
+
+    base, fragment = value.split("#", 1)
+    metadata = parse_qs(fragment, keep_blank_values=True)
+    referer = metadata.get("__ref__", [default_referer])[0] or default_referer
+    display_url = metadata.get("__display__", [None])[0] or None
+    return base, referer, display_url
 
 
 def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True):
@@ -2604,7 +2997,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     unique_urls = set()
 
     # 1. Try JS fb_imagelist (if present, it's best)
-    js_links = get_image_links_from_js(album_url)
+    js_links = get_image_links_from_js(album_url, html=html, log=log)
     if js_links:
         log(f"Found {len(js_links)} images via fb_imagelist.")
         for idx, url in enumerate(js_links, 1):
@@ -2613,29 +3006,64 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
                 image_entries.append((f"Image {idx}", [url], album_url))
                 unique_urls.add(url)
 
-    # 2. Try all displayimage.php pages (these are "original" image pages)
+    # 2. Resolve displayimage links lazily when the thumbnail URL already
+    # exposes the standard Coppermine original path. This avoids opening one
+    # PHP detail page per image while preserving it as a fallback if the
+    # directly-derived original fails during download.
     display_links = []
+    display_total = 0
+    lazy_display_count = 0
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # Coppermine installs vary:
-        #   - displayimage.php?pos=-123
-        #   - displayimage.php?pid=123
-        #   - displayimage.php?album=..&pid=..
-        if "displayimage.php" in href:
-            durl = urljoin(album_url, href)
-            # drop fragments; they explode dedupe and don't affect content
-            try:
-                pu = urlparse(durl)
-                durl = urlunparse(pu._replace(fragment=""))
-            except Exception:
-                pass
-            display_links.append(durl)
-    display_links = list(dict.fromkeys(display_links))  # dedupe
-    if display_links:
-        log(f"[DEBUG] Found {len(display_links)} displayimage links")
+        if "displayimage.php" not in href:
+            continue
+        display_total += 1
+        durl = urljoin(album_url, href)
+        try:
+            pu = urlparse(durl)
+            durl = urlunparse(pu._replace(fragment=""))
+        except Exception:
+            pass
+
+        thumb = a.find("img", src=True)
+        if thumb is not None:
+            thumb_url = urljoin(album_url, thumb.get("src") or "")
+            thumb_name = os.path.basename(thumb_url.split("?", 1)[0])
+            if thumb_url and not is_ui_image(thumb_url, thumb_name):
+                variants = coppermine_url_variants(thumb_url)
+                if variants and variants[0] != thumb_url:
+                    key_url = variants[0].split("#", 1)[0]
+                    if key_url not in unique_urls:
+                        lazy_variants = list(variants)
+                        lazy_variants[0] = _encode_candidate_metadata(
+                            lazy_variants[0],
+                            display_url=durl,
+                        )
+                        image_entries.append(
+                            ("Image (thumb->orig)", lazy_variants, album_url)
+                        )
+                        unique_urls.add(key_url)
+                    lazy_display_count += 1
+                    continue
+
+        display_links.append(durl)
+
+    display_links = list(dict.fromkeys(display_links))
+    if display_total:
+        if lazy_display_count:
+            log(
+                f"[DEBUG] Found {display_total} displayimage links; "
+                f"deferred {lazy_display_count} behind direct originals"
+            )
+        else:
+            log(f"[DEBUG] Found {display_total} displayimage links")
 
     for idx, dlink in enumerate(display_links, 1):
-        candidates = extract_all_displayimage_candidates(dlink, log)
+        candidates = extract_all_displayimage_candidates(
+            dlink,
+            log,
+            referer=album_url,
+        )
         good_candidates = [url for url in candidates if url not in unique_urls]
         if good_candidates:
             image_entries.append((f"Image (displayimage) {idx}", good_candidates, dlink))
@@ -2700,10 +3128,14 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         href = a["href"]
         if re.search(r"\.(jpe?g|png|webp|gif)(?:\?.*)?$", href, re.I):
             url = urljoin(album_url, href)
-            if url and url not in unique_urls:
-                log(f"[DEBUG] a tag -> {url}")
-                image_entries.append((f"Image (a tag)", [url], album_url))
-                unique_urls.add(url)
+            if not url or url in unique_urls:
+                continue
+            fname = os.path.basename(url.split("?", 1)[0])
+            if is_ui_image(url, fname):
+                continue
+            log(f"[DEBUG] a tag -> {url}")
+            image_entries.append((f"Image (a tag)", [url], album_url))
+            unique_urls.add(url)
 
     # 6. Pagination support (recurse only true page navigation; ignore sort links)
     pagelinks = set()
@@ -2842,16 +3274,25 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     # Build one entry per canonical file. Originals first, fall back to lower-res if needed.
     consolidated = []
     for k, items in grouped.items():
-        # de-dup exact URLs, keep highest rank first
+        # De-dup the actual resource URL while preserving downloader metadata.
         seen = set()
         items_sorted = sorted(items, key=lambda t: t[2], reverse=True)
         ordered_urls, ref, name = [], None, None
         for u, rref, _, tname in items_sorted:
-            if u in seen:
+            clean_url, encoded_ref, display_url = _decode_candidate_metadata(
+                u,
+                rref or album_url,
+            )
+            if clean_url in seen:
                 continue
-            seen.add(u)
-            # keep per-URL referer; downloader will extract it
-            ordered_urls.append(f"{u}#__ref__={quote((rref or album_url) or '', safe='')}")
+            seen.add(clean_url)
+            ordered_urls.append(
+                _encode_candidate_metadata(
+                    clean_url,
+                    referer=encoded_ref or rref or album_url,
+                    display_url=display_url,
+                )
+            )
             ref = ref or rref
             name = name or tname
         consolidated.append((name or "Image", ordered_urls, ref or album_url))
@@ -2865,9 +3306,6 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         fname = os.path.basename(main_url_clean.split("?", 1)[0])
         if is_ui_image(main_url_clean, fname):
             log(f"Skipping UI/icon image: {fname}")
-            continue
-        if is_probably_thumbnail(main_url_clean):
-            log(f"Skipping small image (likely icon): {main_url_clean}")
             continue
         filtered_entries.append((name, candidates, referer))
 
@@ -2909,22 +3347,13 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         require a valid Referer to allow direct image downloads.
     """
 
-    # Per-URL referer support: URL may be "http...jpg#__ref__=<encoded referer>"
-    def _url_and_ref(u, default_ref):
-        if isinstance(u, tuple):
-            # backward compatibility if callers pass (url, ref)
-            url, r = u[0], (u[1] or default_ref)
-            return url, r
-        if isinstance(u, str) and "#__ref__=" in u:
-            base, frag = u.split("#__ref__=", 1)
-            try:
-                r = unquote(frag)
-            except Exception:
-                r = default_ref
-            return base, (r or default_ref)
-        return u, default_ref
-
-    _paired = [_url_and_ref(u, referer) for u in candidate_urls]
+    # Candidate fragments can carry a per-URL referer and a lazy
+    # displayimage.php fallback. Fragments are stripped before HTTP requests.
+    _paired = [
+        _decode_candidate_metadata(candidate, referer)
+        for candidate in list(candidate_urls)
+    ]
+    _resolved_display_cache = {}
 
     def _filename_from_headers(default_name: str, headers: dict, content_type: str, filename_hint: str = None) -> str:
         """Best-effort filename inference for endpoints like download.php."""
@@ -2974,7 +3403,16 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         return stem + suffix
 
     for block_attempt in range(1, max_attempts + 1):
-        for candidate, candidate_ref in _paired:
+        candidate_queue = list(_paired)
+        attempted_urls = set()
+        queue_index = 0
+        while queue_index < len(candidate_queue):
+            candidate, candidate_ref, display_url = candidate_queue[queue_index]
+            queue_index += 1
+            if candidate in attempted_urls:
+                continue
+            attempted_urls.add(candidate)
+
             # Use the URL path name as a default; some Coppermine endpoints are PHP
             # but still return images (we'll fix the extension after headers).
             parsed = urlparse(candidate)
@@ -3041,6 +3479,31 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 log(f"Error downloading {candidate}: {e}")
                 rlim = rate_limiter_for_url(candidate)
                 rlim.record_error()
+
+                if display_url:
+                    resolved = _resolved_display_cache.get(display_url)
+                    if resolved is None:
+                        resolved = extract_all_displayimage_candidates(
+                            display_url,
+                            log,
+                            referer=candidate_ref or referer,
+                        )
+                        if resolved:
+                            _resolved_display_cache[display_url] = resolved
+                    if resolved:
+                        fallback_pairs = []
+                        for resolved_url in resolved:
+                            clean_resolved, _, _ = _decode_candidate_metadata(
+                                resolved_url,
+                                display_url,
+                            )
+                            if clean_resolved in attempted_urls:
+                                continue
+                            fallback_pairs.append(
+                                (clean_resolved, display_url, None)
+                            )
+                        if fallback_pairs:
+                            candidate_queue[queue_index:queue_index] = fallback_pairs
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
             time.sleep(1.0)
@@ -3177,7 +3640,7 @@ def threaded_download_worker(download_queue, log, stop_flag):
 
         download_queue.task_done()
 
-def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=True, stop_flag=None):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
     log(
         "Will download {} album(s): {}".format(
@@ -3374,7 +3837,7 @@ class GalleryRipperApp(tb.Window):
         optionsf = ttk.Frame(control_frame)
         optionsf.pack(fill="x", pady=(4, 0))
 
-        self.mimic_var = tk.BooleanVar(value=True)
+        self.mimic_var = tk.BooleanVar(value=False)
         mimic_chk = ttk.Checkbutton(optionsf, text="Mimic human behavior", variable=self.mimic_var)
         mimic_chk.pack(side="left")
 
