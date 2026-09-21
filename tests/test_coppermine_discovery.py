@@ -444,6 +444,121 @@ class CoppermineDiscoveryTests(unittest.TestCase):
             referer="http://example.test/gallery/thumbnails.php?album=5",
         )
 
+    def test_album_pagination_does_not_refetch_page_one_alias(self):
+        album = "http://example.test/gallery/thumbnails.php?album=383"
+        page1 = album + "&page=1"
+        page2 = album + "&page=2"
+        pages = {
+            album: f"""
+                <html>
+                  <a href="displayimage.php?album=383&pid=1">
+                    <img src="albums/test/thumb_001.jpg">
+                  </a>
+                  <a href="{page1}">1</a>
+                  <a href="{page2}">2</a>
+                </html>
+            """,
+            page2: f"""
+                <html>
+                  <a href="displayimage.php?album=383&pid=2">
+                    <img src="albums/test/thumb_002.jpg">
+                  </a>
+                  <a href="{page1}">1</a>
+                  <a href="{page2}">2</a>
+                </html>
+            """,
+        }
+        fetched = []
+
+        def fake_fetch(url, page_cache, **_kwargs):
+            fetched.append(url)
+            if url == page1:
+                raise self._http_error(404, url)
+            html = pages[url]
+            page_cache[url] = {"html": html, "final_url": url}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            entries = gr.get_all_candidate_images_from_album(
+                album,
+                page_cache={},
+                quick_scan=False,
+            )
+
+        self.assertEqual(fetched, [album, page2])
+        self.assertNotIn(page1, fetched)
+        urls = [
+            candidate.split("#", 1)[0]
+            for _name, candidates, _ref in entries
+            for candidate in candidates
+        ]
+        self.assertTrue(any(url.endswith("/albums/test/001.jpg") for url in urls))
+        self.assertTrue(any(url.endswith("/albums/test/002.jpg") for url in urls))
+
+    def test_album_pagination_failure_does_not_abort_album(self):
+        album = "http://example.test/gallery/thumbnails.php?album=383"
+        page2 = album + "&page=2"
+        root_html = f"""
+            <html>
+              <a href="displayimage.php?album=383&pid=1">
+                <img src="albums/test/thumb_001.jpg">
+              </a>
+              <a href="{page2}">2</a>
+            </html>
+        """
+        logs = []
+
+        def fake_fetch(url, page_cache, **_kwargs):
+            if url == page2:
+                raise self._http_error(404, url)
+            page_cache[url] = {"html": root_html, "final_url": url}
+            return root_html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            entries = gr.get_all_candidate_images_from_album(
+                album,
+                log=logs.append,
+                page_cache={},
+                quick_scan=False,
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(
+            any("Skipping unavailable pagination page" in line for line in logs)
+        )
+
+    def test_batch_skips_unavailable_album_and_continues(self):
+        root = "http://example.test/gallery/index.php"
+        bad = "http://example.test/gallery/thumbnails.php?album=1"
+        good = "http://example.test/gallery/thumbnails.php?album=2"
+        logs = []
+        selected = [
+            ("Bad", bad, ["Bad"]),
+            ("Good", good, ["Good"]),
+        ]
+
+        def scrape(url, **_kwargs):
+            if url == bad:
+                raise self._http_error(404, url)
+            return []
+
+        with patch.object(gr, "select_adapter_for_url", return_value="coppermine"), patch.object(
+            gr, "load_page_cache", return_value=({}, None)
+        ), patch.object(
+            gr, "get_all_candidate_images_from_album", side_effect=scrape
+        ) as scraper:
+            gr.rip_galleries(
+                selected,
+                "out",
+                logs.append,
+                root,
+                quick_scan=False,
+            )
+
+        self.assertEqual(scraper.call_count, 2)
+        self.assertTrue(any("Skipping unavailable album: Bad" in line for line in logs))
+        self.assertTrue(any("No images to download." in line for line in logs))
+
     def test_category_pagination_is_aggregated_not_nested(self):
         root = "http://example.test/gallery/index.php?cat=14"
         page2 = "http://example.test/gallery/index.php?cat=14&page=2"
