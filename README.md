@@ -18,7 +18,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
 - Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
 - History dropdown — Quickly reopen recently scanned galleries from cache
-- “Mimic human behavior” — Adds random pauses between downloads to avoid hammering servers (toggle in the GUI)
+- Polite request pacing — Optional per-host pacing for discovery and downloads; atomic scheduling across workers, with adaptive cooldown after throttling
 - Windows double-click support — via `start_gallery_ripper.bat`
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
@@ -36,6 +36,24 @@ Use **Similar** on any card to run a new Yandex reverse-image search from that r
 The **Probe sizes** button sends HEAD requests for visible cards that do not expose file-size metadata in Yandex's page data, then updates file-size sorting for those cards.
 
 If Yandex redirects automated requests to a CAPTCHA page, Copperminer now treats that as a blocked search instead of a fake zero-result discovery. It retries alternate Yandex hosts by default. If you explicitly enable **Reuse Yandex browser cookies**, and `browser-cookie3` is installed, Copperminer can also make a best-effort retry with local Yandex cookies from Chrome, Edge, Firefox, Brave, Chromium, or Opera. If Yandex still blocks the request, open the logged request URL in your browser, solve the challenge, save the result page as HTML, then use **Yandex HTML** to import that saved page. The imported page uses the same parser, preview grid, sorting, and download pipeline.
+
+### Request pacing
+
+**Polite request pacing** is optional and is off by default. When enabled, Copperminer
+spaces outgoing gallery-discovery requests and downloads on a **per-host** basis,
+including IMDb GraphQL pagination. Requests to independent hosts are scheduled
+independently. Downloads retain baseline per-host spacing even when the option is off:
+0.35 seconds between image request starts and 4 seconds after video/GIF starts.
+With the option enabled, discovery and image requests use at least 0.7 seconds
+plus up to 0.3 seconds of jitter; video/GIF requests retain their higher minimum.
+Concurrent workers cannot reserve the same request-start slot. Redirected requests are paced at their destination hosts.
+
+HTTP 429 and transient server errors trigger an adaptive cooldown. Valid
+`Retry-After` values (seconds or HTTP dates) are respected. The scheduler does
+not change browser fingerprints, bypass authentication/CAPTCHAs, or guarantee
+that a site's scraping restrictions will allow automated access. Lower worker
+counts reduce concurrent transfers; pacing controls **request starts**, not how
+many transfers remain open. The toggle is captured when each discovery or download job starts, so concurrent jobs cannot alter one another's pacing mode.
 
 ### IMDb Usage
 
@@ -74,7 +92,7 @@ Filtered selections use a separate stable subfolder. IMDb's gallery API supplies
 
 ## Installation
 
-Download the versioned `Copperminer-v<version>.zip` from [Releases](https://github.com/xmarre/Copperminer/releases), or use a repository checkout. Extract the whole ZIP before launching; `gallery_ripper.py` and `imdb_gallery.py` must remain in the same folder.
+Download the versioned `Copperminer-v<version>.zip` from [Releases](https://github.com/xmarre/Copperminer/releases), or use a repository checkout. Extract the whole ZIP before launching; `gallery_ripper.py`, `imdb_gallery.py`, and `request_pacing.py` must remain in the same folder.
 
 1. Install Python 3.10 or newer. [Download here.](https://www.python.org/downloads/)
 2. Clone or download this repository.

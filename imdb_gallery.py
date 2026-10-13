@@ -126,7 +126,8 @@ def _request(session, query, variables, log, stop_flag=None):
         if stop_flag and stop_flag.is_set():
             raise IMDbError("IMDb discovery stopped by user.")
         try:
-            with session.post(API_URL, headers=HEADERS, json={"query": query, "variables": variables}, timeout=30) as response:
+            pacing_kwargs = {"_pacing_stop_event": stop_flag} if hasattr(session, "pacer") else {}
+            with session.post(API_URL, headers=HEADERS, json={"query": query, "variables": variables}, timeout=30, **pacing_kwargs) as response:
                 if response.status_code in {202, 401, 403}:
                     raise IMDbError(f"IMDb refused gallery access (HTTP {response.status_code}). Try again later; no partial gallery was saved.")
                 if response.status_code == 429 or 500 <= response.status_code < 600:
