@@ -13,10 +13,14 @@ import requests
 
 
 API_URL = "https://caching.graphql.imdb.com/"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_SECONDS = 300
 PAGE_SIZE = 100
-IMAGE_FIELDS = "id url width height caption { plainText }"
+IMAGE_FIELDS = (
+    "id url width height caption { plainText } "
+    "names(limit:null) { id nameText { text } } "
+    "titles(limit:null) { id titleText { text } releaseYear { year endYear } titleType { id text } }"
+)
 HEADERS = {
     "Accept": "application/graphql+json, application/json",
     "Origin": "https://www.imdb.com",
@@ -162,7 +166,104 @@ def _image(node):
         raise IMDbError("IMDb returned an invalid image record.")
     return {"id": node["id"], "url": original_image_url(node.get("url")),
             "caption": (node.get("caption") or {}).get("plainText") or node["id"],
-            "width": node.get("width"), "height": node.get("height")}
+            "width": node.get("width"), "height": node.get("height"),
+            "names": _tags(node.get("names"), "name"),
+            "titles": _tags(node.get("titles"), "title")}
+
+
+def _tags(values, kind):
+    """Normalize optional IMDb tags without making image availability depend on them."""
+    tags = {}
+    for value in values if isinstance(values, list) else []:
+        if not isinstance(value, dict):
+            continue
+        tag_id = value.get("id")
+        if not isinstance(tag_id, str) or not re.fullmatch(r"tt\d+" if kind == "title" else r"nm\d+", tag_id):
+            continue
+        text = value.get("titleText" if kind == "title" else "nameText")
+        text = text.get("text") if isinstance(text, dict) else None
+        tag = {"id": tag_id, "text": text if isinstance(text, str) and text else tag_id}
+        if kind == "title":
+            years = value.get("releaseYear") or {}
+            title_type = value.get("titleType") or {}
+            tag.update(year=years.get("year") if isinstance(years, dict) else None,
+                       end_year=years.get("endYear") if isinstance(years, dict) else None,
+                       title_type=title_type.get("text") if isinstance(title_type, dict) else None)
+        tags[tag_id] = tag
+    return list(tags.values())
+
+
+def _group_url(gallery_url, kind, tag_id):
+    """Identify a local tag subset without changing the parent gallery's filters."""
+    return gallery_url + "#" + urlencode({"imdb_group": f"{kind}:{tag_id}"})
+
+
+def _group_selection(url):
+    """Validate the downloader-only subset carried in a gallery URL fragment."""
+    fragment = parse_qs(urlparse(url).fragment, keep_blank_values=True)
+    if "imdb_group" not in fragment:
+        return None
+    values = fragment["imdb_group"]
+    match = re.fullmatch(r"(name|title):((?:nm|tt)\d+|untagged)", values[0]) if len(values) == 1 else None
+    if not match:
+        raise IMDbError("Invalid IMDb photo group selection.")
+    kind, tag_id = match.groups()
+    if tag_id != "untagged" and not tag_id.startswith("nm" if kind == "name" else "tt"):
+        raise IMDbError("IMDb photo group ID does not match its group type.")
+    return kind, tag_id
+
+
+def _group_images(images, kind, tag_id):
+    """Select matching records; one multi-tagged image may belong to several groups."""
+    key = "names" if kind == "name" else "titles"
+    if tag_id == "untagged":
+        return [image for image in images if not image.get(key)]
+    return [image for image in images if any(tag["id"] == tag_id for tag in image.get(key, []))]
+
+
+def _title_label(tag):
+    """Display year and title type while keeping same-name titles distinguishable."""
+    year = str(tag["year"]) if type(tag.get("year")) is int else "Year unknown"
+    if type(tag.get("end_year")) is int and tag["end_year"] != tag.get("year"):
+        year += f"–{tag['end_year']}"
+    title_type = f" — {tag['title_type']}" if tag.get("title_type") else ""
+    return f"{year} — {tag['text']}{title_type} ({tag['id']})"
+
+
+def _group_node(catalog, spec, path):
+    """Build counterpart tag albums from a complete parent catalog, including untagged records."""
+    kind = "title" if spec["kind"] == "name" else "name"
+    key = "titles" if kind == "title" else "names"
+    heading = "By title" if kind == "title" else "By person"
+    tags = {}
+    counts = {}
+    untagged = set()
+    for image in catalog["images"]:
+        values = image.get(key, [])
+        if not values:
+            untagged.add(image["url"])
+        for tag in values:
+            tags.setdefault(tag["id"], tag)
+            counts.setdefault(tag["id"], set()).add(image["url"])
+    albums = []
+    if kind == "title":
+        ordered = sorted(tags.values(), key=lambda tag: (tag.get("year") if type(tag.get("year")) is int else 9999, tag["text"].casefold(), tag["id"]))
+    else:
+        ordered = sorted(tags.values(), key=lambda tag: (tag["text"].casefold(), tag["id"]))
+    for tag in ordered:
+        label = _title_label(tag) if kind == "title" else f"{tag['text']} ({tag['id']})"
+        albums.append({"type": "album", "name": label,
+                       "url": _group_url(spec["url"], kind, tag["id"]),
+                       "image_count": len(counts[tag["id"]]),
+                       "path": path + [heading, label], "adapter": "imdb"})
+    if untagged:
+        label = "No title tags" if kind == "title" else "No person tags"
+        albums.append({"type": "album", "name": label,
+                       "url": _group_url(spec["url"], kind, "untagged"),
+                       "image_count": len(untagged), "path": path + [heading, label],
+                       "adapter": "imdb"})
+    return {"type": "category", "name": heading, "url": spec["url"],
+            "children": [], "specials": [], "albums": albums, "adapter": "imdb"}
 
 
 def _query(kind):
@@ -269,18 +370,25 @@ def discover_tree(url, session, page_cache, log=lambda msg: None, quick_scan=Tru
                          "url": spec["viewer_url"], "image_count": 1,
                          "path": path + [f"Selected photo {image['id']}"],
                          "adapter": "imdb"})
-    return {"type": "category", "name": label, "url": url, "children": [],
+    groups = _group_node(catalog, spec, path)
+    log(f"IMDb: {len(groups['albums'])} photo group(s); All photos retains the complete gallery independently of tags.")
+    return {"type": "category", "name": label, "url": url, "children": [groups],
             "specials": [], "albums": albums, "adapter": "imdb"}
 
 
 def image_entries(url, session, page_cache, log=lambda msg: None, quick_scan=True, stop_flag=None):
     spec = parse_gallery_url(url)
+    selection = _group_selection(url)
     if spec["image_id"]:
+        if selection:
+            raise IMDbError("IMDb photo groups apply to galleries, not individual viewer photos.")
         images = [load_image(url, session, page_cache, log, quick_scan, stop_flag)]
         referer = spec["viewer_url"]
     else:
         images = load_gallery(url, session, page_cache, log, quick_scan, stop_flag)["images"]
         referer = spec["url"]
+        if selection:
+            images = _group_images(images, *selection)
     # Only original URLs are offered: a failed original must never silently
     # turn into a successful thumbnail download.
     unique = {}
