@@ -418,11 +418,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         )
         success = self._response(200, url=resolved, headers={"Content-Type": "image/jpeg"})
         success.iter_content = Mock(return_value=[b"abc"])
-        limiter = Mock()
-
         with tempfile.TemporaryDirectory() as output_dir, patch.object(
-            gr, "rate_limiter_for_url", return_value=limiter
-        ), patch.object(
             gr.session, "get", side_effect=[failed, success]
         ), patch.object(
             gr,

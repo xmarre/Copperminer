@@ -3,10 +3,12 @@ import threading
 import asyncio
 import requests
 import imdb_gallery
+from request_pacing import PacedSession, PacingCancelled, retry_after_seconds
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
 import posixpath as ppath
 import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, IntVar
 try:
@@ -28,7 +30,6 @@ except Exception:  # Pillow is optional at import time; thumbnails degrade to te
     ImageTk = None
 import json
 import time
-import random
 import hashlib
 import subprocess
 import sys
@@ -37,7 +38,6 @@ import queue
 import base64
 import io
 import tempfile
-from collections import deque
 
 SETTINGS_FILE = "settings.json"
 
@@ -2000,7 +2000,7 @@ DEFAULT_USER_AGENT = (
     "Chrome/138.0.0.0 Safari/537.36"
 )
 
-session = requests.Session()
+session = PacedSession()
 session.headers.update({'User-Agent': DEFAULT_USER_AGENT})
 session.headers.update({
     "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
@@ -2015,107 +2015,10 @@ IMAGE_EXTRACTOR_VERSION = 4
 DOWNLOAD_WORKERS = 4
 
 
-class SmartRateLimiter:
-    """Predictive backoff that adapts before hitting rate limits."""
-
-    def __init__(
-        self,
-        initial_delay=1.33,  # ~0.75 req/s as a safe starting point
-        min_delay=0.25,
-        max_delay=20.0,
-        ramp_window=60,
-        increase_factor=0.95,
-        backoff_factor=2.0,
-        allow_ramp=True,
-    ):
-        self.initial_delay = initial_delay
-        self.delay = initial_delay
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-        self.ramp_window = ramp_window
-        self.increase_factor = increase_factor
-        self.backoff_factor = backoff_factor
-        self.allow_ramp = allow_ramp
-
-        self.lock = threading.Lock()
-        self.last_request = 0.0
-        self.history = deque(maxlen=1000)  # (timestamp, status)
-        self.last_429 = 0.0
-        self.predicted_safe_delay = initial_delay
-
-    def wait(self):
-        with self.lock:
-            now = time.time()
-            wait_time = self.delay - (now - self.last_request)
-        if wait_time > 0:
-            time.sleep(wait_time)
-        with self.lock:
-            self.last_request = time.time()
-
-    def record_result(self, status_code, retry_after=None):
-        now = time.time()
-        with self.lock:
-            self.history.append((now, status_code))
-            if status_code == 429:
-                self.last_429 = now
-                self.delay = min(
-                    self.max_delay,
-                    max(self.delay * self.backoff_factor, self.initial_delay),
-                )
-                if retry_after:
-                    self.delay = max(self.delay, retry_after)
-                self.predicted_safe_delay = self.delay
-            else:
-                window_start = now - self.ramp_window
-                recent = [s for t, s in self.history if t >= window_start]
-                if (
-                    self.allow_ramp
-                    and len(recent) > 20
-                    and all(s != 429 for s in recent)
-                ):
-                    self.delay = max(self.min_delay, self.delay * self.increase_factor)
-                    self.predicted_safe_delay = self.delay
-                else:
-                    self.delay = max(self.delay, self.predicted_safe_delay)
-
-    def record_success(self):
-        self.record_result(200)
-
-    def record_error(self, retry_after=None, status_code=429):
-        self.record_result(status_code, retry_after=retry_after)
-
-    def reset(self):
-        with self.lock:
-            self.delay = self.initial_delay
-            self.history.clear()
-            self.last_429 = 0.0
-            self.predicted_safe_delay = self.initial_delay
-
-
+# The per-host pacer is attached to the shared session. All requests through
+# this session (including IMDb GraphQL pagination) use the same scheduler.
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
 MEDIA_EXTS = ('.webm', '.mp4', '.gif')
-
-# Separate limiters for images vs. videos/gifs. Images can be fetched
-# fairly quickly, but 4chan is much stricter with webm/mp4/gif files.
-image_rate_limiter = SmartRateLimiter(
-    initial_delay=0.35,  # ~3 req/s start
-    min_delay=0.20,
-    max_delay=3.0,
-    allow_ramp=True,
-)
-media_rate_limiter = SmartRateLimiter(
-    initial_delay=4.0,  # ~0.33 req/s start
-    min_delay=2.0,
-    max_delay=20.0,
-    allow_ramp=False,
-)
-
-def rate_limiter_for_url(url: str) -> SmartRateLimiter:
-    """Return the appropriate rate limiter based on file extension."""
-    ext = os.path.splitext(url.split("?")[0])[1].lower()
-    if ext in MEDIA_EXTS:
-        return media_rate_limiter
-    return image_rate_limiter
 
 def get_soup(url, log=lambda msg: None, referer=None):
     headers = {"Referer": referer} if referer else None
@@ -3366,7 +3269,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None,
-                             filename_hint=None):
+                             filename_hint=None, stop_flag=None):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -3475,14 +3378,15 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 if ref_to_use:
                     headers['Referer'] = ref_to_use
                 log(f"[DEBUG] Attempting download: {candidate} (Referer: {ref_to_use})")
-                rlim = rate_limiter_for_url(candidate)
-                rlim.wait()
-                r = session.get(candidate, headers=headers, stream=True, timeout=20)
+                r = session.get(
+                    candidate, headers=headers, stream=True, timeout=20,
+                    _pacing_kind="download", _pacing_stop_event=stop_flag,
+                )
                 if r.status_code == 429:
-                    retry = int(r.headers.get("Retry-After", "5"))
-                    log(f"Rate limited. Backing off for {retry}s...")
-                    rlim.record_error(retry_after=retry)
-                    time.sleep(retry)
+                    retry = retry_after_seconds(r.headers.get("Retry-After"))
+                    delay = min(30.0, max(1.0, 5.0 if retry is None else retry))
+                    log(f"Rate limited. Backing off for {delay:g}s...")
+                    time.sleep(delay)
                     continue
                 r.raise_for_status()
                 ctype = r.headers.get("Content-Type", "")
@@ -3526,13 +3430,11 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     album_stats['total_bytes'] += total_bytes
                     album_stats['total_time'] += elapsed
                     album_stats['downloaded'] += 1
-                rlim.record_success()
                 return True
+            except PacingCancelled:
+                return False
             except Exception as e:
                 log(f"Error downloading {candidate}: {e}")
-                rlim = rate_limiter_for_url(candidate)
-                rlim.record_error()
-
                 if display_url:
                     resolved = _resolved_display_cache.get(display_url)
                     if resolved is None:
@@ -3576,54 +3478,49 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 
 
 def download_4chan_image_oldschool(
-    url,
-    output_dir,
-    log,
-    fname=None,
-    index=None,
-    total=None,
-    album_stats=None,
-    max_attempts=3,
+    url, output_dir, log, fname=None, index=None, total=None,
+    album_stats=None, max_attempts=3, stop_flag=None,
 ):
-    """Download a single 4chan image using urllib like older versions."""
+    """Download 4chan media through urllib, sharing the normal per-host pacer."""
     if fname is None:
-        fname = os.path.basename(url)
+        fname = os.path.basename(urlparse(url).path)
     fpath = os.path.join(output_dir, fname)
     if os.path.exists(fpath):
         log(f"Already downloaded: {fname}")
         return False
 
+    kind = "video" if os.path.splitext(urlparse(url).path)[1].lower() in MEDIA_EXTS else "download"
     for attempt in range(1, max_attempts + 1):
+        partial_path = None
+        if stop_flag is not None and stop_flag.is_set():
+            return False
         try:
             req = urllib.request.Request(
                 url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    )
-                },
+                headers={"User-Agent": DEFAULT_USER_AGENT},
             )
-            rlim = rate_limiter_for_url(fname)
-            rlim.wait()
+            session.pacer.wait(url, kind=kind, stop_event=stop_flag)
             start_time = time.time()
-            with urllib.request.urlopen(req, timeout=60) as resp, open(fpath, "wb") as out:
-                if resp.status == 429:
-                    retry = int(resp.headers.get("Retry-After", "5"))
-                    log(
-                        f"Rate limited. Backing off for {retry}s... (attempt {attempt}/{max_attempts})"
-                    )
-                    rlim.record_error(retry_after=retry)
-                    time.sleep(retry)
-                    continue
-                total_bytes = 0
-                while True:
-                    chunk = resp.read(1024 * 16)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    total_bytes += len(chunk)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                session.pacer.record_response(url, resp.status, resp.headers)
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=output_dir, prefix=".copperminer-",
+                    suffix=".part", delete=False,
+                ) as out:
+                    partial_path = out.name
+                    total_bytes = 0
+                    while True:
+                        if stop_flag is not None and stop_flag.is_set():
+                            return False
+                        chunk = resp.read(1024 * 16)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        total_bytes += len(chunk)
+            if total_bytes == 0:
+                raise IOError("Media response contained no bytes")
+            os.replace(partial_path, fpath)
+            partial_path = None
             elapsed = time.time() - start_time
             speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
             size_str = (
@@ -3636,73 +3533,70 @@ def download_4chan_image_oldschool(
                 album_stats['total_bytes'] += total_bytes
                 album_stats['total_time'] += elapsed
                 album_stats['downloaded'] += 1
-            rlim.record_success()
             return True
-        except Exception as e:
-            log(f"Error downloading {url}: {e}")
-            rlim = rate_limiter_for_url(fname)
-            rlim.record_error()
-            if attempt < max_attempts:
-                log(f"Retrying {url} (attempt {attempt + 1}/{max_attempts})")
+        except urllib.error.HTTPError as exc:
+            session.pacer.record_response(url, exc.code, exc.headers)
+            log(f"HTTP {exc.code} downloading {url} (attempt {attempt}/{max_attempts})")
+            if exc.code != 429 and attempt < max_attempts:
                 time.sleep(1.0)
+        except Exception as exc:
+            log(f"Error downloading {url}: {exc}")
+            if attempt < max_attempts:
+                time.sleep(1.0)
+        finally:
+            if partial_path is not None:
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    pass
     if album_stats is not None:
         album_stats['errors'] += 1
     return False
 
 
 def threaded_download_worker(download_queue, log, stop_flag):
-    """Worker thread that downloads images from a queue."""
+    """Drain queued downloads, even when cancellation or a worker error occurs."""
     while True:
         try:
             args = download_queue.get_nowait()
         except queue.Empty:
-            break
-        if stop_flag and stop_flag.is_set():
+            return
+
+        try:
+            if stop_flag is not None and stop_flag.is_set():
+                continue
+            (
+                idx, album_name, outdir, candidate_urls, referer,
+                filename_hint, total_images, stats,
+            ) = args
+            if stats['downloaded'] > 0:
+                avg_time = stats['total_time'] / stats['downloaded']
+                eta = avg_time * (total_images - idx + 1)
+                eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
+            else:
+                eta_str = ""
+
+            log(f"File {idx} of {total_images}{eta_str}... [{album_name}]")
+            os.makedirs(outdir, exist_ok=True)
+            download_image_candidates(
+                candidate_urls, outdir, log, index=idx,
+                total=total_images, album_stats=stats,
+                referer=referer, filename_hint=filename_hint,
+                stop_flag=stop_flag,
+            )
+        except Exception as exc:
+            log(f"Unexpected download worker error: {exc}")
+            # The downloader accounts for ordinary download failures itself.
+            if len(args) == 8:
+                args[-1]['errors'] += 1
+        finally:
             download_queue.task_done()
-            break
-        (
-            idx,
-            album_name,
-            outdir,
-            candidate_urls,
-            referer,
-            filename_hint,
-            total_images,
-            mimic_human,
-            stats,
-        ) = args
 
-        if stats['downloaded'] > 0:
-            avg_time = stats['total_time'] / stats['downloaded']
-            eta = avg_time * (total_images - idx + 1)
-            eta_str = f" (ETA {int(eta)//60}:{int(eta)%60:02d})"
-        else:
-            eta_str = ""
 
-        log(f"File {idx} of {total_images}{eta_str}... [{album_name}]")
-        os.makedirs(outdir, exist_ok=True)
-
-        was_downloaded = download_image_candidates(
-            candidate_urls,
-            outdir,
-            log,
-            index=idx,
-            total=total_images,
-            album_stats=stats,
-            referer=referer,
-            filename_hint=filename_hint,
-        )
-
-        if was_downloaded and mimic_human:
-            time.sleep(random.uniform(0.7, 2.5))
-            if idx % random.randint(18, 28) == 0:
-                log("...taking a longer break to mimic human behavior...")
-                time.sleep(random.uniform(5, 8))
-
-        download_queue.task_done()
-
-def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None):
     """Download all images from the selected albums with batch-wide progress (tries all candidates for each image)."""
+    workers = max(1, min(16, int(DOWNLOAD_WORKERS if workers is None else workers)))
+    session.pacer.set_polite(mimic_human)
     log(
         "Will download {} album(s): {}".format(
             len(selected_albums), ["/".join(a[2]) for a in selected_albums]
@@ -3739,7 +3633,7 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                 os.makedirs(outdir, exist_ok=True)
                 total_images = len(image_entries)
 
-                sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
+                sem = asyncio.Semaphore(workers)
 
                 async def worker(idx, fname, url):
                     if stop_flag and stop_flag.is_set():
@@ -3755,12 +3649,9 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                             idx,
                             total_images,
                             stats,
+                            3,
+                            stop_flag,
                         )
-                    if mimic_human:
-                        await asyncio.sleep(random.uniform(0.7, 2.5))
-                        if idx % random.randint(18, 28) == 0:
-                            log("...taking a longer break to mimic human behavior...")
-                            await asyncio.sleep(random.uniform(5, 8))
 
                 tasks = [
                     asyncio.create_task(worker(idx, fname, urls[0]))
@@ -3848,10 +3739,10 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
             output_root,
             *[sanitize_name(p) for p in album_path],
         )
-        q.put((idx, album_name, outdir, candidate_urls, referer, filename_hint, total_images, mimic_human, stats))
+        q.put((idx, album_name, outdir, candidate_urls, referer, filename_hint, total_images, stats))
 
     threads = []
-    for _ in range(DOWNLOAD_WORKERS):
+    for _ in range(workers):
         t = threading.Thread(target=threaded_download_worker, args=(q, log, stop_flag))
         t.daemon = True
         t.start()
@@ -3920,8 +3811,12 @@ class GalleryRipperApp(tb.Window):
         optionsf.pack(fill="x", pady=(4, 0))
 
         self.mimic_var = tk.BooleanVar(value=False)
-        mimic_chk = ttk.Checkbutton(optionsf, text="Mimic human behavior", variable=self.mimic_var)
+        mimic_chk = ttk.Checkbutton(optionsf, text="Polite request pacing", variable=self.mimic_var)
         mimic_chk.pack(side="left")
+        ToolTip(
+            mimic_chk,
+            text="Space requests per host, including gallery discovery. Does not bypass site restrictions.",
+        )
 
         self.show_specials_var = tk.BooleanVar(value=False)
         specials_chk = ttk.Checkbutton(optionsf, text="Show special galleries", variable=self.show_specials_var, command=self.refresh_tree)
@@ -3977,7 +3872,7 @@ class GalleryRipperApp(tb.Window):
         self.worker_slider.pack(side="left", padx=(5, 0))
         ToolTip(
             self.worker_slider,
-            text="Avoid using more than 4 workers on 4chan or other sites to prevent rate limits or bans.",
+            text="Maximum concurrent downloads. Host pacing is shared across workers.",
         )
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
@@ -4612,6 +4507,7 @@ class GalleryRipperApp(tb.Window):
         quick = self.quick_scan_var.get()
         reuse_browser_cookies = self.yandex_reuse_browser_cookies_var.get()
         self.discovery_stop_flag.clear()
+        session.pacer.set_polite(self.mimic_var.get())
         self.discovery_thread = threading.Thread(
             target=self.do_discover,
             args=(url, quick, reuse_browser_cookies),
@@ -4824,12 +4720,13 @@ class GalleryRipperApp(tb.Window):
         if not selected:
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
-        global DOWNLOAD_WORKERS
-        DOWNLOAD_WORKERS = self.download_workers_var.get()
-        self.log(f"Starting download of {len(selected)} albums with {DOWNLOAD_WORKERS} workers...")
+        workers = max(1, min(16, int(self.download_workers_var.get())))
+        polite = bool(self.mimic_var.get())
+        quick_scan = bool(self.quick_scan_var.get())
+        self.log(f"Starting download of {len(selected)} albums with {workers} workers...")
         self.download_thread = threading.Thread(
             target=self.download_worker,
-            args=(selected, output_dir, self.url_var.get().strip()),
+            args=(selected, output_dir, self.url_var.get().strip(), workers, polite, quick_scan),
             daemon=True,
         )
         self.download_thread.start()
@@ -4839,16 +4736,17 @@ class GalleryRipperApp(tb.Window):
         self.stop_flag.set()
         self.discovery_stop_flag.set()
 
-    def download_worker(self, selected, output_dir, root_url):
+    def download_worker(self, selected, output_dir, root_url, workers, polite, quick_scan):
         try:
             rip_galleries(
                 selected,
                 output_dir,
                 self.log,
                 root_url,
-                quick_scan=self.quick_scan_var.get(),
-                mimic_human=self.mimic_var.get(),
+                quick_scan=quick_scan,
+                mimic_human=polite,
                 stop_flag=self.stop_flag,
+                workers=workers,
             )
             self.log("All downloads finished or stopped!")
         except Exception as e:

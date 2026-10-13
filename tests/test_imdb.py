@@ -410,7 +410,7 @@ class IMDbIntegrationTests(unittest.TestCase):
         download = response(headers={"Content-Type": "image/jpeg"})
         download.iter_content.return_value = [b"original bytes"]
         logs = []
-        with tempfile.TemporaryDirectory() as folder, patch.object(gr, "load_page_cache", return_value=({}, None)), patch.object(gr, "save_page_cache"), patch.object(imdb, "image_entries", side_effect=entries) as scrape, patch.object(gr.session, "get", return_value=download) as get, patch.object(gr, "rate_limiter_for_url", return_value=Mock()):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gr, "load_page_cache", return_value=({}, None)), patch.object(gr, "save_page_cache"), patch.object(imdb, "image_entries", side_effect=entries) as scrape, patch.object(gr.session, "get", return_value=download) as get:
             gr.rip_galleries(selected, folder, logs.append, TITLE_URL)
             self.assertEqual(Path(folder, "First", "first._V1_.jpg").read_bytes(), b"original bytes")
             self.assertEqual(Path(folder, "Last", "last._V1_.jpg").read_bytes(), b"original bytes")
@@ -457,7 +457,7 @@ class IMDbIntegrationTests(unittest.TestCase):
         first.iter_content.side_effect = interrupted
         second = response(headers={"Content-Type": "image/jpeg"})
         second.iter_content.return_value = [b"complete"]
-        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", side_effect=[first, second]) as get, patch.object(gr, "rate_limiter_for_url", return_value=Mock()), patch.object(gr.time, "sleep"):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", side_effect=[first, second]) as get, patch.object(gr.time, "sleep"):
             self.assertTrue(gr.download_image_candidates([CDN + "asset._V1_.jpg"], folder, lambda msg: None, max_attempts=2))
             self.assertEqual(Path(folder, "asset._V1_.jpg").read_bytes(), b"complete")
             self.assertEqual(len(list(Path(folder).iterdir())), 1)
@@ -472,7 +472,7 @@ class IMDbIntegrationTests(unittest.TestCase):
 
         download = response(headers={"Content-Type": "image/jpeg"})
         download.iter_content.side_effect = interrupted
-        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", return_value=download), patch.object(gr, "rate_limiter_for_url", return_value=Mock()):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", return_value=download):
             self.assertFalse(gr.download_image_candidates([CDN + "asset._V1_.jpg"], folder, lambda msg: None, max_attempts=1))
             self.assertEqual(list(Path(folder).iterdir()), [])
         download.close.assert_called_once()
@@ -486,7 +486,7 @@ class IMDbIntegrationTests(unittest.TestCase):
     def test_empty_media_response_is_not_saved_as_an_original(self):
         download = response(headers={"Content-Type": "image/jpeg"})
         download.iter_content.return_value = []
-        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", return_value=download), patch.object(gr, "rate_limiter_for_url", return_value=Mock()):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gr.session, "get", return_value=download):
             self.assertFalse(gr.download_image_candidates([CDN + "asset._V1_.jpg"], folder, lambda msg: None, max_attempts=1))
             self.assertEqual(list(Path(folder).iterdir()), [])
 
@@ -508,7 +508,7 @@ class IMDbIntegrationTests(unittest.TestCase):
             download = response(status=200, headers={"Content-Type": "image/jpeg"})
             download.iter_content.return_value = [media]
             selected = [("All photos", TITLE_URL + "mediaindex/", ["IMDb", "Jurassic Park"])]
-            with patch.object(gr, "load_page_cache", return_value=({}, None)), patch.object(gr, "save_page_cache"), patch.object(gr.session, "post", return_value=response(page([photo], 1))), patch.object(gr.session, "get", return_value=download) as get, patch.object(gr.image_rate_limiter, "wait"), patch.object(gr, "get_all_candidate_images_from_album") as coppermine:
+            with patch.object(gr, "load_page_cache", return_value=({}, None)), patch.object(gr, "save_page_cache"), patch.object(gr.session, "post", return_value=response(page([photo], 1))), patch.object(gr.session, "get", return_value=download) as get, patch.object(gr, "get_all_candidate_images_from_album") as coppermine:
                 gr.rip_galleries(selected, folder, lambda msg: None, TITLE_URL)
             saved = Path(folder, "IMDb", "Jurassic Park", "asset._V1_.jpg")
             self.assertEqual(saved.read_bytes(), media)
