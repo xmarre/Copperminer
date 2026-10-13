@@ -2,6 +2,7 @@ import os
 import threading
 import asyncio
 import requests
+import imdb_gallery
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
 import posixpath as ppath
@@ -324,8 +325,10 @@ def select_universal_rules(url: str):
 
 
 def select_adapter_for_url(url: str) -> str:
-    """Return the adapter key for *url* ("universal", "coppermine", "4chan", or "yandex")."""
+    """Return the adapter key for a supported gallery URL."""
     url = url.strip()
+    if imdb_gallery.is_imdb_url(url):
+        return "imdb"
     if is_yandex_query_url(url):
         return "yandex"
     if url.lower().startswith("4chan"):
@@ -2657,6 +2660,7 @@ def discover_or_load_gallery_tree(
     quick_scan=True,
     force_refresh=False,
     yandex_reuse_browser_cookies=False,
+    stop_flag=None,
 ):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
@@ -2677,6 +2681,11 @@ def discover_or_load_gallery_tree(
             page_cache=pages,
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
+        )
+    elif site_type == "imdb":
+        tree = imdb_gallery.discover_tree(
+            root_url, session, pages, log=log, quick_scan=quick_scan,
+            stop_flag=stop_flag,
         )
     elif site_type == "yandex":
         tree = yandex_discover_tree(
@@ -3758,6 +3767,11 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                 )
             elif site_type == "yandex":
                 image_entries = yandex_result_image_entries(album_url, log=log)
+            elif site_type == "imdb":
+                image_entries = imdb_gallery.image_entries(
+                    album_url, session, pages, log=log, quick_scan=quick_scan,
+                    stop_flag=stop_flag,
+                )
             else:
                 image_entries = get_all_candidate_images_from_album(
                     album_url, log=log, page_cache=pages, quick_scan=quick_scan
@@ -3835,6 +3849,7 @@ class GalleryRipperApp(tb.Window):
         self.download_thread = None
         self.discovery_thread = None
         self.stop_flag = threading.Event()
+        self.discovery_stop_flag = threading.Event()
         self.history_stack = []
         self.forward_stack = []
 
@@ -4514,6 +4529,7 @@ class GalleryRipperApp(tb.Window):
         self.tree.delete(*self.tree.get_children())
         quick = self.quick_scan_var.get()
         reuse_browser_cookies = self.yandex_reuse_browser_cookies_var.get()
+        self.discovery_stop_flag.clear()
         self.discovery_thread = threading.Thread(
             target=self.do_discover,
             args=(url, quick, reuse_browser_cookies),
@@ -4530,6 +4546,7 @@ class GalleryRipperApp(tb.Window):
                 quick_scan=quick,
                 force_refresh=not quick,
                 yandex_reuse_browser_cookies=reuse_browser_cookies,
+                stop_flag=self.discovery_stop_flag,
             )
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
@@ -4738,6 +4755,7 @@ class GalleryRipperApp(tb.Window):
     def stop_download(self):
         self.log("Stop requested by user. Attempting to stop current operation...")
         self.stop_flag.set()
+        self.discovery_stop_flag.set()
 
     def download_worker(self, selected, output_dir, root_url):
         try:
