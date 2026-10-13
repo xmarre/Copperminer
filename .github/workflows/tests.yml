@@ -59,11 +59,24 @@ jobs:
             resume_draft=false
           fi
           archive="$RUNNER_TEMP/Copperminer-${tag}.zip"
+          notes="$RUNNER_TEMP/Copperminer-${tag}-notes.md"
+          awk -v version="$version" '
+            $1 == "##" {
+              if (printing) exit
+              if ($2 == version) printing = 1
+              next
+            }
+            printing { print }
+          ' CHANGELOG.md > "$notes"
+          if [[ ! -s "$notes" ]]; then
+            echo "CHANGELOG.md has no release notes for ${version}."
+            exit 1
+          fi
           git archive --format=zip --prefix="Copperminer-${tag}/" --output="$archive" "$GITHUB_SHA"
           if [[ "$resume_draft" == "true" ]]; then
             gh release upload "$tag" "$archive" --clobber
           else
-            gh release create "$tag" "$archive" --target "$GITHUB_SHA" --title "Copperminer ${tag}" --notes-file CHANGELOG.md --draft
+            gh release create "$tag" "$archive" --target "$GITHUB_SHA" --title "Copperminer ${tag}" --notes-file "$notes" --draft
           fi
           gh release edit "$tag" --draft=false --latest
           gh release view "$tag" --json url,isDraft,assets
