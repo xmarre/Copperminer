@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0 — 2026-10-13
+
+### Added
+
+- **Polite request pacing**: optional atomic per-host request-start spacing during gallery discovery and media downloads, including IMDb GraphQL and 4chan media.
+- Shared adaptive cooldown on HTTP 429 and transient 5xx responses, with support for numeric and HTTP-date `Retry-After`.
+- Redirected requests are paced at the destination host, not solely the initiating host.
+- Cancellation-aware waits, per-job download-worker configuration, and independent pacing options for simultaneous discovery and download jobs.
+
+### Fixed
+
+- Parallel workers can no longer reserve the same host request-start slot.
+- 4chan downloads now write temporary files and atomically finalize completed media.
+- Worker failures acknowledge queue entries to prevent stalled batches.
+
+### Limitations
+
+Pacing spaces request starts, not simultaneous in-flight transfers, and does not bypass access restrictions or CAPTCHAs. Optional polite pacing remains off by default; baseline media pacing stays active. Site-dependent anti-bot behavior and Windows GUI rendering require independent runtime verification.
+
 ## 0.2.0 — 2026-10-13
 
 ### Added
