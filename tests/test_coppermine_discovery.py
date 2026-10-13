@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import ANY, Mock, mock_open, patch
+import tempfile
+from pathlib import Path
+from unittest.mock import ANY, Mock, patch
 
 import requests
 
@@ -401,7 +403,6 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         self.assertTrue(candidates[0].split("#", 1)[0].endswith("/albums/test/001.jpg"))
 
     def test_lazy_display_page_resolves_only_after_direct_original_fails(self):
-        output_dir = "out"
         original = "http://example.test/gallery/albums/test/001.jpg"
         display = "http://example.test/gallery/displayimage.php?album=5&pid=7"
         resolved = "http://example.test/gallery/albums/test/full_001.jpg"
@@ -419,9 +420,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         success.iter_content = Mock(return_value=[b"abc"])
         limiter = Mock()
 
-        with patch.object(gr.os.path, "exists", return_value=False), patch(
-            "builtins.open", mock_open()
-        ), patch.object(
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
             gr, "rate_limiter_for_url", return_value=limiter
         ), patch.object(
             gr.session, "get", side_effect=[failed, success]
@@ -436,6 +435,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
                 log=lambda _msg: None,
                 max_attempts=1,
             )
+            self.assertEqual(Path(output_dir, "full_001.jpg").read_bytes(), b"abc")
 
         self.assertTrue(downloaded)
         resolve_detail.assert_called_once_with(
