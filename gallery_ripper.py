@@ -2,6 +2,7 @@ import os
 import threading
 import asyncio
 import requests
+import imdb_gallery
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
 import posixpath as ppath
@@ -35,6 +36,7 @@ import glob
 import queue
 import base64
 import io
+import tempfile
 from collections import deque
 
 SETTINGS_FILE = "settings.json"
@@ -83,6 +85,13 @@ def get_git_version():
         ).strip()
         return version
     except Exception:
+        try:
+            with open(os.path.join(repo_dir, "VERSION"), encoding="utf-8") as f:
+                version = f.read().strip()
+            if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+                return f"v{version}"
+        except OSError:
+            pass
         return "(unknown)"
 
 
@@ -324,8 +333,10 @@ def select_universal_rules(url: str):
 
 
 def select_adapter_for_url(url: str) -> str:
-    """Return the adapter key for *url* ("universal", "coppermine", "4chan", or "yandex")."""
+    """Return the adapter key for a supported gallery URL."""
     url = url.strip()
+    if imdb_gallery.is_imdb_url(url):
+        return "imdb"
     if is_yandex_query_url(url):
         return "yandex"
     if url.lower().startswith("4chan"):
@@ -2657,6 +2668,7 @@ def discover_or_load_gallery_tree(
     quick_scan=True,
     force_refresh=False,
     yandex_reuse_browser_cookies=False,
+    stop_flag=None,
 ):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
@@ -2677,6 +2689,11 @@ def discover_or_load_gallery_tree(
             page_cache=pages,
             quick_scan=quick_scan,
             cached_nodes=cached_nodes,
+        )
+    elif site_type == "imdb":
+        tree = imdb_gallery.discover_tree(
+            root_url, session, pages, log=log, quick_scan=quick_scan,
+            stop_flag=stop_flag,
         )
     elif site_type == "yandex":
         tree = yandex_discover_tree(
@@ -3450,6 +3467,8 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                 if os.path.exists(prechecked_path):
                     log(f"Already downloaded: {url_name}")
                     return False
+            r = None
+            partial_path = None
             try:
                 headers = {}
                 ref_to_use = candidate_ref or referer
@@ -3478,11 +3497,19 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     return False
                 total_bytes = 0
                 start_time = time.time()
-                with open(fpath, "wb") as f:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=output_dir, prefix=".copperminer-",
+                    suffix=".part", delete=False,
+                ) as f:
+                    partial_path = f.name
                     for chunk in r.iter_content(1024 * 16):
                         if chunk:
                             f.write(chunk)
                             total_bytes += len(chunk)
+                if total_bytes == 0:
+                    raise requests.RequestException("Media response contained no image/video bytes")
+                os.replace(partial_path, fpath)
+                partial_path = None
                 elapsed = time.time() - start_time
                 speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
                 size_str = (
@@ -3530,6 +3557,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                             )
                         if fallback_pairs:
                             candidate_queue[queue_index:queue_index] = fallback_pairs
+            finally:
+                if r is not None:
+                    r.close()
+                if partial_path is not None:
+                    try:
+                        os.remove(partial_path)
+                    except OSError:
+                        pass
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
             time.sleep(1.0)
@@ -3758,10 +3793,21 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
                 )
             elif site_type == "yandex":
                 image_entries = yandex_result_image_entries(album_url, log=log)
+            elif site_type == "imdb":
+                image_entries = imdb_gallery.image_entries(
+                    album_url, session, pages, log=log, quick_scan=quick_scan,
+                    stop_flag=stop_flag,
+                )
             else:
                 image_entries = get_all_candidate_images_from_album(
                     album_url, log=log, page_cache=pages, quick_scan=quick_scan
                 )
+        except imdb_gallery.IMDbError as exc:
+            if stop_flag and stop_flag.is_set():
+                log("Download stopped by user.")
+                return
+            log(f"  Skipping unavailable IMDb album: {album_name} ({album_url}, {exc})")
+            continue
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
@@ -3835,6 +3881,7 @@ class GalleryRipperApp(tb.Window):
         self.download_thread = None
         self.discovery_thread = None
         self.stop_flag = threading.Event()
+        self.discovery_stop_flag = threading.Event()
         self.history_stack = []
         self.forward_stack = []
 
@@ -3883,6 +3930,8 @@ class GalleryRipperApp(tb.Window):
         self.quick_scan_var = tk.BooleanVar(value=True)
         quick_chk = ttk.Checkbutton(optionsf, text="Quick scan", variable=self.quick_scan_var)
         quick_chk.pack(side="left", padx=(10, 0))
+
+        ttk.Button(optionsf, text="IMDb Filters…", command=self.configure_imdb_filters).pack(side="left", padx=(10, 0))
 
         self.yandex_reuse_browser_cookies_var = tk.BooleanVar(
             value=bool(settings.get("yandex_reuse_browser_cookies", False))
@@ -4019,6 +4068,51 @@ class GalleryRipperApp(tb.Window):
         if not is_yandex_query_url(url):
             self.url_var.set(YANDEX_QUERY_PREFIX + url)
         self.discover_albums()
+
+    def configure_imdb_filters(self):
+        try:
+            spec = imdb_gallery.parse_gallery_url(self.url_var.get().strip())
+        except imdb_gallery.IMDbError as exc:
+            messagebox.showwarning("IMDb filters", str(exc))
+            return
+        win = tk.Toplevel(self)
+        win.title("IMDb photo filters")
+        win.transient(self)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Comma-separated IMDb IDs. Filter groups are combined; leave a field empty to include all.", wraplength=580).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        fields = {}
+        for row, (key, label, constraint, field) in enumerate([
+            ("names", "People: any (nm…)", "nameConstraints", "anyNameIds"),
+            ("allNames", "People: all (nm…)", "nameConstraints", "allNameIds"),
+            ("titles", "Titles: any (tt…)", "titleConstraints", "anyTitleIds"),
+            ("allTitles", "Titles: all (tt…)", "titleConstraints", "allTitleIds"),
+            ("galleries", "Galleries: any (rg…)", "galleryConstraints", "anyGalleryIds"),
+            ("allGalleries", "Galleries: all (rg…)", "galleryConstraints", "allGalleryIds"),
+            ("types", "Types (still_frame, poster, event, publicity…)", None, None),
+        ], 1):
+            value = spec["filter"].get(constraint, {}).get(field, []) if constraint else spec["filter"].get("types", [])
+            variable = tk.StringVar(value=",".join(value))
+            fields[key] = variable
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            ttk.Entry(frame, textvariable=variable, width=45).grid(row=row, column=1, sticky="ew", pady=4)
+        frame.columnconfigure(1, weight=1)
+
+        def apply_filters():
+            params = {key: variable.get().strip() for key, variable in fields.items() if variable.get().strip()}
+            url = spec["url"].split("?", 1)[0]
+            if params:
+                url += "?" + urlencode(params)
+            try:
+                canonical = imdb_gallery.parse_gallery_url(url)["url"]
+            except imdb_gallery.IMDbError as exc:
+                messagebox.showerror("IMDb filters", str(exc), parent=win)
+                return
+            self.url_var.set(canonical)
+            win.destroy()
+            self.discover_albums()
+
+        ttk.Button(frame, text="Apply and Discover", command=apply_filters).grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
     def import_yandex_html(self):
         path = filedialog.askopenfilename(
@@ -4514,6 +4608,7 @@ class GalleryRipperApp(tb.Window):
         self.tree.delete(*self.tree.get_children())
         quick = self.quick_scan_var.get()
         reuse_browser_cookies = self.yandex_reuse_browser_cookies_var.get()
+        self.discovery_stop_flag.clear()
         self.discovery_thread = threading.Thread(
             target=self.do_discover,
             args=(url, quick, reuse_browser_cookies),
@@ -4530,6 +4625,7 @@ class GalleryRipperApp(tb.Window):
                 quick_scan=quick,
                 force_refresh=not quick,
                 yandex_reuse_browser_cookies=reuse_browser_cookies,
+                stop_flag=self.discovery_stop_flag,
             )
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
@@ -4738,6 +4834,7 @@ class GalleryRipperApp(tb.Window):
     def stop_download(self):
         self.log("Stop requested by user. Attempting to stop current operation...")
         self.stop_flag.set()
+        self.discovery_stop_flag.set()
 
     def download_worker(self, selected, output_dir, root_url):
         try:
