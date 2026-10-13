@@ -13,6 +13,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
 - 4chan support — Browse boards and threads to bulk download all attached media
+- IMDb support — Download complete title/person photo galleries, individual media viewer photos, and combined title/person/image-type selections at original resolution
 - Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, download the original/highest-resolution candidate URLs Yandex exposes, and import saved Yandex HTML when direct requests hit a CAPTCHA
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
 - Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
@@ -36,14 +37,38 @@ The **Probe sizes** button sends HEAD requests for visible cards that do not exp
 
 If Yandex redirects automated requests to a CAPTCHA page, Copperminer now treats that as a blocked search instead of a fake zero-result discovery. It retries alternate Yandex hosts by default. If you explicitly enable **Reuse Yandex browser cookies**, and `browser-cookie3` is installed, Copperminer can also make a best-effort retry with local Yandex cookies from Chrome, Edge, Firefox, Brave, Chromium, or Opera. If Yandex still blocks the request, open the logged request URL in your browser, solve the challenge, save the result page as HTML, then use **Yandex HTML** to import that saved page. The imported page uses the same parser, preview grid, sorting, and download pipeline.
 
+### IMDb Usage
+
+Paste an IMDb movie, series, episode, or person URL into **Gallery Root URL**, then click **Discover Galleries**. Select **All photos** and start the download. `/mediaindex/` gallery links work too. Discovery follows every cursor page and checks the number of unique image records against IMDb's total before offering the gallery for download. **Stop** cancels IMDb discovery between requests and during retry waits.
+
+A `/mediaviewer/rm…/` link offers both **Selected photo** and the complete gallery. Select the desired album; the selected photo has its own subfolder. Photos are stored under `IMDb/<title or person> (<IMDb ID>)/` using the original CDN filenames. Existing files are skipped on repeat downloads.
+
+Use **IMDb Filters…** to configure people, titles, gallery IDs, and image types in the GUI, then click **Apply and Discover**. Gallery URLs can also combine filters. Values within `names`, `titles`, or `types` match **any** listed value; different filter groups are combined. `allNames` and `allTitles` require **every** listed person or title. Comma-separated and repeated parameters are accepted. Legacy `refine` links are supported for person IDs, title IDs, and image types. `contentTypes` is an alias for `types`. `galleries` and `allGalleries` accept IMDb gallery IDs. Unsupported parameters produce an explicit error so the selection is never silently widened. Tracking parameters (`ref_`, `ref`) and numbered `page` parameters are ignored: downloads always traverse the full selected gallery.
+
+| Selection | Example URL |
+| --- | --- |
+| Movie gallery | `https://www.imdb.com/title/tt0107290/` |
+| Person gallery | `https://www.imdb.com/name/nm0000554/` |
+| Series gallery | `https://www.imdb.com/title/tt0944947/mediaindex/` |
+| One photo | `https://www.imdb.com/title/tt0107290/mediaviewer/rm1102560512/` |
+| Sam Neill in Jurassic Park, still frames | `https://www.imdb.com/title/tt0107290/mediaindex/?names=nm0000554&types=still_frame` |
+| Photos tagged with two people | `https://www.imdb.com/title/tt0107290/mediaindex/?allNames=nm0000554,nm0000156` |
+
+Filtered selections use a separate stable subfolder. IMDb's gallery API supplies original image URLs and dimensions. Copperminer removes CDN resize/crop/quality modifiers while preserving the asset ID and file format, and downloads the resulting bytes without re-encoding or upscaling. A failed original download is reported as a failure; it does not fall back to a thumbnail. Original resolution is limited by the source image uploaded to IMDb.
+
+**Quick scan** reuses a verified complete catalog for up to five minutes; turn it off for a fresh discovery. Blocked, restricted, malformed, changing, or incomplete gallery responses fail discovery instead of being presented as a complete gallery. This integration uses IMDb's web gallery API and requires no API key or extra dependency; access and schema availability can change.
+
 ## Limitations
 
-- Supports Coppermine, 4chan, Yandex Images text/reverse search, and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
+- Supports Coppermine, IMDb title/person photo galleries, 4chan, Yandex Images text/reverse search, and a small set of rule-based sites (initially ThePlace2 and LiveJournal photos): other galleries may fail
+- IMDb support downloads the images exposed by the selected public gallery. A series gallery does not recursively enumerate separate episode galleries, and a person's gallery does not recursively enumerate every film in their filmography. Use the corresponding title/episode URLs to download those galleries. IMDb may block or restrict API access; Copperminer reports that condition explicitly.
 - Yandex support depends on Yandex's public HTML and can be rate-limited or CAPTCHA-gated by Yandex. Copperminer detects CAPTCHA/block pages, retries with alternate hosts, supports explicit opt-in local browser cookie reuse, and supports saved-HTML import as a manual fallback. Some result file sizes are only available after probing.
 - No thumbnails or junk: heuristically skips thumbnails and UI icons to save only the original images
 - Not for commercial use: See license below
 
 ## Installation
+
+Download the versioned `Copperminer-v<version>.zip` from [Releases](https://github.com/xmarre/Copperminer/releases), or use a repository checkout. Extract the whole ZIP before launching; `gallery_ripper.py` and `imdb_gallery.py` must remain in the same folder.
 
 1. Install Python 3.10 or newer. [Download here.](https://www.python.org/downloads/)
 2. Clone or download this repository.
