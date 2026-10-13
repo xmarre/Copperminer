@@ -278,6 +278,116 @@ class IMDbPaginationTests(unittest.TestCase):
         self.assertEqual(tree["albums"][0]["image_count"], 1)
 
 
+class IMDbTreeTests(unittest.TestCase):
+    """Counterpart groups must preserve the full gallery and all overlapping tags."""
+
+    @staticmethod
+    def title(title_id, text, year=None, end_year=None, title_type="Movie"):
+        return {"id": title_id, "titleText": {"text": text},
+                "releaseYear": {"year": year, "endYear": end_year},
+                "titleType": {"text": title_type}}
+
+    @staticmethod
+    def person(name_id, text):
+        return {"id": name_id, "nameText": {"text": text}}
+
+    def tree(self, nodes, url=NAME_URL, cache=None):
+        session = Mock()
+        kind = "name" if "/name/" in url else "title"
+        session.post.return_value = response(page(nodes, len(nodes), kind=kind))
+        cache = {} if cache is None else cache
+        tree = imdb.discover_tree(url, session, cache)
+        return tree, session, cache
+
+    def test_actor_titles_have_years_and_all_tagged_and_untagged_photos_are_kept(self):
+        older = self.title("tt1", "Earlier", 1993)
+        newer = self.title("tt2", "Later", 2020)
+        nodes = [image("rm1", "one", titles=[newer]),
+                 image("rm2", "two", titles=[older]),
+                 image("rm3", "three", titles=[newer, older]),
+                 image("rm4", "four", titles=[]),
+                 image("rm5", "five", titles=None)]
+        tree, session, cache = self.tree(nodes)
+        self.assertEqual(tree["albums"][0]["name"], "All photos")
+        self.assertEqual(tree["albums"][0]["image_count"], 5)
+        groups = tree["children"][0]
+        self.assertEqual(groups["name"], "By title")
+        self.assertIn("1993 — Earlier", groups["albums"][0]["name"])
+        self.assertIn("2020 — Later", groups["albums"][1]["name"])
+        self.assertEqual([a["image_count"] for a in groups["albums"]], [2, 2, 2])
+        self.assertEqual(groups["albums"][-1]["name"], "No title tags")
+        whole = imdb.image_entries(tree["albums"][0]["url"], session, cache)
+        grouped = [imdb.image_entries(a["url"], session, cache) for a in groups["albums"]]
+        self.assertEqual({entry[1][0] for entry in whole}, {entry[1][0] for entries in grouped for entry in entries})
+        self.assertEqual(len(set(entry[1][0] for entry in grouped[0]) & set(entry[1][0] for entry in grouped[1])), 1)
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_movie_people_are_alphabetical_and_multi_person_images_overlap(self):
+        sam = self.person("nm1", "Sam")
+        ariana = self.person("nm2", "Ariana")
+        tree, session, cache = self.tree([
+            image("rm1", "one", names=[sam]),
+            image("rm2", "two", names=[sam, ariana]),
+            image("rm3", "three", names=[]),
+        ], TITLE_URL)
+        groups = tree["children"][0]
+        self.assertEqual(groups["name"], "By person")
+        self.assertEqual([a["name"] for a in groups["albums"]], ["Ariana (nm2)", "Sam (nm1)", "No person tags"])
+        self.assertEqual([a["image_count"] for a in groups["albums"]], [1, 2, 1])
+        self.assertEqual(len(imdb.image_entries(groups["albums"][1]["url"], session, cache)), 2)
+        self.assertEqual(len(imdb.image_entries(tree["albums"][0]["url"], session, cache)), 3)
+
+    def test_group_download_preserves_existing_any_all_filters(self):
+        url = NAME_URL + "?titles=tt1,tt2&allNames=nm2&types=still_frame"
+        tree, session, cache = self.tree([
+            image("rm1", "one", titles=[self.title("tt1", "Earlier", 1993)]),
+            image("rm2", "two", titles=[self.title("tt2", "Later", 2020)]),
+        ], url)
+        group = tree["children"][0]["albums"][0]
+        self.assertEqual(imdb.parse_gallery_url(group["url"])["filter"], imdb.parse_gallery_url(url)["filter"])
+        entries = imdb.image_entries(group["url"], session, cache)
+        self.assertEqual(entries[0][1], [CDN + "one._V1_.jpg"])
+        self.assertNotIn("#", entries[0][2])
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_absent_malformed_tags_and_unknown_years_do_not_drop_images(self):
+        tree, session, cache = self.tree([
+            image("rm1", "one", titles=[None, {"id": "bad"}]),
+            image("rm2", "two", titles=[{"id": "tt3"}]),
+            image("rm3", "three", titles=[self.title("tt4", "Series", 2011, 2019, "TV Series")]),
+        ])
+        albums = tree["children"][0]["albums"]
+        self.assertIn("2011–2019 — Series", albums[0]["name"])
+        self.assertIn("Year unknown", albums[1]["name"])
+        self.assertEqual(albums[-1]["name"], "No title tags")
+        self.assertEqual(len(imdb.image_entries(tree["albums"][0]["url"], session, cache)), 3)
+
+    def test_duplicate_tags_and_same_named_entities_remain_distinct(self):
+        first = self.title("tt1", "Same name", 1990)
+        second = self.title("tt2", "Same name", 1990)
+        tree, _, _ = self.tree([image(titles=[first, first, second])])
+        albums = tree["children"][0]["albums"]
+        self.assertEqual(len(albums), 2)
+        self.assertEqual([a["image_count"] for a in albums], [1, 1])
+        self.assertNotEqual(albums[0]["url"], albums[1]["url"])
+        self.assertNotEqual(albums[0]["path"], albums[1]["path"])
+
+    def test_old_catalog_cache_is_refetched_for_tag_metadata(self):
+        spec = imdb.parse_gallery_url(NAME_URL)
+        cache = {spec["url"]: {"imdb": {"version": 1, "timestamp": imdb.time.time(), "images": [], "label": "Sam"}}}
+        tree, session, cache = self.tree([image(titles=[self.title("tt1", "Movie", 1993)])], cache=cache)
+        self.assertEqual(session.post.call_count, 1)
+        self.assertEqual(cache[spec["url"]]["imdb"]["version"], imdb.CACHE_VERSION)
+        self.assertEqual(len(tree["children"][0]["albums"]), 1)
+
+    def test_invalid_group_selection_fails_before_fetching(self):
+        for suffix in ["name:tt1", "title:nm1", "title:bad", "title:tt1&imdb_group=title:tt2"]:
+            session = Mock()
+            with self.subTest(suffix=suffix), self.assertRaises(imdb.IMDbError):
+                imdb.image_entries(TITLE_URL + "#imdb_group=" + suffix, session, {})
+            session.post.assert_not_called()
+
+
 class IMDbIntegrationTests(unittest.TestCase):
     def test_source_zip_version_falls_back_to_packaged_version_file(self):
         """The release ZIP must display its version without a Git checkout."""
