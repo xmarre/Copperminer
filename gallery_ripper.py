@@ -4323,6 +4323,9 @@ class GalleryRipperApp(tb.Window):
         # Tree mode
         self._all_albums = None
         self.insert_tree_node("", tree_data, [])
+        if tree_data.get("adapter") == "imdb":
+            for root in self.tree.get_children(""):
+                self.tree.item(root, open=True)
         self.search_all_btn.pack(side="left", padx=5)
 
     def _select_album_by_url(self, album_url, selected=True):
