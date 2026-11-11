@@ -387,7 +387,7 @@ class ArchiveBrowserFallbackTests(unittest.TestCase):
         app.discover_albums.assert_called_once()
         self.assertIs(
             gr.GalleryRipperApp._archive_data_for_url(app, ARCHIVE_URL),
-            data,
+            app._archive_snapshot[1],
         )
         self.assertIsNone(
             gr.GalleryRipperApp._archive_data_for_url(
