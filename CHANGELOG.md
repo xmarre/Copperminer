@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 — 2026-11-11
+
+### Added
+
+- Paste an `archived.moe/<board>/thread/<id>` link to discover and recover original-media attachments from an expired 4chan thread.
+- Archived threads reuse the matching live 4chan download directory by board and thread ID, even when the archive's subject differs. Existing filenames are skipped; missing files are added without replacing them.
+- Retry archived original-media candidates, including linked external full-image sources and still-available 4chan CDN URLs. Treat unavailable originals and thumbnail/HTML responses as failures, not completed downloads.
+- Focused regression coverage for archive metadata, source routing, folder matching, duplicate filenames, fallback downloads, and unavailable originals.
+
+### Limitations
+
+- Archived.moe archives thumbnails for many attachments; their originals may no longer exist. Candidate counts do not guarantee recoverable bytes.
+- Archived.moe or linked hosts can impose Cloudflare challenges, access restrictions, or disappear. Browsing archived board indexes and live recovery automation are not included. Live compatibility and Windows GUI behavior still require real-world validation.
+
 ## 0.3.0 — 2026-10-13
 
 ### Added

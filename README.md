@@ -12,7 +12,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Download progress & log — See what’s happening at every step
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
-- 4chan support — Browse boards and threads to bulk download all attached media
+- 4chan support — Browse live boards/threads and recover original attachments from archived.moe thread URLs into the matching 4chan folders
 - IMDb support — Download complete title/person photo galleries, individual media viewer photos, and combined title/person/image-type selections at original resolution
 - Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, download the original/highest-resolution candidate URLs Yandex exposes, and import saved Yandex HTML when direct requests hit a CAPTCHA
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
@@ -23,9 +23,13 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
 
-### 4chan Usage
+### 4chan and archived.moe Usage
 
-Enter `4chan` by itself to browse all boards, or paste any 4chan board or thread URL. Double-click a board to open it. Use the **Back** button to walk back up the navigation stack. Threads show a checkmark when fully downloaded or `[+n]` for new files. After a download finishes, the tree refreshes to reflect the new status. Selecting a thread downloads all attached files (images, webms, mp4s) into a `4chan/<board>/<subject> (id)` folder structure.
+Enter `4chan` by itself to browse live boards, or paste a live 4chan board/thread URL. Double-click a board to open it; use **Back** to navigate. Threads show a checkmark when fully downloaded or `[+n]` for new files. Selecting a thread saves attached media (images, webms, mp4s) under `4chan/<board>/<sanitized subject> <thread ID>` (Copperminer removes parentheses when sanitizing folder names).
+
+To recover a thread that has disappeared from 4chan, paste an archived.moe **thread** link into **Gallery Root URL**, for example `https://archived.moe/b/thread/956262976/#956262976`. Click **Discover Galleries**, select the archived thread, then **Start Download**. Copperminer reads the archived FoolFuuka thread metadata and attempts every available original-media URL. If the matching `4chan/<board>/... (<thread id>)` folder already exists, new files go into that folder even if the archived subject differs. Existing files with matching original filenames are left untouched; if the thread has never been downloaded, Copperminer creates the normal 4chan folder.
+
+Archived.moe does **not** preserve every full-size original. Its metadata can contain thumbnails without a recoverable original, and some linked source URLs may return HTTP errors or anti-bot challenges. Copperminer does not use thumbnails as substitutes for originals, logs unavailable files, and does not bypass access restrictions. The reported count reflects attachments with at least one candidate original URL, not guaranteed successful downloads. Recovery is available for individual archived.moe thread URLs; archived board browsing/search is not supported.
 
 ### Yandex Images Usage
 
