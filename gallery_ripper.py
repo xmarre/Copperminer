@@ -3,6 +3,7 @@ import threading
 import asyncio
 import requests
 import imdb_gallery
+import archived_moe
 from request_pacing import PacedSession, PacingCancelled, retry_after_seconds
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
@@ -339,7 +340,7 @@ def select_adapter_for_url(url: str) -> str:
         return "imdb"
     if is_yandex_query_url(url):
         return "yandex"
-    if url.lower().startswith("4chan"):
+    if url.lower().startswith("4chan") or archived_moe.parse_thread_url(url):
         return "4chan"
     domain = urlparse(url).netloc.lower()
     if (
@@ -712,6 +713,9 @@ def normalize_fourchan_url(url: str) -> str:
     url = url.strip()
     if not url:
         return "4chan"
+    archived = archived_moe.parse_thread_url(url)
+    if archived:
+        return archived_moe.canonical_thread_url(*archived)
     if url.lower().startswith("4chan"):
         return url.rstrip("/")
     m = FOURCHAN_URL_RE.search(url)
@@ -774,6 +778,48 @@ def fourchan_thread_images(board, thread_id, log=lambda msg: None):
     return entries
 
 
+def archived_moe_thread_images(board, thread_id, log=lambda msg: None):
+    """Load archived OP/replies and their original-media candidates."""
+    api_url = archived_moe.thread_api_url(board, thread_id)
+    response = _discovery_request("get", api_url, timeout=25, log=log)
+    try:
+        response.raise_for_status()
+        subject, entries, unavailable = archived_moe.extract_thread(
+            response.json(), board, thread_id
+        )
+    finally:
+        response.close()
+    if unavailable:
+        log(
+            f"Archived /{board}/{thread_id}: {unavailable} attachment(s) "
+            "have no original-media location in the archive metadata."
+        )
+    return subject, entries
+
+
+def fourchan_output_directory(output_root, album_url, album_path):
+    """Reuse the one existing live-thread folder matching an archived thread ID."""
+    proposed = os.path.join(output_root, *[sanitize_name(p) for p in album_path])
+    archived = archived_moe.parse_thread_url(album_url)
+    if not archived:
+        return proposed
+    board, thread_id = archived
+    parent = os.path.join(output_root, "4chan", sanitize_name(board))
+    if not os.path.isdir(parent):
+        return proposed
+    # sanitize_name() strips parentheses from the album path created by
+    # existing Copperminer versions; also support hand-named '(id)' folders.
+    suffixes = (f" {thread_id}", f" ({thread_id})")
+    matches = [
+        name for name in os.listdir(parent)
+        if name.endswith(suffixes) and os.path.isdir(os.path.join(parent, name))
+    ]
+    # Avoid merging two user-maintained directories if the mapping is ambiguous.
+    if len(matches) == 1:
+        return os.path.join(parent, matches[0])
+    return proposed
+
+
 def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
     """Return a tree of boards and threads for 4chan."""
     canonical = normalize_fourchan_url(root_url)
@@ -802,17 +848,20 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
     if "/" in after_colon:
         board, thread_id = after_colon.split("/", 1)
         thread_id = thread_id.strip()
-        info = fourchan_thread_images(board, thread_id, log=log)
-        subject = f"Thread {thread_id}"
-        try:
-            data = fetch_json_simple(
-                f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
-            )
-            if data.get("posts"):
-                op = data["posts"][0]
-                subject = op.get("sub") or re.sub(r"<.*?>", "", op.get("com", ""))[:80] or subject
-        except Exception:
-            pass
+        if archived_moe.parse_thread_url(canonical):
+            subject, info = archived_moe_thread_images(board, thread_id, log=log)
+        else:
+            info = fourchan_thread_images(board, thread_id, log=log)
+            subject = f"Thread {thread_id}"
+            try:
+                data = fetch_json_simple(
+                    f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
+                )
+                if data.get("posts"):
+                    op = data["posts"][0]
+                    subject = op.get("sub") or re.sub(r"<.*?>", "", op.get("com", ""))[:80] or subject
+            except Exception:
+                pass
         safe_subj = sanitize_folder_name(subject.strip()) or thread_id
         node = {
             "type": "category",
@@ -3480,6 +3529,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 def download_4chan_image_oldschool(
     url, output_dir, log, fname=None, index=None, total=None,
     album_stats=None, max_attempts=3, stop_flag=None, polite=None,
+    require_original=False, expected=None,
 ):
     """Download 4chan media through urllib, sharing the normal per-host pacer."""
     if fname is None:
@@ -3503,23 +3553,69 @@ def download_4chan_image_oldschool(
             start_time = time.time()
             with urllib.request.urlopen(req, timeout=60) as resp:
                 session.pacer.record_response(url, resp.status, resp.headers)
+                if require_original:
+                    content_type = (
+                        (resp.headers.get("Content-Type", "") or "")
+                        .split(";", 1)[0].strip().lower()
+                    )
+                    permitted = (
+                        content_type.startswith(("image/", "video/"))
+                        or content_type in {
+                            "application/octet-stream", "application/pdf",
+                            "application/x-shockwave-flash",
+                        }
+                    )
+                    if content_type and not permitted:
+                        raise IOError(
+                            f"Original media unavailable (Content-Type: {content_type})"
+                        )
+                    final_url = resp.geturl()
+                    if isinstance(final_url, str) and any(
+                        part in {"thumb", "thumbnail", "preview"}
+                        for part in urlparse(final_url).path.lower().split("/")
+                    ):
+                        raise IOError("Archive redirected original media to a thumbnail")
                 with tempfile.NamedTemporaryFile(
                     mode="wb", dir=output_dir, prefix=".copperminer-",
                     suffix=".part", delete=False,
                 ) as out:
                     partial_path = out.name
                     total_bytes = 0
+                    digest = hashlib.md5() if require_original and expected and "md5" in expected else None
                     while True:
                         if stop_flag is not None and stop_flag.is_set():
                             return False
                         chunk = resp.read(1024 * 16)
                         if not chunk:
                             break
+                        if require_original and not total_bytes and chunk.lstrip()[:32].lower().startswith(
+                            (b"<html", b"<!doctype html", b'{"error"')
+                        ):
+                            raise IOError("Original media URL returned an HTML/JSON error")
                         out.write(chunk)
                         total_bytes += len(chunk)
+                        if digest is not None:
+                            digest.update(chunk)
             if total_bytes == 0:
                 raise IOError("Media response contained no bytes")
-            os.replace(partial_path, fpath)
+            if require_original and expected:
+                expected_size = expected.get("size")
+                if expected_size is not None and total_bytes != expected_size:
+                    raise IOError(
+                        f"Original media size mismatch: {total_bytes} != {expected_size}"
+                    )
+                if digest is not None and digest.digest() != expected["md5"]:
+                    raise IOError("Original media MD5 does not match archive metadata")
+            if require_original:
+                # Publishing a completed archive file must never overwrite a
+                # file that another running ripper created in the meantime.
+                if os.name == "nt":
+                    os.rename(partial_path, fpath)  # Windows: no replace
+                else:
+                    os.link(partial_path, fpath)  # POSIX: no-clobber hard link
+                    os.unlink(partial_path)
+            else:
+                os.replace(partial_path, fpath)
             partial_path = None
             elapsed = time.time() - start_time
             speed = total_bytes / 1024 / elapsed if elapsed > 0 else 0
@@ -3551,6 +3647,37 @@ def download_4chan_image_oldschool(
                     pass
     if album_stats is not None:
         album_stats['errors'] += 1
+    return False
+
+
+def download_4chan_archive_candidates(
+    urls, output_dir, log, fname, index, total, album_stats,
+    verification=None, stop_flag=None, polite=None,
+):
+    """Try archived original-media sources, counting a missing file only once."""
+    if os.path.exists(os.path.join(output_dir, fname)):
+        log(f"Already downloaded: {fname}")
+        return False
+    for url in urls:
+        if stop_flag is not None and stop_flag.is_set():
+            return False
+        attempt_stats = {
+            "total_bytes": 0, "total_time": 0.0, "downloaded": 0, "errors": 0,
+        }
+        if download_4chan_image_oldschool(
+            url, output_dir, log, fname, index, total, attempt_stats,
+            2, stop_flag, polite, require_original=True,
+            expected=verification,
+        ):
+            for key in ("total_bytes", "total_time", "downloaded"):
+                album_stats[key] += attempt_stats[key]
+            return True
+        if os.path.exists(os.path.join(output_dir, fname)):
+            log(f"Already downloaded: {fname}")
+            return False
+    if stop_flag is None or not stop_flag.is_set():
+        album_stats["errors"] += 1
+        log(f"Original unavailable after checking {len(urls)} source(s): {fname}")
     return False
 
 
@@ -3634,39 +3761,41 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 board, tid = album_url.split(":", 1)[-1].split("/", 1)
                 board = board.strip().strip("/")
                 tid = tid.strip().split("/")[0]
-                image_entries = fourchan_thread_images(board, tid, log=log)
-                log(f"  Found {len(image_entries)} images in {album_name}.")
-                outdir = os.path.join(
-                    output_root,
-                    *[sanitize_name(p) for p in album_path],
+                is_archive = archived_moe.parse_thread_url(album_url) is not None
+                if is_archive:
+                    _, image_entries = archived_moe_thread_images(board, tid, log=log)
+                else:
+                    image_entries = fourchan_thread_images(board, tid, log=log)
+                log(f"  Found {len(image_entries)} media attachments in {album_name}.")
+                outdir = fourchan_output_directory(
+                    output_root, album_url, album_path
                 )
                 os.makedirs(outdir, exist_ok=True)
                 total_images = len(image_entries)
 
                 sem = asyncio.Semaphore(workers)
 
-                async def worker(idx, fname, url):
+                async def worker(idx, fname, urls, verification):
                     if stop_flag and stop_flag.is_set():
                         return
                     async with sem:
-                        await loop.run_in_executor(
-                            None,
-                            download_4chan_image_oldschool,
-                            url,
-                            outdir,
-                            log,
-                            fname,
-                            idx,
-                            total_images,
-                            stats,
-                            3,
-                            stop_flag,
-                            mimic_human,
-                        )
+                        if is_archive:
+                            args = (
+                                urls, outdir, log, fname, idx, total_images,
+                                stats, verification, stop_flag, mimic_human,
+                            )
+                            downloader = download_4chan_archive_candidates
+                        else:
+                            args = (
+                                urls[0], outdir, log, fname, idx, total_images,
+                                stats, 3, stop_flag, mimic_human,
+                            )
+                            downloader = download_4chan_image_oldschool
+                        await loop.run_in_executor(None, downloader, *args)
 
                 tasks = [
-                    asyncio.create_task(worker(idx, fname, urls[0]))
-                    for idx, (fname, urls, _) in enumerate(image_entries, 1)
+                    asyncio.create_task(worker(idx, fname, urls, verification))
+                    for idx, (fname, urls, verification) in enumerate(image_entries, 1)
                 ]
                 await asyncio.gather(*tasks)
 
@@ -4150,7 +4279,9 @@ class GalleryRipperApp(tb.Window):
             label = alb["name"]
             album_path = alb.get("path") or [alb["name"]]
             if isinstance(img_count, int):
-                dl_folder = os.path.join(
+                dl_folder = fourchan_output_directory(
+                    self.path_var.get().strip(), alb["url"], album_path
+                ) if archived_moe.parse_thread_url(alb["url"]) else os.path.join(
                     self.path_var.get().strip(),
                     *[sanitize_name(p) for p in album_path],
                 )
@@ -4590,7 +4721,9 @@ class GalleryRipperApp(tb.Window):
             album_path = alb.get("path") or node_path + [alb['name']]
             label = alb['name']
             if isinstance(img_count, int):
-                dl_folder = os.path.join(
+                dl_folder = fourchan_output_directory(
+                    self.path_var.get().strip(), alb["url"], album_path
+                ) if archived_moe.parse_thread_url(alb["url"]) else os.path.join(
                     self.path_var.get().strip(),
                     *[sanitize_name(p) for p in album_path],
                 )
