@@ -1,4 +1,6 @@
 """Archived.moe recovery and live-4chan folder compatibility regressions."""
+import base64
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,7 +78,20 @@ class ArchiveMetadataTests(unittest.TestCase):
         self.assertIn("https://i.4cdn.org/b/1000000000001.jpg", first_urls)
         self.assertNotIn("thumb", " ".join(first_urls).lower())
         self.assertEqual(entries[1][1][0], "https://thebarchive.com/b/full_image/1000000000002.webm")
+        self.assertIn("https://thebarchive.com/b/full_image/1000000000002.web", entries[1][1])
         self.assertEqual(entries[1][2], None)
+
+    def test_archive_metadata_exposes_original_size_and_md5(self):
+        data = make_thread()
+        body = b"original media content"
+        first = data[THREAD_ID]["op"]["media"]
+        first["media_size"] = str(len(body))
+        first["media_hash"] = base64.b64encode(hashlib.md5(body).digest()).decode("ascii")
+        _, entries, _ = am.extract_thread(data, "b", THREAD_ID)
+        self.assertEqual(
+            entries[0][2],
+            {"size": len(body), "md5": hashlib.md5(body).digest()},
+        )
 
     def test_original_filenames_do_not_escape_download_dir_or_collide(self):
         data = make_thread()
@@ -233,6 +248,38 @@ class ArchiveDownloadTests(unittest.TestCase):
                     require_original=True,
                 ))
                 self.assertFalse(Path(directory, "file.jpg").exists())
+
+    def test_archive_verifies_original_bytes_before_publication(self):
+        payload = b"the genuine original bytes"
+        good_hash = hashlib.md5(payload).digest()
+        cases = (
+            ({"size": len(payload), "md5": good_hash}, True),
+            ({"size": len(payload) + 1, "md5": good_hash}, False),
+            ({"size": len(payload), "md5": bytes(16)}, False),
+        )
+        for expected, should_succeed in cases:
+            with self.subTest(expected=expected):
+                response = Mock(status=200, headers={"Content-Type": "image/jpeg"})
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                response.geturl.return_value = "https://thebarchive.com/b/full_image/1.jpg"
+                response.read.side_effect = [payload, b""]
+                with tempfile.TemporaryDirectory() as directory, patch.object(
+                    gr.urllib.request, "urlopen", return_value=response
+                ), patch.object(gr.session.pacer, "wait"), patch.object(
+                    gr.session.pacer, "record_response"
+                ), patch.object(gr.time, "sleep"):
+                    success = gr.download_4chan_image_oldschool(
+                        "https://thebarchive.com/b/full_image/1.jpg",
+                        directory, lambda _msg: None, fname="file.jpg",
+                        max_attempts=1, require_original=True, expected=expected,
+                    )
+                    self.assertIs(success, should_succeed)
+                    path = Path(directory, "file.jpg")
+                    self.assertEqual(path.exists(), should_succeed)
+                    if should_succeed:
+                        self.assertEqual(path.read_bytes(), payload)
+                    self.assertFalse(list(Path(directory).glob("*.part")))
 
     def test_archive_detects_html_payload_without_content_type(self):
         response = Mock(status=200, headers={})

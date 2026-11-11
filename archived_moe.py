@@ -2,6 +2,8 @@
 
 The archive's thumbnail links are intentionally never download candidates.
 """
+import base64
+import binascii
 import html
 import re
 from urllib.parse import urljoin, urlparse
@@ -94,9 +96,34 @@ def _original_candidates(media, board):
             for url in urls
         ):
             add(f"https://thebarchive.com/b/full_image/{original}")
+        # The /b/ full-image archive also uses '.web' for some WEBM files.
+        if board == "b":
+            for location in tuple(urls):
+                if urlparse(location).hostname == "thebarchive.com" and location.endswith(".webm"):
+                    add(location[:-1])
         # Recently expired threads may still have media on 4chan's CDN.
         add(f"https://i.4cdn.org/{board}/{original}")
     return urls
+
+
+def _verification_metadata(media):
+    """Return original byte count/MD5 if FoolFuuka supplied valid metadata."""
+    result = {}
+    try:
+        size = int(media.get("media_size"))
+        if size > 0:
+            result["size"] = size
+    except (ValueError, TypeError):
+        pass
+    md5 = media.get("media_hash")
+    if isinstance(md5, str):
+        try:
+            decoded = base64.b64decode(md5.strip(), validate=True)
+            if len(decoded) == 16:
+                result["md5"] = decoded
+        except (ValueError, binascii.Error):
+            pass
+    return result or None
 
 
 def _post_order(post):
@@ -143,17 +170,17 @@ def extract_thread(data, board, thread_id):
         if not fname or not urls:
             unavailable += 1
             continue
-        if fname in filenames:
+        if fname.casefold() in filenames:
             stem, dot, ext = fname.rpartition(".")
             stem = stem if dot else fname
             suffix = original.rpartition(".")[0] if isinstance(original, str) else ""
             suffix = suffix if re.fullmatch(r"[A-Za-z0-9_-]+", suffix) else str(_post_order(post))
             candidate = f"{stem}_{suffix}{dot}{ext}"
             index = 2
-            while candidate in filenames:
+            while candidate.casefold() in filenames:
                 candidate = f"{stem}_{suffix}_{index}{dot}{ext}"
                 index += 1
             fname = candidate
-        filenames.add(fname)
-        entries.append((fname, urls, None))
+        filenames.add(fname.casefold())
+        entries.append((fname, urls, _verification_metadata(media)))
     return subject, entries, unavailable

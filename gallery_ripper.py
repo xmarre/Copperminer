@@ -3529,7 +3529,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
 def download_4chan_image_oldschool(
     url, output_dir, log, fname=None, index=None, total=None,
     album_stats=None, max_attempts=3, stop_flag=None, polite=None,
-    require_original=False,
+    require_original=False, expected=None,
 ):
     """Download 4chan media through urllib, sharing the normal per-host pacer."""
     if fname is None:
@@ -3581,6 +3581,7 @@ def download_4chan_image_oldschool(
                 ) as out:
                     partial_path = out.name
                     total_bytes = 0
+                    digest = hashlib.md5() if require_original and expected and "md5" in expected else None
                     while True:
                         if stop_flag is not None and stop_flag.is_set():
                             return False
@@ -3593,8 +3594,18 @@ def download_4chan_image_oldschool(
                             raise IOError("Original media URL returned an HTML/JSON error")
                         out.write(chunk)
                         total_bytes += len(chunk)
+                        if digest is not None:
+                            digest.update(chunk)
             if total_bytes == 0:
                 raise IOError("Media response contained no bytes")
+            if require_original and expected:
+                expected_size = expected.get("size")
+                if expected_size is not None and total_bytes != expected_size:
+                    raise IOError(
+                        f"Original media size mismatch: {total_bytes} != {expected_size}"
+                    )
+                if digest is not None and digest.digest() != expected["md5"]:
+                    raise IOError("Original media MD5 does not match archive metadata")
             if require_original:
                 # Publishing a completed archive file must never overwrite a
                 # file that another running ripper created in the meantime.
@@ -3641,7 +3652,7 @@ def download_4chan_image_oldschool(
 
 def download_4chan_archive_candidates(
     urls, output_dir, log, fname, index, total, album_stats,
-    stop_flag=None, polite=None,
+    verification=None, stop_flag=None, polite=None,
 ):
     """Try archived original-media sources, counting a missing file only once."""
     if os.path.exists(os.path.join(output_dir, fname)):
@@ -3656,6 +3667,7 @@ def download_4chan_archive_candidates(
         if download_4chan_image_oldschool(
             url, output_dir, log, fname, index, total, attempt_stats,
             2, stop_flag, polite, require_original=True,
+            expected=verification,
         ):
             for key in ("total_bytes", "total_time", "downloaded"):
                 album_stats[key] += attempt_stats[key]
@@ -3763,14 +3775,14 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
 
                 sem = asyncio.Semaphore(workers)
 
-                async def worker(idx, fname, urls):
+                async def worker(idx, fname, urls, verification):
                     if stop_flag and stop_flag.is_set():
                         return
                     async with sem:
                         if is_archive:
                             args = (
                                 urls, outdir, log, fname, idx, total_images,
-                                stats, stop_flag, mimic_human,
+                                stats, verification, stop_flag, mimic_human,
                             )
                             downloader = download_4chan_archive_candidates
                         else:
@@ -3782,8 +3794,8 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                         await loop.run_in_executor(None, downloader, *args)
 
                 tasks = [
-                    asyncio.create_task(worker(idx, fname, urls))
-                    for idx, (fname, urls, _) in enumerate(image_entries, 1)
+                    asyncio.create_task(worker(idx, fname, urls, verification))
+                    for idx, (fname, urls, verification) in enumerate(image_entries, 1)
                 ]
                 await asyncio.gather(*tasks)
 

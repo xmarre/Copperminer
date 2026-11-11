@@ -6,7 +6,7 @@
 
 - Paste an `archived.moe/<board>/thread/<id>` link to discover and recover original-media attachments from an expired 4chan thread.
 - Archived threads reuse the matching live 4chan download directory by board and thread ID, even when the archive's subject differs. Existing filenames are skipped; missing files are added without replacing them.
-- Retry archived original-media candidates, including linked external full-image sources and still-available 4chan CDN URLs. Treat unavailable originals and thumbnail/HTML responses as failures, not completed downloads.
+- Retry archived original-media candidates, including linked external full-image sources and still-available 4chan CDN URLs. Validate original byte count and MD5 when available; treat unavailable originals and thumbnail/HTML responses as failures, not completed downloads.
 - Focused regression coverage for archive metadata, source routing, folder matching, duplicate filenames, fallback downloads, and unavailable originals.
 
 ### Limitations
