@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 — 2026-11-11
+
+### Fixed
+
+- Archived.moe may reject Python API requests with HTTP 403 even when the thread is viewable in a browser. Show a dedicated, actionable message and open the exact thread API URL in the user's browser on request.
+- Add **Import saved thread JSON** to read a browser-saved FoolFuuka API response. Validate its thread ID, board (when present), JSON structure and input size; reject HTML challenge/error pages and mismatched threads.
+- Pass the validated in-memory archive snapshot through both discovery **and** download, preventing the second API fetch that would otherwise fail with another 403.
+- Keep existing folder matching, original-only candidates, size/hash verification, request pacing and file-preserving downloads unchanged.
+
+### Limitations
+
+Browser access to the API and successful original-media downloads still depend on archived.moe and linked services. This fallback is manual if normal API discovery is blocked; it does not bypass Cloudflare or grant access to unavailable originals. Automated tests cover the import flow; live browser export and Windows GUI behavior still require independent verification.
+
 ## 0.4.0 — 2026-11-11
 
 ### Added

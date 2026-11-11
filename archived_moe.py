@@ -5,6 +5,7 @@ The archive's thumbnail links are intentionally never download candidates.
 import base64
 import binascii
 import html
+import json
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -13,6 +14,58 @@ _CANONICAL_THREAD = re.compile(r"archived\.moe:([a-z0-9]+)/(\d+)", re.I)
 _ORIGINAL_NAME = re.compile(r"[A-Za-z0-9_-]+\.(?:jpe?g|png|gif|webp|bmp|webm|mp4|pdf|swf)", re.I)
 _BAD_FILENAME = re.compile(r'[\\/*?:"<>|\x00-\x1f]')
 _WINDOWS_RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", re.I)
+MAX_SAVED_THREAD_JSON_BYTES = 64 * 1024 * 1024
+
+
+class ArchiveAccessBlockedError(RuntimeError):
+    """A server denied access to archived thread metadata."""
+
+    def __init__(self, api_url, status_code):
+        self.api_url = api_url
+        self.status_code = status_code
+        super().__init__(
+            f"archived.moe thread API returned HTTP {status_code}. "
+            "The server may require browser verification or prohibit API access. "
+            "Open the API URL in your browser and import a saved JSON response."
+        )
+
+
+def load_saved_thread_json(path, board, thread_id):
+    """Load a browser-saved FoolFuuka thread response, rejecting wrong threads.
+
+    The bytes are read once and can be passed to discovery and download without
+    any further HTTP requests to the archive metadata API.
+    """
+    with open(path, "rb") as stream:
+        raw = stream.read(MAX_SAVED_THREAD_JSON_BYTES + 1)
+    if len(raw) > MAX_SAVED_THREAD_JSON_BYTES:
+        raise ValueError("Saved archive JSON exceeds the 64 MiB import limit.")
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "This is not valid archived.moe API JSON. Browser challenge pages "
+            "and saved HTML pages cannot be imported as thread metadata."
+        ) from exc
+    # In addition to validating the response shape, check the board when the
+    # archive provides it. The thread ID must be present as the response key.
+    thread = data.get(str(thread_id)) if isinstance(data, dict) else None
+    if not isinstance(thread, dict):
+        raise ValueError(
+            f"Saved JSON does not contain thread /{board}/{thread_id}."
+        )
+    op = thread.get("op")
+    if not isinstance(op, dict):
+        raise ValueError("Saved archive JSON has no valid original post.")
+    board_meta = op.get("board")
+    if isinstance(board_meta, dict):
+        recorded_board = board_meta.get("shortname")
+        if recorded_board and str(recorded_board).lower() != board.lower():
+            raise ValueError(
+                f"Saved JSON belongs to /{recorded_board}/, not /{board}/."
+            )
+    extract_thread(data, board, thread_id)
+    return data
 
 
 def parse_thread_url(url):

@@ -1,6 +1,7 @@
 """Archived.moe recovery and live-4chan folder compatibility regressions."""
 import base64
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -298,6 +299,151 @@ class ArchiveDownloadTests(unittest.TestCase):
                 require_original=True,
             ))
             self.assertFalse(Path(directory, "file.jpg").exists())
+
+
+
+class ArchiveBrowserFallbackTests(unittest.TestCase):
+    def test_403_prompts_for_browser_metadata_instead_of_empty_album(self):
+        import requests
+        api_url = am.thread_api_url("b", THREAD_ID)
+        denied = Mock(status_code=403)
+        denied.raise_for_status.side_effect = requests.HTTPError(
+            "403 Client Error", response=denied
+        )
+        with patch.object(gr, "_discovery_request", return_value=denied):
+            with self.assertRaises(am.ArchiveAccessBlockedError) as raised:
+                gr.fourchan_discover_tree(ARCHIVE_URL)
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.api_url, api_url)
+        denied.close.assert_called_once()
+
+    def test_json_file_import_validates_thread_and_board(self):
+        data = make_thread()
+        data[THREAD_ID]["op"]["board"] = {"shortname": "b"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "saved.json")
+            path.write_text(json.dumps(data), encoding="utf-8-sig")
+            self.assertEqual(
+                am.load_saved_thread_json(path, "b", THREAD_ID), data
+            )
+            with self.assertRaisesRegex(ValueError, r"does not contain thread"):
+                am.load_saved_thread_json(path, "b", "123456789")
+            with self.assertRaisesRegex(ValueError, r"not /g/"):
+                am.load_saved_thread_json(path, "g", THREAD_ID)
+            path.write_text("<!DOCTYPE html>Cloudflare challenge", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not valid"):
+                am.load_saved_thread_json(path, "b", THREAD_ID)
+            with patch.object(am, "MAX_SAVED_THREAD_JSON_BYTES", 10):
+                with self.assertRaisesRegex(ValueError, "64 MiB"):
+                    am.load_saved_thread_json(path, "b", THREAD_ID)
+
+    def test_imported_api_data_bypasses_network_discovery(self):
+        data = make_thread()
+        with patch.object(gr, "_discovery_request") as request:
+            tree = gr.discover_or_load_gallery_tree(
+                ARCHIVE_URL, lambda _message: None, archive_data=data,
+            )
+        request.assert_not_called()
+        self.assertEqual(tree["albums"][0]["url"], CANONICAL)
+        self.assertEqual(tree["albums"][0]["image_count"], 2)
+
+    def test_download_uses_imported_snapshot_without_reaching_metadata_api(self):
+        data = make_thread()
+        with tempfile.TemporaryDirectory() as directory:
+            existing = Path(directory, "4chan", "b", f"Live name {THREAD_ID}")
+            existing.mkdir(parents=True)
+            (existing / "original.jpg").write_bytes(b"already here")
+            with patch.object(gr, "_discovery_request") as request, patch.object(
+                gr, "download_4chan_image_oldschool", return_value=False
+            ) as downloader, patch.object(gr.time, "sleep"):
+                gr._rip_galleries_impl(
+                    [("From browser JSON", CANONICAL, ["4chan", "b", f"Archived ({THREAD_ID})"])],
+                    directory, lambda _msg: None, ARCHIVE_URL,
+                    workers=1, archive_data=data,
+                )
+            request.assert_not_called()
+            self.assertEqual((existing / "original.jpg").read_bytes(), b"already here")
+            self.assertFalse(Path(directory, "4chan", "b", f"Archived {THREAD_ID}").exists())
+            self.assertGreaterEqual(downloader.call_count, 1)
+            self.assertTrue(all(call.kwargs.get("require_original") for call in downloader.call_args_list))
+
+    def test_import_button_retains_same_thread_snapshot_and_starts_discovery(self):
+        data = make_thread()
+        app = Mock()
+        app.url_var.get.return_value = ARCHIVE_URL
+        app.discovery_thread = None
+        app.download_thread = None
+        app._archive_snapshot = None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "saved.json")
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(gr.filedialog, "askopenfilename", return_value=str(path)), patch.object(
+                gr.messagebox, "showerror"
+            ) as showerror:
+                gr.GalleryRipperApp.import_archived_moe_json(app)
+            showerror.assert_not_called()
+        self.assertEqual(app._archive_snapshot[0], ("b", THREAD_ID))
+        self.assertEqual(app._archive_snapshot[1], data)
+        app.discover_albums.assert_called_once()
+        self.assertIs(
+            gr.GalleryRipperApp._archive_data_for_url(app, ARCHIVE_URL),
+            app._archive_snapshot[1],
+        )
+        self.assertIsNone(
+            gr.GalleryRipperApp._archive_data_for_url(
+                app, "https://archived.moe/b/thread/956262977"
+            )
+        )
+
+    def test_rejected_import_does_not_replace_existing_snapshot(self):
+        app = Mock()
+        app.url_var.get.return_value = ARCHIVE_URL
+        app.discovery_thread = None
+        app.download_thread = None
+        prior = (("b", THREAD_ID), make_thread())
+        app._archive_snapshot = prior
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bad.json")
+            path.write_text('{"something":"else"}', encoding="utf-8")
+            with patch.object(gr.filedialog, "askopenfilename", return_value=str(path)), patch.object(
+                gr.messagebox, "showerror"
+            ) as showerror:
+                gr.GalleryRipperApp.import_archived_moe_json(app)
+            showerror.assert_called_once()
+        self.assertIs(app._archive_snapshot, prior)
+        app.discover_albums.assert_not_called()
+
+    def test_403_dialog_offers_exact_browser_api_url(self):
+        app = Mock()
+        error = am.ArchiveAccessBlockedError(
+            am.thread_api_url("b", THREAD_ID), 403
+        )
+        with patch.object(gr.messagebox, "askyesno", return_value=True) as dialog, patch.object(
+            gr.webbrowser, "open"
+        ) as browser:
+            gr.GalleryRipperApp.handle_archived_moe_blocked(app, error)
+        browser.assert_called_once_with(am.thread_api_url("b", THREAD_ID))
+        self.assertIn("Import saved thread JSON", dialog.call_args.args[1])
+
+    def test_snapshot_for_download_is_captured_before_worker_starts(self):
+        app = Mock()
+        app.url_var.get.return_value = ARCHIVE_URL
+        app.path_var.get.return_value = "testfolder"
+        app.download_workers_var.get.return_value = 1
+        app.mimic_var.get.return_value = False
+        app.quick_scan_var.get.return_value = True
+        app.download_thread = None
+        app.selected_album_urls = {"album1"}
+        app.item_to_album = {
+            "album1": ("Archived", CANONICAL, ["4chan", "b", f"Thread ({THREAD_ID})"])
+        }
+        data = make_thread()
+        app._archive_data_for_url.return_value = data
+        with patch.object(gr.threading, "Thread") as worker:
+            gr.GalleryRipperApp.start_download(app)
+        args = worker.call_args.kwargs["args"]
+        self.assertIs(args[-1], data)
+        self.assertEqual(args[2], ARCHIVE_URL)
 
 
 if __name__ == "__main__":
