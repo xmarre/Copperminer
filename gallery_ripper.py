@@ -778,17 +778,28 @@ def fourchan_thread_images(board, thread_id, log=lambda msg: None):
     return entries
 
 
-def archived_moe_thread_images(board, thread_id, log=lambda msg: None):
-    """Load archived OP/replies and their original-media candidates."""
-    api_url = archived_moe.thread_api_url(board, thread_id)
-    response = _discovery_request("get", api_url, timeout=25, log=log)
-    try:
-        response.raise_for_status()
-        subject, entries, unavailable = archived_moe.extract_thread(
-            response.json(), board, thread_id
-        )
-    finally:
-        response.close()
+def archived_moe_thread_images(board, thread_id, log=lambda msg: None, archive_data=None):
+    """Load archived OP/replies from the API or browser-saved thread JSON."""
+    if archive_data is None:
+        api_url = archived_moe.thread_api_url(board, thread_id)
+        response = _discovery_request("get", api_url, timeout=25, log=log)
+        try:
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                code = getattr(exc.response, "status_code", None)
+                if code == 403:
+                    raise archived_moe.ArchiveAccessBlockedError(api_url, code) from exc
+                raise
+            data = response.json()
+        finally:
+            response.close()
+    else:
+        log(f"Using browser-saved archived.moe JSON for /{board}/{thread_id}.")
+        data = archive_data
+    subject, entries, unavailable = archived_moe.extract_thread(
+        data, board, thread_id
+    )
     if unavailable:
         log(
             f"Archived /{board}/{thread_id}: {unavailable} attachment(s) "
@@ -820,7 +831,7 @@ def fourchan_output_directory(output_root, album_url, album_path):
     return proposed
 
 
-def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
+def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True, archive_data=None):
     """Return a tree of boards and threads for 4chan."""
     canonical = normalize_fourchan_url(root_url)
     if canonical.lower() in {"4chan", "4chan:"}:
@@ -849,7 +860,9 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True):
         board, thread_id = after_colon.split("/", 1)
         thread_id = thread_id.strip()
         if archived_moe.parse_thread_url(canonical):
-            subject, info = archived_moe_thread_images(board, thread_id, log=log)
+            subject, info = archived_moe_thread_images(
+                board, thread_id, log=log, archive_data=archive_data
+            )
         else:
             info = fourchan_thread_images(board, thread_id, log=log)
             subject = f"Thread {thread_id}"
@@ -2621,6 +2634,7 @@ def discover_or_load_gallery_tree(
     force_refresh=False,
     yandex_reuse_browser_cookies=False,
     stop_flag=None,
+    archive_data=None,
 ):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
@@ -2659,6 +2673,7 @@ def discover_or_load_gallery_tree(
             root_url,
             log=log,
             quick_scan=quick_scan,
+            archive_data=archive_data,
         )
     else:
         tree = discover_tree(
@@ -3721,17 +3736,17 @@ def threaded_download_worker(download_queue, log, stop_flag, polite=False):
             download_queue.task_done()
 
 
-def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None):
     """Run one download job under its selected request-pacing policy."""
     with session.polite_mode(mimic_human):
         return _rip_galleries_impl(
             selected_albums, output_root, log, root_url,
             quick_scan=quick_scan, mimic_human=mimic_human,
-            stop_flag=stop_flag, workers=workers,
+            stop_flag=stop_flag, workers=workers, archive_data=archive_data,
         )
 
 
-def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None):
+def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None):
     """Build and download a gallery queue with independent host scheduling."""
     workers = max(1, min(16, int(DOWNLOAD_WORKERS if workers is None else workers)))
     log(
@@ -3763,7 +3778,14 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 tid = tid.strip().split("/")[0]
                 is_archive = archived_moe.parse_thread_url(album_url) is not None
                 if is_archive:
-                    _, image_entries = archived_moe_thread_images(board, tid, log=log)
+                    # An imported snapshot is valid only for its selected thread.
+                    selected_archive = archive_data if (
+                        archived_moe.parse_thread_url(root_url)
+                        == (board, tid)
+                    ) else None
+                    _, image_entries = archived_moe_thread_images(
+                        board, tid, log=log, archive_data=selected_archive
+                    )
                 else:
                     image_entries = fourchan_thread_images(board, tid, log=log)
                 log(f"  Found {len(image_entries)} media attachments in {album_name}.")
@@ -3909,6 +3931,7 @@ class GalleryRipperApp(tb.Window):
         self.geometry("980x700")
         self.minsize(700, 480)
         self.albums_tree_data = None
+        self._archive_snapshot = None
         self.download_thread = None
         self.discovery_thread = None
         self.stop_flag = threading.Event()
@@ -3940,6 +3963,18 @@ class GalleryRipperApp(tb.Window):
         ttk.Button(urlf, text="Yandex Search", command=self.discover_yandex_from_url).pack(side="left", padx=(5, 0))
         ttk.Button(urlf, text="Yandex HTML", command=self.import_yandex_html).pack(side="left", padx=(5, 0))
         ttk.Button(urlf, text="History", command=self.show_history).pack(side="left", padx=(5, 0))
+
+        archivef = ttk.Frame(control_frame)
+        archivef.pack(fill="x", pady=(5, 0))
+        ttk.Label(archivef, text="Archived.moe:").pack(side="left")
+        ttk.Button(
+            archivef, text="Open thread API in browser",
+            command=self.open_archive_api_in_browser,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Button(
+            archivef, text="Import saved thread JSON",
+            command=self.import_archived_moe_json,
+        ).pack(side="left", padx=(5, 0))
 
         pathf = ttk.Frame(control_frame)
         pathf.pack(fill="x", pady=(8, 0))
@@ -4157,6 +4192,57 @@ class GalleryRipperApp(tb.Window):
         if not path:
             return
         self.url_var.set(YANDEX_HTML_PREFIX + path)
+        self.discover_albums()
+
+    def _archive_data_for_url(self, url):
+        identity = archived_moe.parse_thread_url(url)
+        if self._archive_snapshot and identity == self._archive_snapshot[0]:
+            return self._archive_snapshot[1]
+        return None
+
+    def open_archive_api_in_browser(self):
+        identity = archived_moe.parse_thread_url(self.url_var.get().strip())
+        if not identity:
+            messagebox.showwarning(
+                "Archived.moe", "Paste an archived.moe thread URL first."
+            )
+            return
+        webbrowser.open(archived_moe.thread_api_url(*identity))
+
+    def import_archived_moe_json(self):
+        url = self.url_var.get().strip()
+        identity = archived_moe.parse_thread_url(url)
+        if not identity:
+            messagebox.showwarning(
+                "Archived.moe", "Paste an archived.moe thread URL first."
+            )
+            return
+        if (
+            self.download_thread and self.download_thread.is_alive()
+        ) or (
+            self.discovery_thread and self.discovery_thread.is_alive()
+        ):
+            messagebox.showinfo(
+                "Job running", "Finish the current discovery or download first."
+            )
+            return
+        path = filedialog.askopenfilename(
+            title="Select browser-saved archived.moe thread API JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = archived_moe.load_saved_thread_json(path, *identity)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Invalid archived.moe JSON", str(exc))
+            return
+        # Keep the validated metadata in memory; discovery and downloads use
+        # the same snapshot, including if the archive still returns HTTP 403.
+        self._archive_snapshot = (identity, data)
+        self.thread_safe_log(
+            f"Imported browser-saved archive metadata for /{identity[0]}/{identity[1]}."
+        )
         self.discover_albums()
 
     def show_history(self):
@@ -4647,18 +4733,19 @@ class GalleryRipperApp(tb.Window):
         self.thread_safe_log(f"Discovering albums from: {url}")
         self.tree.delete(*self.tree.get_children())
         quick = self.quick_scan_var.get()
+        archive_data = self._archive_data_for_url(url)
         reuse_browser_cookies = self.yandex_reuse_browser_cookies_var.get()
         self.discovery_stop_flag.clear()
         polite = bool(self.mimic_var.get())
         self.discovery_thread = threading.Thread(
             target=self.do_discover,
-            args=(url, quick, reuse_browser_cookies, polite),
+            args=(url, quick, reuse_browser_cookies, polite, archive_data),
             daemon=True,
         )
         self.discovery_thread.start()
         self.update_nav_buttons()
 
-    def do_discover(self, url, quick, reuse_browser_cookies=False, polite=False):
+    def do_discover(self, url, quick, reuse_browser_cookies=False, polite=False, archive_data=None):
         try:
             with session.polite_mode(polite):
                 tree_data = discover_or_load_gallery_tree(
@@ -4668,6 +4755,7 @@ class GalleryRipperApp(tb.Window):
                     force_refresh=not quick,
                     yandex_reuse_browser_cookies=reuse_browser_cookies,
                     stop_flag=self.discovery_stop_flag,
+                    archive_data=archive_data,
                 )
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
@@ -4677,8 +4765,23 @@ class GalleryRipperApp(tb.Window):
             self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
         except YandexBlockedError as e:
             self.after(0, lambda err=e: self.handle_yandex_blocked(err))
+        except archived_moe.ArchiveAccessBlockedError as e:
+            self.after(0, lambda err=e: self.handle_archived_moe_blocked(err))
         except Exception as e:
             self.after(0, lambda err=e: self.log(f"Discovery failed: {err}"))
+
+    def handle_archived_moe_blocked(self, err):
+        self.log(f"Discovery blocked: {err}")
+        if messagebox.askyesno(
+            "Archived.moe denied API access",
+            f"Archived.moe returned HTTP {err.status_code} for this thread's API.\n\n"
+            "If the API URL opens in your browser, complete any verification, "
+            "save its JSON response (Ctrl+S), then click 'Import saved thread JSON' "
+            "in Copperminer. Discovery and download will use that saved response "
+            "without contacting the blocked metadata API again.\n\n"
+            "Open the API URL in your browser now?",
+        ):
+            webbrowser.open(err.api_url)
 
     def handle_yandex_blocked(self, err):
         details = f"Discovery failed: {err}"
@@ -4868,10 +4971,12 @@ class GalleryRipperApp(tb.Window):
         workers = max(1, min(16, int(self.download_workers_var.get())))
         polite = bool(self.mimic_var.get())
         quick_scan = bool(self.quick_scan_var.get())
+        root_url = self.url_var.get().strip()
+        archive_data = self._archive_data_for_url(root_url)
         self.log(f"Starting download of {len(selected)} albums with {workers} workers...")
         self.download_thread = threading.Thread(
             target=self.download_worker,
-            args=(selected, output_dir, self.url_var.get().strip(), workers, polite, quick_scan),
+            args=(selected, output_dir, root_url, workers, polite, quick_scan, archive_data),
             daemon=True,
         )
         self.download_thread.start()
@@ -4881,7 +4986,7 @@ class GalleryRipperApp(tb.Window):
         self.stop_flag.set()
         self.discovery_stop_flag.set()
 
-    def download_worker(self, selected, output_dir, root_url, workers, polite, quick_scan):
+    def download_worker(self, selected, output_dir, root_url, workers, polite, quick_scan, archive_data=None):
         try:
             rip_galleries(
                 selected,
@@ -4892,6 +4997,7 @@ class GalleryRipperApp(tb.Window):
                 mimic_human=polite,
                 stop_flag=self.stop_flag,
                 workers=workers,
+                archive_data=archive_data,
             )
             self.log("All downloads finished or stopped!")
         except Exception as e:

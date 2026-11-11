@@ -12,7 +12,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Download progress & log — See what’s happening at every step
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
-- 4chan support — Browse live boards/threads and recover original attachments from archived.moe thread URLs into the matching 4chan folders
+- 4chan support — Browse live boards/threads, recover archived.moe original attachments into the corresponding 4chan folders, and import a browser-saved API JSON response if archive discovery is denied
 - IMDb support — Download complete title/person photo galleries, individual media viewer photos, and combined title/person/image-type selections at original resolution
 - Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, download the original/highest-resolution candidate URLs Yandex exposes, and import saved Yandex HTML when direct requests hit a CAPTCHA
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
@@ -28,6 +28,14 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 Enter `4chan` by itself to browse live boards, or paste a live 4chan board/thread URL. Double-click a board to open it; use **Back** to navigate. Threads show a checkmark when fully downloaded or `[+n]` for new files. Selecting a thread saves attached media (images, webms, mp4s) under `4chan/<board>/<sanitized subject> <thread ID>` (Copperminer removes parentheses when sanitizing folder names).
 
 To recover a thread that has disappeared from 4chan, paste an archived.moe **thread** link into **Gallery Root URL**, for example `https://archived.moe/b/thread/956262976/#956262976`. Click **Discover Galleries**, select the archived thread, then **Start Download**. Copperminer reads the archived FoolFuuka thread metadata and attempts every available original-media URL. If the matching `4chan/<board>/... (<thread id>)` folder already exists, new files go into that folder even if the archived subject differs. Existing files with matching original filenames are left untouched; if the thread has never been downloaded, Copperminer creates the normal 4chan folder.
+
+**If archived.moe blocks API access with HTTP 403:** The thread URL is recognized, but automated metadata discovery is denied by the archive's server. Copperminer shows the blocked API URL and offers to open it in your normal browser. With the archived thread URL still in **Gallery Root URL**:
+
+1. Click **Open thread API in browser**, and complete any verification the website requires. Confirm that the browser displays a JSON object containing the thread ID, not an HTML challenge/error page. If the browser itself cannot obtain JSON, this fallback cannot work.
+2. Save the displayed API response as a `.json` file (Ctrl+S in browsers that support saving JSON; choose the original JSON text rather than rendered HTML).
+3. Click **Import saved thread JSON** and select that file. Copperminer checks that it contains the specified thread, discovers its attachments without another metadata API call, and retains that snapshot for **Start Download**. This is an explicit one-time import for the current app session, not a persistent credential or cookie.
+
+Imported data supplies **original-media URLs and integrity metadata**, not the media bytes. Media downloads may still fail if the archive or linked hosting service denies access. Copperminer logs these failures and continues through the remaining original candidates. It never treats a saved challenge page as valid JSON or silently substitutes thumbnails.
 
 Archived.moe does **not** preserve every full-size original. Its metadata can contain thumbnails without a recoverable original, and some linked source URLs may return HTTP errors or anti-bot challenges. Copperminer does not use thumbnails as substitutes for originals, verifies file size and MD5 when archived metadata supplies them, logs unavailable files, and does not bypass access restrictions. The reported count reflects attachments with at least one candidate original URL, not guaranteed successful downloads. Recovery is available for individual archived.moe thread URLs; archived board browsing/search is not supported.
 
