@@ -1125,6 +1125,201 @@ class CoppermineRecoveryTests(unittest.TestCase):
 
 
 
+
+class CoppermineImagePrefilterTests(unittest.TestCase):
+    @staticmethod
+    def image_response(data, content_type="image/png"):
+        response = Mock(status_code=200)
+        response.headers = {"Content-Type": content_type}
+        response.raise_for_status = Mock()
+        response.iter_content.return_value = iter([data])
+        return response
+
+    @staticmethod
+    def image_bytes(width, height, fmt="PNG"):
+        output = io.BytesIO()
+        gr.Image.new("RGB", (width, height)).save(output, format=fmt)
+        return output.getvalue()
+
+    def test_tooltip_dimensions_filter_without_any_image_request(self):
+        album = "https://gallery.test/photos/thumbnails.php?album=352"
+        display = "displayimage.php?album=352&pid=24561"
+        html = (
+            '<html><title>Premiere</title><a href="' + display + '">'
+            '<img src="albums/PublicAppearances/thumb_023.jpg" '
+            'onmouseover="return overlib(\'Filename=023.jpg &lt;br&gt; '
+            'Dimensions=395x594\');"></a></html>'
+        )
+        cache = {}
+        def fake_fetch(url, pages, **_):
+            pages[url] = {"html": html, "final_url": url}
+            return html, True
+        skipped = {}
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch), patch.object(
+            gr, "extract_all_displayimage_candidates"
+        ) as detail, patch.object(gr.session, "get") as get:
+            entries = gr.get_all_candidate_images_from_album(
+                album, page_cache=cache, quick_scan=False,
+                min_width=1024, min_height=1024, skipped_stats=skipped,
+            )
+        self.assertEqual(entries, [])
+        self.assertEqual(skipped["skipped_small"], 1)
+        detail.assert_not_called()
+        get.assert_not_called()
+        self.assertEqual(cache[album]["images_v"], gr.IMAGE_EXTRACTOR_VERSION)
+        self.assertEqual(len(cache[album]["images"]), 1)
+
+    def test_cached_entries_reapply_changed_threshold_without_network(self):
+        album = "https://gallery.test/photos/thumbnails.php?album=352"
+        html = (
+            '<html><title>Premiere</title><a href="displayimage.php?album=352&pid=1">'
+            '<img src="albums/test/thumb_001.jpg" title="Dimensions=395x594">'
+            '</a></html>'
+        )
+        cache = {album: {
+            "html": html, "timestamp": 100, "final_url": album,
+        }}
+        with patch.object(gr.time, "time", return_value=100), patch.object(
+            gr.session, "get"
+        ) as get:
+            too_small = gr.get_all_candidate_images_from_album(
+                album, page_cache=cache, min_width=1024, min_height=1024,
+            )
+            eligible = gr.get_all_candidate_images_from_album(
+                album, page_cache=cache, min_width=300, min_height=500,
+            )
+            disabled = gr.get_all_candidate_images_from_album(album, page_cache=cache)
+        self.assertEqual(too_small, [])
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(len(disabled), 1)
+        get.assert_not_called()
+
+    def test_html_thumbnail_dimensions_do_not_reject_original(self):
+        album = "https://gallery.test/photos/thumbnails.php?album=352"
+        html = (
+            '<html><title>Premiere</title><a href="displayimage.php?album=352&pid=1">'
+            '<img src="albums/test/thumb_001.jpg" width="120" height="155"></a></html>'
+        )
+        cache = {album: {"html": html, "timestamp": 100, "final_url": album}}
+        with patch.object(gr.time, "time", return_value=100):
+            entries = gr.get_all_candidate_images_from_album(
+                album, page_cache=cache, min_width=1024, min_height=1024
+            )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(cache[album]["image_dimensions"], {})
+
+    def test_dimensions_apply_to_correct_thumbnail_only(self):
+        album = "https://gallery.test/photos/thumbnails.php?album=9"
+        html = (
+            '<table><tr><td><a href="displayimage.php?album=9&pid=1">'
+            '<img src="albums/test/thumb_001.jpg" title="Dimensions=395x594"></a></td>'
+            '<td><a href="displayimage.php?album=9&pid=2">'
+            '<img src="albums/test/thumb_002.jpg" title="Dimensions=2560x1440"></a>'
+            '</td></tr></table>'
+        )
+        cache = {album: {"html": html, "timestamp": 100, "final_url": album}}
+        with patch.object(gr.time, "time", return_value=100):
+            entries = gr.get_all_candidate_images_from_album(
+                album, page_cache=cache, min_width=1024, min_height=1024,
+            )
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(gr._decode_candidate_metadata(entries[0][1][0])[0].endswith("002.jpg"))
+
+    def test_header_rejects_small_png_before_second_body_chunk(self):
+        data = self.image_bytes(395, 594)
+        response = Mock(status_code=200)
+        response.headers = {"Content-Type": "image/png"}
+        response.raise_for_status = Mock()
+        def body(_chunk_size):
+            yield data[:128]
+            raise AssertionError("Full image transfer should be aborted")
+        response.iter_content.side_effect = body
+        stats = {"downloaded": 0, "errors": 0, "total_bytes": 0, "total_time": 0.0}
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", return_value=response
+        ) as get:
+            result = gr.download_image_candidates(
+                ["https://gallery.test/albums/023.png"], folder,
+                lambda _msg: None, max_attempts=2, album_stats=stats,
+                min_width=1024, min_height=1024,
+            )
+            self.assertFalse(result)
+            self.assertEqual(list(Path(folder).iterdir()), [])
+        get.assert_called_once()
+        response.close.assert_called_once()
+        self.assertEqual(stats["skipped_small"], 1)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_encoded_space_alias_and_thumbnail_are_not_downloaded(self):
+        small = self.image_response(self.image_bytes(395, 594))
+        display = "https://gallery.test/displayimage.php?album=352&pid=1"
+        primary = gr._encode_candidate_metadata(
+            "https://gallery.test/albums/April%2010/023.png",
+            display_url=display,
+        )
+        aliases = [
+            primary,
+            "https://gallery.test/albums/April 10/023.png",
+            "https://gallery.test/albums/April%2010/thumb_023.png",
+        ]
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", return_value=small
+        ) as get, patch.object(
+            gr, "extract_all_displayimage_candidates"
+        ) as detail:
+            result = gr.download_image_candidates(
+                aliases, folder, lambda _msg: None, max_attempts=3,
+                min_width=1024, min_height=1024,
+            )
+        self.assertFalse(result)
+        get.assert_called_once()
+        detail.assert_not_called()
+
+    def test_valid_large_image_remains_complete_and_downloadable(self):
+        data = self.image_bytes(1600, 1200, "JPEG")
+        response = Mock(status_code=200)
+        response.headers = {"Content-Type": "image/jpeg"}
+        response.raise_for_status = Mock()
+        response.iter_content.return_value = iter(
+            [data[:1024], data[1024:]]
+        )
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", return_value=response
+        ):
+            ok = gr.download_image_candidates(
+                ["https://gallery.test/001.jpg"], folder,
+                lambda _msg: None, max_attempts=1,
+                min_width=1024, min_height=1024,
+            )
+            self.assertTrue(ok)
+            self.assertEqual(Path(folder, "001.jpg").read_bytes(), data)
+
+    def test_missing_original_still_tries_genuinely_distinct_hires_fallback(self):
+        original = "https://gallery.test/albums/test/001.jpg"
+        display = "https://gallery.test/displayimage.php?album=7&pid=9"
+        alternate = "https://gallery.test/albums/hires/001.jpg"
+        missing = Mock(status_code=404)
+        missing.raise_for_status.side_effect = requests.HTTPError(
+            "404 Not Found", response=missing
+        )
+        large = self.image_response(self.image_bytes(1400, 1400))
+        candidate = gr._encode_candidate_metadata(original, display_url=display)
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", side_effect=[missing, large]
+        ) as get, patch.object(
+            gr, "extract_all_displayimage_candidates", return_value=[alternate]
+        ) as detail:
+            success = gr.download_image_candidates(
+                [candidate], folder, lambda _msg: None,
+                max_attempts=1, min_width=1024, min_height=1024,
+            )
+            self.assertTrue(success)
+            self.assertTrue(Path(folder, "001.jpg").exists())
+            self.assertEqual(get.call_count, 2)
+        detail.assert_called_once()
+
+
+
 class CoppermineNavigationLinkTests(unittest.TestCase):
     """Category navigation/breadcrumbs must not become incomplete children."""
 
