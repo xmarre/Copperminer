@@ -3339,6 +3339,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             )
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in {403, 429}:
+                # Never save a partial image list as though the album were
+                # complete after the server has denied additional pages.
+                raise
             detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
             log(f"[DEBUG] Skipping unavailable pagination page: {pl} ({detail})")
             continue
@@ -3444,7 +3448,8 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None,
                              filename_hint=None, stop_flag=None,
-                             min_width=0, min_height=0):
+                             min_width=0, min_height=0,
+                             abort_on_block=False):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -3558,6 +3563,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     candidate, headers=headers, stream=True, timeout=20,
                     _pacing_kind="download", _pacing_stop_event=stop_flag,
                 )
+                if abort_on_block and r.status_code in {403, 429}:
+                    log(
+                        f"HTTP {r.status_code} from {candidate}; stopping Coppermine "
+                        "downloads to avoid further requests to a restricted host."
+                    )
+                    if stop_flag is not None:
+                        stop_flag.set()
+                    return False
                 if r.status_code == 429:
                     retry = retry_after_seconds(r.headers.get("Retry-After"))
                     delay = min(30.0, max(1.0, 5.0 if retry is None else retry))
@@ -3844,7 +3857,7 @@ def download_4chan_archive_candidates(
 
 
 def threaded_download_worker(download_queue, log, stop_flag, polite=False,
-                             min_width=0, min_height=0):
+                             min_width=0, min_height=0, abort_on_block=False):
     """Drain queued downloads, even when cancellation or a worker error occurs."""
     while True:
         try:
@@ -3875,6 +3888,7 @@ def threaded_download_worker(download_queue, log, stop_flag, polite=False,
                     referer=referer, filename_hint=filename_hint,
                     stop_flag=stop_flag,
                     min_width=min_width, min_height=min_height,
+                    abort_on_block=abort_on_block,
                 )
         except Exception as exc:
             log(f"Unexpected download worker error: {exc}")
@@ -3904,6 +3918,10 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
         session.pacer.set_host_min_interval(
             root_url, COPPERMINE_REQUEST_INTERVAL_SECONDS
         )
+        # GUI jobs already have a stop event. Direct API calls also need a
+        # shared signal to stop their remaining queue after an HTTP block.
+        if stop_flag is None:
+            stop_flag = threading.Event()
         if workers > 1:
             log(
                 f"Coppermine protection: using 1 download worker instead of "
@@ -4033,6 +4051,11 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 f"  Skipping unavailable album: {album_name} "
                 f"({album_url}, {detail})"
             )
+            if site_type == "coppermine" and status in {403, 429}:
+                log("Access restricted: stopping remaining Coppermine album requests.")
+                stop_flag.set()
+                save_page_cache(root_url, tree, pages)
+                return
             continue
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
@@ -4073,7 +4096,10 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
     for _ in range(workers):
         t = threading.Thread(
             target=threaded_download_worker,
-            args=(q, log, stop_flag, mimic_human, min_width, min_height),
+            args=(
+                q, log, stop_flag, mimic_human, min_width, min_height,
+                site_type == "coppermine",
+            ),
         )
         t.daemon = True
         t.start()

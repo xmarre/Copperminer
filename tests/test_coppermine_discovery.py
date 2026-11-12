@@ -941,6 +941,79 @@ class CoppermineTrafficReductionTests(unittest.TestCase):
                 )
         saved.assert_not_called()
 
+    def test_blocked_coppermine_image_aborts_without_retrying_candidates(self):
+        urls = [
+            "https://gallery.test/photos/albums/original.jpg",
+            "https://gallery.test/photos/albums/normal_original.jpg",
+        ]
+        for status in (403, 429):
+            with self.subTest(status=status):
+                response = self._response(status, url=urls[0])
+                stop = gr.threading.Event()
+                logs = []
+                with tempfile.TemporaryDirectory() as folder, patch.object(
+                    gr.session, "get", return_value=response
+                ) as get, patch.object(gr.time, "sleep") as sleep:
+                    result = gr.download_image_candidates(
+                        urls, folder, logs.append, max_attempts=3,
+                        stop_flag=stop, abort_on_block=True,
+                    )
+                    self.assertFalse(result)
+                    self.assertTrue(stop.is_set())
+                    get.assert_called_once()
+                    sleep.assert_not_called()
+                    self.assertEqual(list(Path(folder).iterdir()), [])
+                self.assertTrue(any(f"HTTP {status}" in msg for msg in logs))
+
+    def test_blocked_album_stops_following_album_scans(self):
+        root = "https://gallery.test/photos/"
+        selected = [
+            ("First", root + "thumbnails.php?album=1", ["First"]),
+            ("Second", root + "thumbnails.php?album=2", ["Second"]),
+        ]
+        rejected = self._response(403, url=selected[0][1])
+        stop = gr.threading.Event()
+        logs = []
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr, "load_page_cache", return_value=({}, None)
+        ), patch.object(gr, "save_page_cache") as saved, patch.object(
+            gr, "get_all_candidate_images_from_album",
+            side_effect=requests.HTTPError("Forbidden", response=rejected)
+        ) as extract:
+            gr._rip_galleries_impl(
+                selected, folder, logs.append, root,
+                stop_flag=stop, workers=8,
+            )
+        self.assertTrue(stop.is_set())
+        extract.assert_called_once()
+        saved.assert_called_once()
+        self.assertTrue(any("1 download worker" in msg for msg in logs))
+        self.assertTrue(any("stopping remaining" in msg for msg in logs))
+
+    def test_blocked_album_pagination_is_not_silently_partial(self):
+        root = "https://gallery.test/photos/thumbnails.php?album=1"
+        next_page = root + "&page=2"
+        html = (
+            '<html><a href="displayimage.php?album=1&pid=7">'
+            '<img src="albums/test/thumb_001.jpg"></a>'
+            '<a href="thumbnails.php?album=1&page=2">2</a></html>'
+        )
+        blocked = self._response(403, url=next_page)
+
+        def fake_fetch(url, pages, **_kwargs):
+            if url == next_page:
+                raise requests.HTTPError("Forbidden", response=blocked)
+            self.assertEqual(url, root)
+            pages[url] = {"final_url": url, "html": html}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            with self.assertRaises(requests.HTTPError):
+                gr.get_all_candidate_images_from_album(
+                    root, page_cache={}, quick_scan=False,
+                )
+
+
     def test_discovery_installs_host_policy_before_fetching_pages(self):
         root = "https://gallery.test/photos/"
         tree = {

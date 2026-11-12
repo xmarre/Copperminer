@@ -9,6 +9,7 @@
 - Cached HTML revalidation uses one conditional GET instead of HEAD followed by GET. Unchanged pages retain their extracted image-list and album metadata, avoiding unnecessary follow-on fetches.
 - HTTP 403/429 during cached-page revalidation propagates to the existing incomplete-discovery handling rather than being silently treated as a successful cached page.
 - Coppermine discovery honors the Stop flag before each request and during host pacing/retry waits. Cancellation is not mistaken for an incomplete or successfully cached scan.
+- Blocked album pagination and image downloads stop further Coppermine requests instead of continuing through additional albums or retrying image variants.
 
 ### Diagnostics and validation
 

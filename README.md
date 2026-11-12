@@ -97,7 +97,10 @@ downloading. Cached pages are revalidated with a single conditional GET, never
 a HEAD request followed by a GET. The **Stop** button cancels pending
 Coppermine requests and pacing waits without visiting additional categories.
 A cached page that receives HTTP 403/429
-does not mask the access failure. Logs include limited response diagnostics
+does not mask the access failure. Downloading also stops scanning additional
+Coppermine albums or attempting alternative image URLs after HTTP 403/429,
+preventing an access-denied response from producing a retry storm.
+Logs include limited response diagnostics
 such as Retry-After or CF-Mitigated, when provided, without including cookies
 or challenge-response content.
 
