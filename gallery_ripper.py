@@ -2160,7 +2160,9 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
-TREE_CACHE_VERSION = 3
+# Version 4 drops trees that incorrectly persisted breadcrumb/backlink
+# placeholders as incomplete categories. Page HTML remains reusable.
+TREE_CACHE_VERSION = 4
 IMAGE_EXTRACTOR_VERSION = 4
 DOWNLOAD_WORKERS = 4
 
@@ -2550,6 +2552,12 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             name = a.text.strip()
             if not name or name == cat_title or linked_cat in seen_subcat_ids:
                 continue
+            if subcat_url in visited:
+                # Coppermine breadcrumb/navigation links can point back to
+                # already explored ancestors or other categories. They are
+                # not children and must not become incomplete placeholders.
+                log(f"{indent}   ↪ Navigation link to visited category: {name}; ignoring.")
+                continue
             seen_subcat_ids.add(linked_cat)
             subcats.append((name, subcat_url))
             log(f"{indent}   Found subcategory: {name}")
@@ -2661,6 +2669,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         if cached_node.get('name') != cat_title:
             cached_node = dict(cached_node)
             cached_node['name'] = cat_title
+        # A reused subtree is already explored for this scan. Register all
+        # its descendants so later breadcrumb links cannot create duplicates.
+        visited.update(url for url in _build_url_map(cached_node) if url)
         return cached_node
 
     seen_cats = set()
@@ -2673,6 +2684,11 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         if cat_num.group(1) in seen_cats:
             continue
         seen_cats.add(cat_num.group(1))
+        # Earlier siblings may have visited this URL after the links above
+        # were parsed. Ignore these navigation/cross-links as well.
+        if subcat_url in visited:
+            log(f"{indent}   ↪ Already explored category: {name}; ignoring.")
+            continue
         host = urlparse(subcat_url).netloc.lower()
         child = None
         if host not in blocked_hosts:
@@ -2703,6 +2719,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                     f"({subcat_url}, {detail}); retaining its place in the tree"
                 )
         if child is None:
+            # The visited-before-request guard above rejects navigation links.
+            # A URL added to visited during a *failed* fetch still needs an
+            # incomplete placeholder and any previously cached albums.
             # Preserve any previously discovered albums, otherwise keep a
             # navigable placeholder for a category seen on its parent's page.
             previous = (cached_nodes or {}).get(subcat_url)

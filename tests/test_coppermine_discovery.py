@@ -1124,6 +1124,176 @@ class CoppermineRecoveryTests(unittest.TestCase):
         self.assertEqual([n["name"] for n in tree["children"]], ["Movies"])
 
 
+
+class CoppermineNavigationLinkTests(unittest.TestCase):
+    """Category navigation/breadcrumbs must not become incomplete children."""
+
+    def test_ancestor_breadcrumb_does_not_mark_complete_gallery_incomplete(self):
+        root = "https://gallery.test/photos/index.php"
+        television = "https://gallery.test/photos/index.php?cat=3"
+        production = "https://gallery.test/photos/index.php?cat=11"
+        stills = "https://gallery.test/photos/index.php?cat=128"
+        pages = {
+            root: '<html><title>Home</title><a href="index.php?cat=3">Television &amp; Web Series</a></html>',
+            television: '<html><title>TV</title><a href="index.php?cat=11">Show</a></html>',
+            production: '<html><title>Show</title><a href="index.php?cat=128">Episode Stills</a></html>',
+            stills: (
+                '<html><title>Episode Stills</title>'
+                '<a href="index.php?cat=3">Television &amp; Web Series</a>'
+                '<a href="thumbnails.php?album=47">Promotional Stills</a></html>'
+            ),
+        }
+        fetched = []
+        logs = []
+
+        def fake_fetch(url, cache, **_kwargs):
+            fetched.append(url)
+            cache[url] = {"html": pages[url], "final_url": url}
+            return pages[url], True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(root, page_cache={}, quick_scan=False, log=logs.append)
+
+        self.assertEqual(fetched, [root, television, production, stills])
+        self.assertFalse(tree["incomplete"])
+        tv_node = tree["children"][0]
+        show_node = tv_node["children"][0]
+        stills_node = show_node["children"][0]
+        self.assertFalse(any(n["incomplete"] for n in (tv_node, show_node, stills_node)))
+        self.assertEqual(stills_node["children"], [])
+        self.assertEqual([a["name"] for a in stills_node["albums"]], ["Promotional Stills"])
+        self.assertTrue(any("Navigation link to visited category" in entry for entry in logs))
+        self.assertFalse(any("Unavailable subcategory" in entry for entry in logs))
+
+    def test_backlink_to_previous_sibling_is_not_a_new_child(self):
+        root = "https://gallery.test/photos/index.php"
+        movies = "https://gallery.test/photos/index.php?cat=2"
+        tv = "https://gallery.test/photos/index.php?cat=3"
+        earlier = "https://gallery.test/photos/index.php?cat=4"
+        pages = {
+            root: (
+                '<html><title>Home</title>'
+                '<a href="index.php?cat=2">Movies</a>'
+                '<a href="index.php?cat=3">Television</a></html>'
+            ),
+            movies: '<html><title>Movies</title><a href="index.php?cat=4">Stills</a></html>',
+            earlier: "<html><title>Stills</title></html>",
+            tv: (
+                '<html><title>TV</title>'
+                '<a href="index.php?cat=4">Stills navigation</a></html>'
+            ),
+        }
+        calls = []
+
+        def fake_fetch(url, cache, **_kwargs):
+            calls.append(url)
+            cache[url] = {"html": pages[url], "final_url": url}
+            return pages[url], True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(root, page_cache={}, quick_scan=False)
+        self.assertFalse(tree["incomplete"])
+        self.assertEqual([n["name"] for n in tree["children"]], ["Movies", "Television"])
+        self.assertEqual([n["name"] for n in tree["children"][0]["children"]], ["Stills"])
+        self.assertEqual(tree["children"][1]["children"], [])
+        self.assertEqual(calls.count(earlier), 1)
+
+    def test_quick_scan_cached_subtree_registers_descendant_as_visited(self):
+        root = "https://gallery.test/photos/index.php"
+        movies = "https://gallery.test/photos/index.php?cat=2"
+        tv = "https://gallery.test/photos/index.php?cat=3"
+        stills = "https://gallery.test/photos/index.php?cat=4"
+        pages = {
+            root: (
+                '<html><title>Home</title>'
+                '<a href="index.php?cat=2">Movies</a>'
+                '<a href="index.php?cat=3">TV</a></html>'
+            ),
+            movies: '<html><title>Movies</title><a href="index.php?cat=4">Stills</a></html>',
+            tv: '<html><title>TV</title><a href="index.php?cat=4">Stills</a></html>',
+        }
+        cached_stills = {
+            "type": "category", "name": "Stills", "url": stills,
+            "children": [], "albums": [], "specials": [], "incomplete": False,
+        }
+        cached_movies = {
+            "type": "category", "name": "Movies", "url": movies,
+            "child_hash": gr.compute_child_hash([("Stills", stills)], []),
+            "children": [cached_stills], "albums": [], "specials": [],
+            "incomplete": False,
+        }
+        requests = []
+
+        def fake_fetch(url, cache, **_kwargs):
+            requests.append(url)
+            cache[url] = {"html": pages[url], "final_url": url}
+            return pages[url], True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(
+                root, page_cache={}, quick_scan=True,
+                cached_nodes={movies: cached_movies},
+            )
+
+        self.assertFalse(tree["incomplete"])
+        self.assertEqual([c["name"] for c in tree["children"]], ["Movies", "TV"])
+        self.assertEqual([c["name"] for c in tree["children"][0]["children"]], ["Stills"])
+        self.assertEqual(tree["children"][1]["children"], [])
+        self.assertNotIn(stills, requests)
+
+    def test_old_poisoned_cache_tree_rejected_but_page_cache_retained(self):
+        root = "https://gallery.test/photos/index.php"
+        cached_pages = {root: {"html": "<html></html>"}}
+        stale_tree = {
+            "type": "category", "name": "Home", "url": root,
+            "incomplete": True,
+            "children": [
+                {"type": "category", "name": "Breadcrumb", "url": root,
+                 "incomplete": True, "children": [], "albums": []}
+            ],
+        }
+        with patch.object(gr, "site_cache_path", return_value="cache.json"), patch.object(
+            gr.os.path, "exists", return_value=True
+        ), patch("builtins.open"), patch.object(
+            gr.json, "load", return_value={
+                "tree_v": 3, "tree": stale_tree, "pages": cached_pages,
+            }
+        ):
+            loaded_pages, loaded_tree = gr.load_page_cache(root)
+        self.assertEqual(loaded_pages, cached_pages)
+        self.assertIsNone(loaded_tree)
+
+    def test_revisited_link_never_hides_real_fetch_failure(self):
+        root = "https://gallery.test/photos/index.php"
+        child = "https://gallery.test/photos/index.php?cat=2"
+        missing = "https://gallery.test/photos/index.php?cat=3"
+        html = (
+            '<html><title>Home</title>'
+            '<a href="index.php?cat=2">Movies</a>'
+            '<a href="index.php?cat=3">Unavailable</a></html>'
+        )
+        def fake_fetch(url, cache, **_kwargs):
+            if url == missing:
+                response = requests.Response()
+                response.status_code = 503
+                response.url = url
+                raise requests.HTTPError("503", response=response)
+            contents = html if url == root else (
+                '<html><title>Movies</title>'
+                '<a href="index.php?cat=2">Movies</a></html>'
+            )
+            cache[url] = {"html": contents, "final_url": url}
+            return contents, True
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(root, page_cache={}, quick_scan=False)
+        self.assertTrue(tree["incomplete"])
+        self.assertEqual(len(tree["children"]), 2)
+        self.assertFalse(tree["children"][0]["incomplete"])
+        self.assertTrue(tree["children"][1]["incomplete"])
+        self.assertEqual(tree["children"][0]["children"], [])
+
+
+
 class ImageQualityFilterTests(unittest.TestCase):
     @staticmethod
     def png(width, height):
