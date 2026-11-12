@@ -1794,6 +1794,9 @@ def yandex_result_image_entries(album_url, log=lambda msg: None):
 
 
 PAGE_CACHE_FRESH_SECONDS = 300
+# Slow down Coppermine *before* the first failure, including image transfers.
+# Host-wide reservation ensures category pages and download workers share slots.
+COPPERMINE_REQUEST_INTERVAL_SECONDS = 3.0
 PAGE_REQUEST_RETRY_DELAY = 1.0
 PAGE_REQUEST_RETRYABLE_STATUSES = {403, 404, 429, 500, 502, 503, 504}
 PAGE_REQUEST_INITIAL_BACKOFF = 0.15
@@ -1821,7 +1824,7 @@ def _page_state(url):
     )
 
 
-def _wait_for_page_request(url):
+def _wait_for_page_request(url, stop_flag=None):
     """Apply adaptive pacing only while a host is recovering from failures."""
     with _page_request_lock:
         host, state = _page_state(url)
@@ -1837,7 +1840,11 @@ def _wait_for_page_request(url):
 
     wait_time = scheduled - now
     if wait_time > 0:
-        time.sleep(wait_time)
+        if stop_flag is not None:
+            if stop_flag.wait(wait_time):
+                raise PacingCancelled("Discovery cancelled during host backoff")
+        else:
+            time.sleep(wait_time)
 
 
 def _activate_page_backoff(url, *, severe=False):
@@ -1892,6 +1899,7 @@ def _discovery_request(
     timeout=20,
     log=lambda msg: None,
     indent="",
+    stop_flag=None,
 ):
     """Issue a gallery-page request with adaptive host backoff and one retry."""
     request_headers = {"Referer": _same_origin_referer(url)}
@@ -1901,18 +1909,36 @@ def _discovery_request(
     requester = getattr(session, method.lower())
     first_status = None
     for attempt in range(2):
-        _wait_for_page_request(url)
-        response = requester(
-            url,
-            headers=request_headers,
-            allow_redirects=True,
-            timeout=timeout,
-        )
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Discovery cancelled before next request")
+        if stop_flag is not None:
+            _wait_for_page_request(url, stop_flag=stop_flag)
+        else:
+            _wait_for_page_request(url)
+        request_options = {
+            "headers": request_headers,
+            "allow_redirects": True,
+            "timeout": timeout,
+        }
+        if stop_flag is not None:
+            request_options["_pacing_stop_event"] = stop_flag
+        response = requester(url, **request_options)
         status = response.status_code
         if status in {403, 429}:
             # Access denial is not a signal to hammer the same host again.
             _activate_page_backoff(url, severe=True)
-            log(f"{indent}HTTP {status} from {url}; pausing this host for this discovery")
+            details = []
+            # Log bounded, non-sensitive diagnostics instead of challenge HTML,
+            # cookies, server-set tokens, or request authentication headers.
+            for name in ("Server", "Retry-After", "CF-Mitigated", "CF-Ray"):
+                value = response.headers.get(name) if response.headers else None
+                if value:
+                    details.append(f"{name}={str(value).strip()[:80]!r}")
+            diagnostic = f" ({', '.join(details)})" if details else ""
+            log(
+                f"{indent}HTTP {status} from {url}{diagnostic}; "
+                "stopping discovery requests to this host"
+            )
             return response
         if status not in PAGE_REQUEST_RETRYABLE_STATUSES:
             if first_status == 404:
@@ -1937,124 +1963,87 @@ def _discovery_request(
             f"{indent}HTTP {status} from {url}; "
             f"retrying after {delay:g}s"
         )
-        time.sleep(delay)
+        if stop_flag is not None:
+            if stop_flag.wait(delay):
+                raise PacingCancelled("Discovery cancelled during retry delay")
+        else:
+            time.sleep(delay)
 
     return response
 
 
-def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
-    """Return HTML for *url* using the cache and indicate if it changed."""
+def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent="", stop_flag=None):
+    """Fetch gallery HTML with at most one HTTP request per cache revalidation.
+
+    A conditional GET replaces the previous HEAD + GET pair. A blocking 403/429
+    must propagate to discovery, including for stale cached pages, so that the
+    crawler stops contacting that host instead of treating a block as success.
+    """
+    if stop_flag is not None and stop_flag.is_set():
+        raise PacingCancelled("Discovery cancelled")
     entry = page_cache.get(url)
-    if entry and quick_scan:
+    if entry and not quick_scan and entry.get("final_url"):
+        log(f"{indent}Using cached page: {url}")
+        return entry["html"], False
+
+    if entry and quick_scan and entry.get("final_url"):
         timestamp = entry.get("timestamp")
-        if (
-            timestamp is not None
-            and entry.get("final_url")
-            and time.time() - timestamp <= PAGE_CACHE_FRESH_SECONDS
-        ):
+        if timestamp is not None and time.time() - timestamp <= PAGE_CACHE_FRESH_SECONDS:
             log(f"{indent}Using fresh cached page: {url}")
             return entry["html"], False
 
-        headers = {}
+    headers = {}
+    if entry and quick_scan:
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
         if entry.get("last_modified"):
             headers["If-Modified-Since"] = entry["last_modified"]
-        try:
-            r = _discovery_request(
-                "head",
-                url,
-                headers=headers,
-                timeout=10,
-                log=log,
-                indent=indent,
-            )
-            if r.ok and getattr(r, "url", None):
-                entry["final_url"] = r.url
-            if r.status_code == 304:
-                entry["timestamp"] = time.time()
-                log(f"{indent}Using cached page (304): {url}")
-                return entry["html"], False
-            if r.status_code == 200:
-                et = r.headers.get("ETag")
-                lm = r.headers.get("Last-Modified")
-                validators = []
-                if et and entry.get("etag"):
-                    validators.append(et == entry.get("etag"))
-                if lm and entry.get("last_modified"):
-                    validators.append(lm == entry.get("last_modified"))
-                if validators and all(validators):
-                    entry["timestamp"] = time.time()
-                    log(f"{indent}Using cached page (headers match): {url}")
-                    return entry["html"], False
 
-                refresh = _discovery_request(
-                    "get",
-                    url,
-                    timeout=20,
-                    log=log,
-                    indent=indent,
-                )
-                refresh.raise_for_status()
-                html = refresh.text
-                page_cache[url] = {
-                    "html": html,
-                    "html_hash": hashlib.sha1(html.encode("utf-8")).hexdigest(),
-                    "timestamp": time.time(),
-                    "etag": refresh.headers.get("ETag"),
-                    "last_modified": refresh.headers.get("Last-Modified"),
-                    "final_url": refresh.url,
-                }
-                if refresh.url != url:
-                    log(f"{indent}Refreshed: {url} -> {refresh.url}")
-                else:
-                    log(f"{indent}Refreshed: {url}")
-                return html, True
-        except requests.RequestException:
-            pass
-        # Revalidation failures must not destroy a usable cached page.
-        log(f"{indent}Using cached page: {url}")
+    try:
+        resp = _discovery_request(
+            "get", url, headers=headers or None, timeout=20,
+            log=log, indent=indent, stop_flag=stop_flag,
+        )
+        if entry and resp.status_code == 304:
+            entry["timestamp"] = time.time()
+            if getattr(resp, "url", None):
+                entry["final_url"] = resp.url
+            log(f"{indent}Using cached page (304): {url}")
+            return entry["html"], False
+        resp.raise_for_status()
+        html = resp.text
+        new_hash = hashlib.sha1(html.encode("utf-8")).hexdigest()
+        old_hash = (
+            entry.get("html_hash")
+            or hashlib.sha1(entry["html"].encode("utf-8")).hexdigest()
+        ) if entry else None
+        changed = old_hash != new_hash
+        metadata = {
+            "html": html,
+            "html_hash": new_hash,
+            "timestamp": time.time(),
+            "etag": resp.headers.get("ETag"),
+            "last_modified": resp.headers.get("Last-Modified"),
+            "final_url": resp.url,
+        }
+        if entry and not changed:
+            # Preserve expensive album-image and child-list extraction on a
+            # byte-identical 200 response (some servers don't send validators).
+            entry.update(metadata)
+        else:
+            page_cache[url] = metadata
+        log(
+            f"{indent}Fetched: {url} -> {resp.url}"
+            if resp.url != url else f"{indent}Fetched: {url}"
+        )
+        return html, changed
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(exc, PacingCancelled) or status in {403, 429} or not entry:
+            raise
+        # A transient failure must not delete a usable cached page.
+        log(f"{indent}Using cached page after revalidation failed: {url}")
         return entry["html"], False
-
-    if entry and not quick_scan:
-        if not entry.get("final_url"):
-            try:
-                r = _discovery_request(
-                    "head",
-                    url,
-                    timeout=10,
-                    log=log,
-                    indent=indent,
-                )
-                if r.ok and getattr(r, "url", None):
-                    entry["final_url"] = r.url
-            except Exception:
-                pass
-        log(f"{indent}Using cached page: {url}")
-        return entry["html"], False
-
-    resp = _discovery_request(
-        "get",
-        url,
-        timeout=20,
-        log=log,
-        indent=indent,
-    )
-    resp.raise_for_status()
-    html = resp.text
-    page_cache[url] = {
-        "html": html,
-        "html_hash": hashlib.sha1(html.encode("utf-8")).hexdigest(),
-        "timestamp": time.time(),
-        "etag": resp.headers.get("ETag"),
-        "last_modified": resp.headers.get("Last-Modified"),
-        "final_url": resp.url,
-    }
-    if resp.url != url:
-        log(f"{indent}Fetched: {url} -> {resp.url}")
-    else:
-        log(f"{indent}Fetched: {url}")
-    return html, True
 
 BASE_URL = ""  # Will be set from GUI
 
@@ -2256,7 +2245,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None, blocked_hosts=None):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None, blocked_hosts=None, probe_album_counts=False, stop_flag=None):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -2279,6 +2268,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         Mapping of previously discovered nodes keyed by URL. Used for quick
         delta scans to skip unchanged subtrees.
     """
+    if stop_flag is not None and stop_flag.is_set():
+        raise PacingCancelled("Coppermine discovery stopped by user")
     if visited is None:
         visited = set()
     if blocked_hosts is None:
@@ -2293,7 +2284,10 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     if page_cache is None:
         page_cache = {}
 
-    html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
+    html, _ = fetch_html_cached(
+        root_url, page_cache, log=log, quick_scan=quick_scan,
+        indent=indent, stop_flag=stop_flag,
+    )
     soup = BeautifulSoup(html, "html.parser")
     page_url = page_cache.get(root_url, {}).get("final_url") or root_url
     base_tag = soup.find("base", href=True)
@@ -2387,6 +2381,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
 
     enqueue_pagination(soup, link_base_url)
     while queued_pages:
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Coppermine discovery stopped by user")
         pagination_url = queued_pages.pop(0)
         if urlparse(pagination_url).netloc.lower() in blocked_hosts:
             node["incomplete"] = True
@@ -2398,8 +2394,11 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 log=log,
                 quick_scan=quick_scan,
                 indent=indent + "  ",
+                stop_flag=stop_flag,
             )
         except requests.RequestException as exc:
+            if isinstance(exc, PacingCancelled):
+                raise
             node["incomplete"] = True
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status in {403, 429}:
@@ -2454,6 +2453,13 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
             log(f"{indent}   Found subcategory: {name}")
 
     albums = []
+    # Album counts displayed on category pages are sufficient for discovery.
+    # Opening every thumbnails.php page just to populate a count can multiply
+    # the request volume by the number of albums on a large gallery.
+    previous_counts = {
+        album.get("url"): album.get("image_count")
+        for album in ((cached_nodes or {}).get(root_url) or {}).get("albums", [])
+    }
     seen_album_ids = set()
     special_keys = {key for _, key in SPECIALS}
     for _, page_base, page_soup in page_contexts:
@@ -2488,14 +2494,23 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 pass
             listing_count = _album_count_from_listing(a)
             try:
-                img_count = (
-                    listing_count
-                    if listing_count is not None
-                    else (
+                if listing_count is not None:
+                    img_count = listing_count
+                elif not probe_album_counts:
+                    img_count = previous_counts.get(album_url)
+                    if img_count is None:
+                        cached_page = page_cache.get(album_url) or {}
+                        img_count = (
+                            cached_page.get("image_count", "?")
+                            if cached_page.get("image_count_html_hash")
+                            == cached_page.get("html_hash")
+                            else "?"
+                        )
+                else:
+                    img_count = (
                         "?" if urlparse(album_url).netloc.lower() in blocked_hosts
                         else get_album_image_count(album_url, page_cache)
                     )
-                )
             except requests.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in {404, 410}:
@@ -2548,6 +2563,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
 
     seen_cats = set()
     for name, subcat_url in subcats:
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Coppermine discovery stopped by user")
         cat_num = re.search(r'cat=(\d+)', subcat_url)
         if not cat_num:
             continue
@@ -2569,8 +2586,12 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                     quick_scan=quick_scan,
                     cached_nodes=cached_nodes,
                     blocked_hosts=blocked_hosts,
+                    probe_album_counts=probe_album_counts,
+                    stop_flag=stop_flag,
                 )
             except requests.RequestException as exc:
+                if isinstance(exc, PacingCancelled):
+                    raise
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
                 if status in {403, 429}:
@@ -2716,6 +2737,14 @@ def discover_or_load_gallery_tree(
     cached_nodes = _build_url_map(cached_tree) if cached_tree else None
     site_type = select_adapter_for_url(root_url)
     log(f"[DEBUG] Adapter chosen: {site_type}")
+    if site_type == "coppermine":
+        session.pacer.set_host_min_interval(
+            root_url, COPPERMINE_REQUEST_INTERVAL_SECONDS
+        )
+        log(
+            "Coppermine protective pacing: at least 3 seconds between requests "
+            "to the same host; album pages are not probed for counts."
+        )
     if site_type == "universal":
         rules = select_universal_rules(root_url)
         tree = universal_discover_tree(
@@ -2753,8 +2782,11 @@ def discover_or_load_gallery_tree(
                 page_cache=pages,
                 quick_scan=quick_scan,
                 cached_nodes=cached_nodes,
+                stop_flag=stop_flag,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            if isinstance(exc, PacingCancelled):
+                raise
             if not cached_tree:
                 raise
             tree = dict(cached_tree)
@@ -3307,6 +3339,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
             )
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in {403, 429}:
+                # Never save a partial image list as though the album were
+                # complete after the server has denied additional pages.
+                raise
             detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
             log(f"[DEBUG] Skipping unavailable pagination page: {pl} ({detail})")
             continue
@@ -3412,7 +3448,8 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None,
                              filename_hint=None, stop_flag=None,
-                             min_width=0, min_height=0):
+                             min_width=0, min_height=0,
+                             abort_on_block=False):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -3526,6 +3563,14 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     candidate, headers=headers, stream=True, timeout=20,
                     _pacing_kind="download", _pacing_stop_event=stop_flag,
                 )
+                if abort_on_block and r.status_code in {403, 429}:
+                    log(
+                        f"HTTP {r.status_code} from {candidate}; stopping Coppermine "
+                        "downloads to avoid further requests to a restricted host."
+                    )
+                    if stop_flag is not None:
+                        stop_flag.set()
+                    return False
                 if r.status_code == 429:
                     retry = retry_after_seconds(r.headers.get("Retry-After"))
                     delay = min(30.0, max(1.0, 5.0 if retry is None else retry))
@@ -3812,7 +3857,7 @@ def download_4chan_archive_candidates(
 
 
 def threaded_download_worker(download_queue, log, stop_flag, polite=False,
-                             min_width=0, min_height=0):
+                             min_width=0, min_height=0, abort_on_block=False):
     """Drain queued downloads, even when cancellation or a worker error occurs."""
     while True:
         try:
@@ -3843,6 +3888,7 @@ def threaded_download_worker(download_queue, log, stop_flag, polite=False,
                     referer=referer, filename_hint=filename_hint,
                     stop_flag=stop_flag,
                     min_width=min_width, min_height=min_height,
+                    abort_on_block=abort_on_block,
                 )
         except Exception as exc:
             log(f"Unexpected download worker error: {exc}")
@@ -3867,13 +3913,27 @@ def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, 
 def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None, min_width=0, min_height=0):
     """Build and download a gallery queue with independent host scheduling."""
     workers = max(1, min(16, int(DOWNLOAD_WORKERS if workers is None else workers)))
+    site_type = select_adapter_for_url(root_url)
+    if site_type == "coppermine":
+        session.pacer.set_host_min_interval(
+            root_url, COPPERMINE_REQUEST_INTERVAL_SECONDS
+        )
+        # GUI jobs already have a stop event. Direct API calls also need a
+        # shared signal to stop their remaining queue after an HTTP block.
+        if stop_flag is None:
+            stop_flag = threading.Event()
+        if workers > 1:
+            log(
+                f"Coppermine protection: using 1 download worker instead of "
+                f"{workers} to avoid parallel requests."
+            )
+            workers = 1
     log(
         "Will download {} album(s): {}".format(
             len(selected_albums), ["/".join(a[2]) for a in selected_albums]
         )
     )
 
-    site_type = select_adapter_for_url(root_url)
     if site_type == "4chan":
         log("Detected 4chan; using fast download path.")
 
@@ -3991,6 +4051,11 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 f"  Skipping unavailable album: {album_name} "
                 f"({album_url}, {detail})"
             )
+            if site_type == "coppermine" and status in {403, 429}:
+                log("Access restricted: stopping remaining Coppermine album requests.")
+                stop_flag.set()
+                save_page_cache(root_url, tree, pages)
+                return
             continue
         log(f"  Found {len(image_entries)} images in {album_name}.")
         if not image_entries:
@@ -4031,7 +4096,10 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
     for _ in range(workers):
         t = threading.Thread(
             target=threaded_download_worker,
-            args=(q, log, stop_flag, mimic_human, min_width, min_height),
+            args=(
+                q, log, stop_flag, mimic_human, min_width, min_height,
+                site_type == "coppermine",
+            ),
         )
         t.daemon = True
         t.start()
@@ -4118,7 +4186,9 @@ class GalleryRipperApp(tb.Window):
         mimic_chk.pack(side="left")
         ToolTip(
             mimic_chk,
-            text="Space requests per host, including gallery discovery. Does not bypass site restrictions.",
+            text="Recommended for all galleries. Coppermine always uses a conservative "
+                 "3-second per-host minimum and one download worker, even if unchecked. "
+                 "Pacing does not bypass site restrictions.",
         )
 
         self.show_specials_var = tk.BooleanVar(value=False)
@@ -4923,6 +4993,8 @@ class GalleryRipperApp(tb.Window):
                 ))
             else:
                 self.after(0, lambda: self.log("Discovery complete."))
+        except PacingCancelled:
+            self.after(0, lambda: self.log("Discovery stopped by user."))
         except YandexBlockedError as e:
             self.after(0, lambda err=e: self.handle_yandex_blocked(err))
         except archived_moe.ArchiveAccessBlockedError as e:

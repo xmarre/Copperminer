@@ -53,6 +53,29 @@ class HostRequestPacerTests(unittest.TestCase):
         pacer.wait("https://example.test/two")
         self.assertLess(time.monotonic() - start, 0.2)
 
+    def test_coppermine_floor_applies_before_first_error_even_without_polite(self):
+        clock = [100.0]
+        pacer = HostRequestPacer(clock=lambda: clock[0], jitter=lambda a, b: 0.0)
+        page = "https://site.test/photos/index.php?cat=1"
+        image = "https://site.test/photos/albums/photo.jpg"
+        pacer.set_host_min_interval(page, 3.0)
+        pacer.wait(page, kind="page", polite=False)
+        self.assertEqual(pacer._hosts["site.test"]["next_at"], 103.0)
+        clock[0] = 103.0
+        pacer.wait(image, kind="download", polite=False)
+        self.assertEqual(pacer._hosts["site.test"]["next_at"], 106.0)
+        pacer.set_host_min_interval(page, 1.0)
+        self.assertEqual(pacer._hosts["site.test"]["min_interval"], 3.0)
+
+    def test_coppermine_host_floor_does_not_throttle_another_host(self):
+        clock = [100.0]
+        pacer = HostRequestPacer(clock=lambda: clock[0], jitter=lambda a, b: 0.0)
+        pacer.set_host_min_interval("https://site.test/photos/", 3.0)
+        pacer.wait("https://site.test/photos/index.php", polite=False)
+        pacer.wait("https://other.test/index.php", polite=False)
+        self.assertEqual(pacer._hosts["other.test"]["next_at"], 100.0)
+
+
     def test_retry_after_http_date_and_invalid_value(self):
         now = datetime.now(timezone.utc)
         self.assertAlmostEqual(
