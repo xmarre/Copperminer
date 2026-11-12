@@ -1824,7 +1824,7 @@ def _page_state(url):
     )
 
 
-def _wait_for_page_request(url):
+def _wait_for_page_request(url, stop_flag=None):
     """Apply adaptive pacing only while a host is recovering from failures."""
     with _page_request_lock:
         host, state = _page_state(url)
@@ -1840,7 +1840,11 @@ def _wait_for_page_request(url):
 
     wait_time = scheduled - now
     if wait_time > 0:
-        time.sleep(wait_time)
+        if stop_flag is not None:
+            if stop_flag.wait(wait_time):
+                raise PacingCancelled("Discovery cancelled during host backoff")
+        else:
+            time.sleep(wait_time)
 
 
 def _activate_page_backoff(url, *, severe=False):
@@ -1895,6 +1899,7 @@ def _discovery_request(
     timeout=20,
     log=lambda msg: None,
     indent="",
+    stop_flag=None,
 ):
     """Issue a gallery-page request with adaptive host backoff and one retry."""
     request_headers = {"Referer": _same_origin_referer(url)}
@@ -1904,13 +1909,20 @@ def _discovery_request(
     requester = getattr(session, method.lower())
     first_status = None
     for attempt in range(2):
-        _wait_for_page_request(url)
-        response = requester(
-            url,
-            headers=request_headers,
-            allow_redirects=True,
-            timeout=timeout,
-        )
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Discovery cancelled before next request")
+        if stop_flag is not None:
+            _wait_for_page_request(url, stop_flag=stop_flag)
+        else:
+            _wait_for_page_request(url)
+        request_options = {
+            "headers": request_headers,
+            "allow_redirects": True,
+            "timeout": timeout,
+        }
+        if stop_flag is not None:
+            request_options["_pacing_stop_event"] = stop_flag
+        response = requester(url, **request_options)
         status = response.status_code
         if status in {403, 429}:
             # Access denial is not a signal to hammer the same host again.
@@ -1951,18 +1963,24 @@ def _discovery_request(
             f"{indent}HTTP {status} from {url}; "
             f"retrying after {delay:g}s"
         )
-        time.sleep(delay)
+        if stop_flag is not None:
+            if stop_flag.wait(delay):
+                raise PacingCancelled("Discovery cancelled during retry delay")
+        else:
+            time.sleep(delay)
 
     return response
 
 
-def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent=""):
+def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, indent="", stop_flag=None):
     """Fetch gallery HTML with at most one HTTP request per cache revalidation.
 
     A conditional GET replaces the previous HEAD + GET pair. A blocking 403/429
     must propagate to discovery, including for stale cached pages, so that the
     crawler stops contacting that host instead of treating a block as success.
     """
+    if stop_flag is not None and stop_flag.is_set():
+        raise PacingCancelled("Discovery cancelled")
     entry = page_cache.get(url)
     if entry and not quick_scan and entry.get("final_url"):
         log(f"{indent}Using cached page: {url}")
@@ -1984,7 +2002,7 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
     try:
         resp = _discovery_request(
             "get", url, headers=headers or None, timeout=20,
-            log=log, indent=indent,
+            log=log, indent=indent, stop_flag=stop_flag,
         )
         if entry and resp.status_code == 304:
             entry["timestamp"] = time.time()
@@ -2021,7 +2039,7 @@ def fetch_html_cached(url, page_cache, log=lambda msg: None, quick_scan=True, in
         return html, changed
     except requests.RequestException as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
-        if status in {403, 429} or not entry:
+        if isinstance(exc, PacingCancelled) or status in {403, 429} or not entry:
             raise
         # A transient failure must not delete a usable cached page.
         log(f"{indent}Using cached page after revalidation failed: {url}")
@@ -2227,7 +2245,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None, blocked_hosts=None, probe_album_counts=False):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None, blocked_hosts=None, probe_album_counts=False, stop_flag=None):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -2250,6 +2268,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         Mapping of previously discovered nodes keyed by URL. Used for quick
         delta scans to skip unchanged subtrees.
     """
+    if stop_flag is not None and stop_flag.is_set():
+        raise PacingCancelled("Coppermine discovery stopped by user")
     if visited is None:
         visited = set()
     if blocked_hosts is None:
@@ -2264,7 +2284,10 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     if page_cache is None:
         page_cache = {}
 
-    html, _ = fetch_html_cached(root_url, page_cache, log=log, quick_scan=quick_scan, indent=indent)
+    html, _ = fetch_html_cached(
+        root_url, page_cache, log=log, quick_scan=quick_scan,
+        indent=indent, stop_flag=stop_flag,
+    )
     soup = BeautifulSoup(html, "html.parser")
     page_url = page_cache.get(root_url, {}).get("final_url") or root_url
     base_tag = soup.find("base", href=True)
@@ -2358,6 +2381,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
 
     enqueue_pagination(soup, link_base_url)
     while queued_pages:
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Coppermine discovery stopped by user")
         pagination_url = queued_pages.pop(0)
         if urlparse(pagination_url).netloc.lower() in blocked_hosts:
             node["incomplete"] = True
@@ -2369,8 +2394,11 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 log=log,
                 quick_scan=quick_scan,
                 indent=indent + "  ",
+                stop_flag=stop_flag,
             )
         except requests.RequestException as exc:
+            if isinstance(exc, PacingCancelled):
+                raise
             node["incomplete"] = True
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status in {403, 429}:
@@ -2535,6 +2563,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
 
     seen_cats = set()
     for name, subcat_url in subcats:
+        if stop_flag is not None and stop_flag.is_set():
+            raise PacingCancelled("Coppermine discovery stopped by user")
         cat_num = re.search(r'cat=(\d+)', subcat_url)
         if not cat_num:
             continue
@@ -2557,8 +2587,11 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                     cached_nodes=cached_nodes,
                     blocked_hosts=blocked_hosts,
                     probe_album_counts=probe_album_counts,
+                    stop_flag=stop_flag,
                 )
             except requests.RequestException as exc:
+                if isinstance(exc, PacingCancelled):
+                    raise
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
                 if status in {403, 429}:
@@ -2749,8 +2782,11 @@ def discover_or_load_gallery_tree(
                 page_cache=pages,
                 quick_scan=quick_scan,
                 cached_nodes=cached_nodes,
+                stop_flag=stop_flag,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            if isinstance(exc, PacingCancelled):
+                raise
             if not cached_tree:
                 raise
             tree = dict(cached_tree)
@@ -4931,6 +4967,8 @@ class GalleryRipperApp(tb.Window):
                 ))
             else:
                 self.after(0, lambda: self.log("Discovery complete."))
+        except PacingCancelled:
+            self.after(0, lambda: self.log("Discovery stopped by user."))
         except YandexBlockedError as e:
             self.after(0, lambda err=e: self.handle_yandex_blocked(err))
         except archived_moe.ArchiveAccessBlockedError as e:

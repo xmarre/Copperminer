@@ -877,6 +877,70 @@ class CoppermineTrafficReductionTests(unittest.TestCase):
         get.assert_called_once()
         sleep.assert_not_called()
 
+    def test_stop_prevents_additional_category_requests(self):
+        root = "https://gallery.test/photos/"
+        child = "https://gallery.test/photos/index.php?cat=2"
+        stop = gr.threading.Event()
+        fetched = []
+        html = (
+            '<html><title>Home</title>'
+            '<a href="index.php?cat=2">Movies</a></html>'
+        )
+
+        def fake_fetch(url, pages, **_kwargs):
+            fetched.append(url)
+            self.assertEqual(url, root)
+            pages[url] = {"html": html, "final_url": url}
+            stop.set()
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            with self.assertRaises(gr.PacingCancelled):
+                gr.discover_tree(
+                    root, page_cache={}, quick_scan=False, stop_flag=stop
+                )
+        self.assertEqual(fetched, [root])
+        self.assertNotIn(child, fetched)
+
+    def test_cancelled_cached_page_does_not_hide_stop_request(self):
+        url = "https://gallery.test/photos/"
+        stop = gr.threading.Event()
+        stop.set()
+        cache = {url: {
+            "html": "<html><title>Old</title></html>",
+            "timestamp": 1000, "final_url": url,
+        }}
+        with patch.object(gr.session, "get") as get:
+            with self.assertRaises(gr.PacingCancelled):
+                gr.fetch_html_cached(url, cache, stop_flag=stop)
+        get.assert_not_called()
+
+    def test_coppermine_request_passes_stop_event_to_scheduler(self):
+        url = "https://gallery.test/photos/"
+        stop = gr.threading.Event()
+        response = self._response(200, url=url)
+        with patch.object(gr.session, "get", return_value=response) as get, patch.object(
+            gr, "_wait_for_page_request"
+        ):
+            gr._discovery_request("get", url, stop_flag=stop)
+        self.assertIs(get.call_args.kwargs["_pacing_stop_event"], stop)
+
+    def test_cancellation_is_not_relabelled_as_incomplete_cache(self):
+        root = "https://gallery.test/photos/"
+        cached_tree = {"type": "category", "name": "Old", "url": root}
+        stop = gr.threading.Event()
+        stop.set()
+        with patch.object(
+            gr, "load_page_cache", return_value=({}, cached_tree)
+        ), patch.object(gr, "save_page_cache") as saved, patch.object(
+            gr, "discover_tree", side_effect=gr.PacingCancelled("stopped")
+        ):
+            with self.assertRaises(gr.PacingCancelled):
+                gr.discover_or_load_gallery_tree(
+                    root, lambda _msg: None, stop_flag=stop
+                )
+        saved.assert_not_called()
+
     def test_discovery_installs_host_policy_before_fetching_pages(self):
         root = "https://gallery.test/photos/"
         tree = {

@@ -94,7 +94,9 @@ During discovery, Copperminer reads album image counts from category listings
 or verified cached values, rather than requesting every album merely to count
 its images. Missing counts appear as `?` until the album is visited for
 downloading. Cached pages are revalidated with a single conditional GET, never
-a HEAD request followed by a GET. A cached page that receives HTTP 403/429
+a HEAD request followed by a GET. The **Stop** button cancels pending
+Coppermine requests and pacing waits without visiting additional categories.
+A cached page that receives HTTP 403/429
 does not mask the access failure. Logs include limited response diagnostics
 such as Retry-After or CF-Mitigated, when provided, without including cookies
 or challenge-response content.
