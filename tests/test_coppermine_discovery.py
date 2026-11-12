@@ -94,7 +94,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
             "http://example.test/",
         )
 
-    def test_fresh_cached_page_skips_head_probe(self):
+    def test_fresh_cached_page_skips_network(self):
         now = 1000.0
         cache = {
             "http://example.test/gallery": {
@@ -105,7 +105,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         }
         with patch.object(gr.time, "time", return_value=now), patch.object(
             gr.session, "head"
-        ) as head:
+        ) as head, patch.object(gr.session, "get") as get:
             html, changed = gr.fetch_html_cached(
                 "http://example.test/gallery", cache, quick_scan=True
             )
@@ -113,28 +113,28 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertIn("Cached", html)
         head.assert_not_called()
+        get.assert_not_called()
 
     def test_fresh_legacy_cache_backfills_effective_url(self):
         url = "http://example.test/gallery"
-        response = self._response(200, url="http://example.test/gallery/")
-        cache = {
-            url: {
-                "html": "<html><title>Cached</title></html>",
-                "timestamp": 995.0,
-            }
-        }
+        cached_html = "<html><title>Cached</title></html>"
+        response = self._response(
+            200, url="http://example.test/gallery/", text=cached_html
+        )
+        cache = {url: {"html": cached_html, "timestamp": 995.0}}
 
         with patch.object(gr.time, "time", return_value=1000.0), patch.object(
-            gr.session, "head", return_value=response
-        ) as head:
+            gr.session, "get", return_value=response
+        ) as get, patch.object(gr.session, "head") as head:
             html, changed = gr.fetch_html_cached(url, cache, quick_scan=True)
 
         self.assertFalse(changed)
         self.assertIn("Cached", html)
-        head.assert_called_once()
+        get.assert_called_once()
+        head.assert_not_called()
         self.assertEqual(cache[url]["final_url"], "http://example.test/gallery/")
 
-    def test_failed_quick_head_does_not_replace_cached_effective_url(self):
+    def test_failed_quick_revalidation_does_not_replace_cached_effective_url(self):
         url = "http://example.test/gallery"
         response = self._response(503, url="http://example.test/login")
         cache = {
@@ -147,23 +147,25 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         }
 
         with patch.object(gr.time, "time", return_value=1000.0), patch.object(
-            gr.session, "head", return_value=response
-        ), patch.object(gr.time, "sleep"):
+            gr.session, "get", return_value=response
+        ), patch.object(gr.session, "head") as head, patch.object(gr.time, "sleep"):
             html, changed = gr.fetch_html_cached(url, cache, quick_scan=True)
+            head.assert_not_called()
 
         self.assertFalse(changed)
         self.assertIn("Cached", html)
         self.assertEqual(cache[url]["final_url"], "http://example.test/gallery/")
 
-    def test_failed_legacy_head_does_not_store_error_url(self):
+    def test_failed_legacy_get_does_not_store_error_url(self):
         url = "http://example.test/gallery"
         response = self._response(503, url="http://example.test/login")
         cache = {url: {"html": "<html><title>Cached</title></html>"}}
 
-        with patch.object(gr.session, "head", return_value=response), patch.object(
-            gr.time, "sleep"
-        ):
+        with patch.object(gr.session, "get", return_value=response), patch.object(
+            gr.session, "head"
+        ) as head, patch.object(gr.time, "sleep"):
             html, changed = gr.fetch_html_cached(url, cache, quick_scan=False)
+            head.assert_not_called()
 
         self.assertFalse(changed)
         self.assertIn("Cached", html)
@@ -255,7 +257,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         self.assertEqual(cache[url]["image_count"], 9)
         self.assertIn("image_count_html_hash", cache[url])
 
-    def test_stale_cached_page_refreshes_when_head_validator_changes(self):
+    def test_stale_cached_page_refreshes_with_one_conditional_get(self):
         url = "http://example.test/gallery/index.php?cat=2"
         old_html = "<html><title>Old</title></html>"
         new_html = "<html><title>New</title></html>"
@@ -268,13 +270,15 @@ class CoppermineDiscoveryTests(unittest.TestCase):
                 "final_url": url,
             }
         }
-        head = self._response(200, url=url, headers={"ETag": "new"})
-        get = self._response(200, url=url, text=new_html, headers={"ETag": "new"})
+        response = self._response(200, url=url, text=new_html, headers={"ETag": "new"})
 
         with patch.object(gr.time, "time", return_value=1000.0), patch.object(
-            gr.session, "head", return_value=head
-        ), patch.object(gr.session, "get", return_value=get):
+            gr.session, "head"
+        ) as head, patch.object(gr.session, "get", return_value=response) as get:
             html, changed = gr.fetch_html_cached(url, cache, quick_scan=True)
+            head.assert_not_called()
+            get.assert_called_once()
+            self.assertEqual(get.call_args.kwargs["headers"]["If-None-Match"], "old")
 
         self.assertTrue(changed)
         self.assertEqual(html, new_html)
@@ -592,6 +596,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
                 parent_title="2008",
                 page_cache={},
                 quick_scan=False,
+                probe_album_counts=True,
             )
 
         self.assertEqual(tree["children"], [])
@@ -715,6 +720,7 @@ class CoppermineDiscoveryTests(unittest.TestCase):
                 log=logs.append,
                 page_cache={},
                 quick_scan=False,
+                probe_album_counts=True,
             )
 
         self.assertEqual([album["name"] for album in tree["albums"]], ["Working", "Transient"])
@@ -755,6 +761,137 @@ class CoppermineDiscoveryTests(unittest.TestCase):
         self.assertTrue(tree["children"][0]["incomplete"])
         self.assertFalse(tree["children"][1]["incomplete"])
         self.assertTrue(any("Unavailable subcategory: Broken" in line for line in logs))
+
+
+class CoppermineTrafficReductionTests(unittest.TestCase):
+    _response = staticmethod(CoppermineDiscoveryTests._response)
+
+    def setUp(self):
+        gr._page_request_state.clear()
+
+    def test_coppermine_discovery_does_not_fetch_album_pages_for_counts(self):
+        root = "https://gallery.test/photos/index.php?cat=1"
+        html = (
+            "<html><title>Movies</title>"
+            + "".join(
+                f'<a href="thumbnails.php?album={index}">Album {index}</a>'
+                for index in range(1, 41)
+            )
+            + "</html>"
+        )
+        fetched = []
+
+        def fake_fetch(url, pages, **_kwargs):
+            fetched.append(url)
+            pages[url] = {"final_url": url, "html": html}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch), patch.object(
+            gr, "get_album_image_count"
+        ) as get_count:
+            tree = gr.discover_tree(root, page_cache={}, quick_scan=False)
+
+        self.assertEqual(fetched, [root])
+        get_count.assert_not_called()
+        self.assertEqual(len(tree["albums"]), 40)
+        self.assertTrue(all(a["image_count"] == "?" for a in tree["albums"]))
+        self.assertFalse(tree["incomplete"])
+
+    def test_cached_album_count_is_used_without_network(self):
+        root = "https://gallery.test/photos/index.php?cat=1"
+        album = "https://gallery.test/photos/thumbnails.php?album=8"
+        html = '<html><title>Movies</title><a href="thumbnails.php?album=8">Stills</a></html>'
+        previous = {
+            "type": "category", "url": root, "name": "Movies",
+            "children": [], "albums": [{
+                "type": "album", "url": album, "name": "Stills", "image_count": 440,
+            }],
+            "specials": [], "incomplete": False,
+        }
+
+        def fake_fetch(url, pages, **_kwargs):
+            pages[url] = {"final_url": url, "html": html}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch), patch.object(
+            gr, "get_album_image_count"
+        ) as count:
+            tree = gr.discover_tree(
+                root, page_cache={}, cached_nodes={root: previous}, quick_scan=False
+            )
+
+        count.assert_not_called()
+        self.assertEqual(tree["albums"][0]["image_count"], 440)
+
+    def test_conditional_304_does_not_discard_cached_album_metadata(self):
+        url = "https://gallery.test/photos/thumbnails.php?album=8"
+        html = "<html><title>Stills</title></html>"
+        digest = gr.hashlib.sha1(html.encode("utf-8")).hexdigest()
+        pages = {url: {
+            "html": html, "html_hash": digest, "timestamp": 1,
+            "final_url": url, "etag": "abc", "image_count": 123,
+            "images": [("one", ["x"], url)], "images_v": gr.IMAGE_EXTRACTOR_VERSION,
+        }}
+        response = self._response(304, url=url)
+        with patch.object(gr.time, "time", return_value=1000), patch.object(
+            gr.session, "get", return_value=response
+        ) as get, patch.object(gr.session, "head") as head:
+            refreshed, changed = gr.fetch_html_cached(url, pages)
+        self.assertEqual(refreshed, html)
+        self.assertFalse(changed)
+        self.assertEqual(pages[url]["image_count"], 123)
+        self.assertEqual(len(pages[url]["images"]), 1)
+        get.assert_called_once()
+        head.assert_not_called()
+
+    def test_identical_200_preserves_cached_image_list(self):
+        url = "https://gallery.test/photos/thumbnails.php?album=8"
+        html = "<html><title>Stills</title></html>"
+        pages = {url: {
+            "html": html, "timestamp": 1, "final_url": url,
+            "images": [("one", ["x"], url)],
+        }}
+        response = self._response(200, url=url, text=html)
+        with patch.object(gr.time, "time", return_value=1000), patch.object(
+            gr.session, "get", return_value=response
+        ) as get:
+            refreshed, changed = gr.fetch_html_cached(url, pages)
+        self.assertEqual(refreshed, html)
+        self.assertFalse(changed)
+        self.assertEqual(len(pages[url]["images"]), 1)
+        get.assert_called_once()
+
+    def test_blocked_stale_cache_is_not_mistaken_for_complete_scan(self):
+        url = "https://gallery.test/photos/index.php?cat=1"
+        pages = {url: {
+            "html": "<html><title>Old</title></html>",
+            "timestamp": 1, "final_url": url,
+        }}
+        denied = self._response(403, url=url)
+        with patch.object(gr.time, "time", return_value=1000), patch.object(
+            gr.session, "get", return_value=denied
+        ) as get, patch.object(gr.time, "sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                gr.fetch_html_cached(url, pages)
+        self.assertEqual(pages[url]["html"], "<html><title>Old</title></html>")
+        get.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_discovery_installs_host_policy_before_fetching_pages(self):
+        root = "https://gallery.test/photos/"
+        tree = {
+            "type": "category", "name": "Home", "url": root,
+            "children": [], "albums": [],
+        }
+        with patch.object(gr, "load_page_cache", return_value=({}, None)), patch.object(
+            gr, "save_page_cache"
+        ), patch.object(
+            gr.session.pacer, "set_host_min_interval"
+        ) as configure, patch.object(gr, "discover_tree", return_value=tree) as discover:
+            result = gr.discover_or_load_gallery_tree(root, lambda _msg: None)
+        self.assertIs(result, tree)
+        configure.assert_called_once_with(root, gr.COPPERMINE_REQUEST_INTERVAL_SECONDS)
+        discover.assert_called_once()
 
 
 class CoppermineRecoveryTests(unittest.TestCase):

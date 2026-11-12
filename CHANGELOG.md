@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.3 — 2026-11-12
+
+### Fixed
+
+- Coppermine galleries now receive proactive per-host pacing of at least 3 seconds between page and media requests, regardless of the generic optional pacing control. Coppermine downloads run with one worker to avoid parallel fetch bursts.
+- Category discovery no longer opens each album merely to calculate its image count. Read counts from category listings or prior cache; show unknown counts until the album is opened.
+- Cached HTML revalidation uses one conditional GET instead of HEAD followed by GET. Unchanged pages retain their extracted image-list and album metadata, avoiding unnecessary follow-on fetches.
+- HTTP 403/429 during cached-page revalidation propagates to the existing incomplete-discovery handling rather than being silently treated as a successful cached page.
+
+### Diagnostics and validation
+
+- Access-denied discovery logs report a limited allowlist of server-provided response headers (when present), without logging cookies or response bodies.
+- Mocked gallery and request-scheduler regression tests verify reduced request counts, retained caches, pacing before any error, host isolation, and access-denial behavior.
+
+### Limitations
+
+These safeguards reduce request load and the risk of automated access restrictions; they cannot guarantee access to hosts that independently reject scraper traffic. Existing server-side blocks are not bypassed or removed. Live compatibility with site-specific defenses and Windows GUI rendering require independent verification.
+
 ## 0.4.2 — 2026-11-12
 
 ### Fixed

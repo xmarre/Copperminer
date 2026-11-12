@@ -61,9 +61,8 @@ as a fully refreshed cache. Subsequent discoveries retry incomplete branches.
 A successful future crawl replaces stale placeholders with real albums.
 
 This does not bypass a site's access policy or reveal albums that could not be
-retrieved. Give the site time to recover and use **Polite request pacing**
-before attempting another discovery. Lower worker counts also help avoid
-excessive concurrent image downloads.
+retrieved. If access has already been denied, do not repeatedly rerun discovery.
+Wait for the restriction to expire or contact the site's administrator.
 
 ### Minimum image resolution
 
@@ -83,7 +82,25 @@ aesthetic quality. A separate manual review is still needed for curated datasets
 
 ### Request pacing
 
-**Polite request pacing** is optional and is off by default. When enabled, Copperminer
+**Coppermine safety defaults:** Coppermine galleries always enforce a shared
+minimum of **3 seconds** between requests to the same host, including category
+pages, album pages, and image downloads. A small amount of jitter helps avoid
+bursts from different download workers. Coppermine downloads use **one worker**
+regardless of the general Workers slider, so image transfers are not initiated
+in parallel by a single download job. This reduces load; it does not guarantee
+that a site's anti-bot policy will allow automated downloads.
+
+During discovery, Copperminer reads album image counts from category listings
+or verified cached values, rather than requesting every album merely to count
+its images. Missing counts appear as `?` until the album is visited for
+downloading. Cached pages are revalidated with a single conditional GET, never
+a HEAD request followed by a GET. A cached page that receives HTTP 403/429
+does not mask the access failure. Logs include limited response diagnostics
+such as Retry-After or CF-Mitigated, when provided, without including cookies
+or challenge-response content.
+
+**Polite request pacing** remains optional for other gallery adapters and is
+off by default. When enabled, Copperminer
 spaces outgoing gallery-discovery requests and downloads on a **per-host** basis,
 including IMDb GraphQL pagination. Requests to independent hosts are scheduled
 independently. Downloads retain baseline per-host spacing even when the option is off:

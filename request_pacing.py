@@ -68,6 +68,25 @@ class HostRequestPacer:
             self._polite = bool(enabled)
             self._condition.notify_all()
 
+    def set_host_min_interval(self, url, seconds):
+        """Enforce a shared per-host floor across discovery and media requests.
+
+        The floor is monotone for the lifetime of the session: a concurrent job
+        cannot inadvertently disable a previously activated host policy.
+        """
+        host = urlsplit(url).netloc.lower()
+        if not host:
+            return
+        with self._condition:
+            state = self._hosts.setdefault(host, {
+                "next_at": 0.0, "blocked_until": 0.0,
+                "penalty": 0.0, "successes": 0,
+            })
+            state["min_interval"] = max(
+                state.get("min_interval", 0.0), float(seconds)
+            )
+            self._condition.notify_all()
+
     def wait(self, url, *, kind=None, stop_event=None, polite=None):
         host = urlsplit(url).netloc.lower()
         if not host:
@@ -84,11 +103,15 @@ class HostRequestPacer:
                 now = self._clock()
                 ready_at = max(state["next_at"], state["blocked_until"])
                 if now >= ready_at:
-                    # Discovery is unchanged when the option is off. Downloads
-                    # remain conservatively paced, including with the option off.
+                    # Downloads retain their historical baseline. Hosts that
+                    # require conservative crawling have an additional minimum
+                    # even when the generic "polite" checkbox is disabled.
                     base = 4.0 if kind == "video" else 0.35 if kind == "download" else 0.0
                     if self._polite if polite is None else polite:
                         base = max(base, 0.7) + self._jitter(0.0, 0.3)
+                    host_floor = state.get("min_interval", 0.0)
+                    if host_floor:
+                        base = max(base, host_floor + self._jitter(0.0, 0.5))
                     state["next_at"] = now + max(base, state["penalty"])
                     self._condition.notify_all()
                     return
