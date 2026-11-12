@@ -1909,6 +1909,11 @@ def _discovery_request(
             timeout=timeout,
         )
         status = response.status_code
+        if status in {403, 429}:
+            # Access denial is not a signal to hammer the same host again.
+            _activate_page_backoff(url, severe=True)
+            log(f"{indent}HTTP {status} from {url}; pausing this host for this discovery")
+            return response
         if status not in PAGE_REQUEST_RETRYABLE_STATUSES:
             if first_status == 404:
                 # A 404 followed by success is direct evidence that this host can
@@ -2072,7 +2077,7 @@ session.headers.update({
 })
 
 CACHE_DIR = ".coppermine_cache"
-TREE_CACHE_VERSION = 2
+TREE_CACHE_VERSION = 3
 IMAGE_EXTRACTOR_VERSION = 4
 DOWNLOAD_WORKERS = 4
 
@@ -2081,6 +2086,21 @@ DOWNLOAD_WORKERS = 4
 # this session (including IMDb GraphQL pagination) use the same scheduler.
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
 MEDIA_EXTS = ('.webm', '.mp4', '.gif')
+
+def undersized_image_dimensions(path, min_width=0, min_height=0):
+    """Return dimensions when an image fails either minimum."""
+    if not min_width and not min_height:
+        return None
+    if Image is None:
+        raise RuntimeError("Pillow is required for image-resolution filtering")
+    with Image.open(path) as image:
+        width, height = image.size
+    return (width, height) if width < min_width or height < min_height else None
+
+
+class UndersizedImageError(Exception):
+    """An image candidate is below the requested minimum resolution."""
+
 
 def get_soup(url, log=lambda msg: None, referer=None):
     headers = {"Referer": referer} if referer else None
@@ -2236,7 +2256,7 @@ SPECIALS = [
     ("Search", "search"),
 ]
 
-def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None):
+def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: None, depth=0, visited=None, page_cache=None, quick_scan=True, cached_nodes=None, blocked_hosts=None):
     """Recursively build nested tree of categories, albums, and special albums.
 
     Parameters
@@ -2261,6 +2281,8 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     """
     if visited is None:
         visited = set()
+    if blocked_hosts is None:
+        blocked_hosts = set()
     indent = "  " * depth
     if root_url in visited:
         log(f"{indent}↪ Already visited: {root_url}, skipping.")
@@ -2290,6 +2312,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         "children": [],
         "specials": [],
         "albums": [],
+        "incomplete": False,
     }
 
     for label, key in SPECIALS:
@@ -2365,6 +2388,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     enqueue_pagination(soup, link_base_url)
     while queued_pages:
         pagination_url = queued_pages.pop(0)
+        if urlparse(pagination_url).netloc.lower() in blocked_hosts:
+            node["incomplete"] = True
+            continue
         try:
             page_html, _ = fetch_html_cached(
                 pagination_url,
@@ -2374,7 +2400,10 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 indent=indent + "  ",
             )
         except requests.RequestException as exc:
+            node["incomplete"] = True
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in {403, 429}:
+                blocked_hosts.add(urlparse(pagination_url).netloc.lower())
             detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
             log(
                 f"{indent}   Skipping unavailable category page: "
@@ -2462,7 +2491,10 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 img_count = (
                     listing_count
                     if listing_count is not None
-                    else get_album_image_count(album_url, page_cache)
+                    else (
+                        "?" if urlparse(album_url).netloc.lower() in blocked_hosts
+                        else get_album_image_count(album_url, page_cache)
+                    )
                 )
             except requests.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -2472,6 +2504,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                         f"({album_url}, HTTP {status})"
                     )
                     continue
+                node["incomplete"] = True
+                if status in {403, 429}:
+                    blocked_hosts.add(urlparse(album_url).netloc.lower())
                 detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
                 log(
                     f"{indent}     Could not count album: {name} "
@@ -2479,6 +2514,7 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
                 )
                 img_count = "?"
             except requests.RequestException as exc:
+                node["incomplete"] = True
                 log(
                     f"{indent}     Could not count album: {name} "
                     f"({album_url}, {exc.__class__.__name__}); "
@@ -2501,7 +2537,9 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
     cached_node = None
     if quick_scan and cached_nodes:
         cached_node = cached_nodes.get(root_url)
-    if quick_scan and cached_node and cached_node.get('child_hash') == child_hash:
+    if (quick_scan and cached_node and not node["incomplete"]
+            and not cached_node.get("incomplete")
+            and cached_node.get('child_hash') == child_hash):
         log(f"{indent}   No changes detected; skipping subtree")
         if cached_node.get('name') != cat_title:
             cached_node = dict(cached_node)
@@ -2516,30 +2554,61 @@ def discover_tree(root_url, parent_cat=None, parent_title=None, log=lambda msg: 
         if cat_num.group(1) in seen_cats:
             continue
         seen_cats.add(cat_num.group(1))
-        try:
-            child = discover_tree(
-                subcat_url,
-                parent_cat=cat_id,
-                parent_title=name,
-                log=log,
-                depth=depth + 1,
-                visited=visited,
-                page_cache=page_cache,
-                quick_scan=quick_scan,
-                cached_nodes=cached_nodes,
-            )
-        except requests.RequestException as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
-            log(
-                f"{indent}  Skipping unavailable subcategory: {name} "
-                f"({subcat_url}, {detail})"
-            )
-            continue
-        if child:
-            node['children'].append(child)
+        host = urlparse(subcat_url).netloc.lower()
+        child = None
+        if host not in blocked_hosts:
+            try:
+                child = discover_tree(
+                    subcat_url,
+                    parent_cat=cat_id,
+                    parent_title=name,
+                    log=log,
+                    depth=depth + 1,
+                    visited=visited,
+                    page_cache=page_cache,
+                    quick_scan=quick_scan,
+                    cached_nodes=cached_nodes,
+                    blocked_hosts=blocked_hosts,
+                )
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                detail = f"HTTP {status}" if status is not None else exc.__class__.__name__
+                if status in {403, 429}:
+                    blocked_hosts.add(host)
+                log(
+                    f"{indent}  Unavailable subcategory: {name} "
+                    f"({subcat_url}, {detail}); retaining its place in the tree"
+                )
+        if child is None:
+            # Preserve any previously discovered albums, otherwise keep a
+            # navigable placeholder for a category seen on its parent's page.
+            previous = (cached_nodes or {}).get(subcat_url)
+            child = dict(previous) if previous else {
+                "type": "category", "name": name, "url": subcat_url,
+                "cat_id": cat_num.group(1), "children": [],
+                "albums": [], "specials": [],
+            }
+            child["incomplete"] = True
+        if child.get("incomplete"):
+            node["incomplete"] = True
+        node['children'].append(child)
 
     node['albums'] = albums
+
+    if node["incomplete"]:
+        # A temporarily inaccessible pagination page must not erase entries
+        # that were successfully discovered in a previous scan.
+        previous = (cached_nodes or {}).get(root_url) or {}
+        known_children = {child.get("url") for child in node["children"]}
+        for old in previous.get("children", []):
+            if old.get("url") not in known_children:
+                retained = dict(old)
+                retained["incomplete"] = True
+                node["children"].append(retained)
+        known_albums = {album.get("url") for album in node["albums"]}
+        for old in previous.get("albums", []):
+            if old.get("url") not in known_albums:
+                node["albums"].append(dict(old))
 
     log(
         f"{indent}   -> {len(node['children'])} subcategories | {len(node['albums'])} albums"
@@ -2638,6 +2707,7 @@ def discover_or_load_gallery_tree(
 ):
     """Discover galleries using cached pages when possible."""
     pages, cached_tree = load_page_cache(root_url)
+    retained_pages = pages
     if force_refresh:
         log("Forcing full refresh (ignoring cache)...")
         pages = {}
@@ -2676,15 +2746,23 @@ def discover_or_load_gallery_tree(
             archive_data=archive_data,
         )
     else:
-        tree = discover_tree(
-            root_url,
-            log=log,
-            page_cache=pages,
-            quick_scan=quick_scan,
-            cached_nodes=cached_nodes,
-        )
+        try:
+            tree = discover_tree(
+                root_url,
+                log=log,
+                page_cache=pages,
+                quick_scan=quick_scan,
+                cached_nodes=cached_nodes,
+            )
+        except requests.RequestException:
+            if not cached_tree:
+                raise
+            tree = dict(cached_tree)
+            tree["incomplete"] = True
+            log("Gallery access denied or unavailable; retaining previously discovered categories.")
     if site_type not in {"4chan", "yandex"}:
-        save_page_cache(root_url, tree, pages)
+        # A failed forced scan must not erase pages collected on earlier runs.
+        save_page_cache(root_url, tree, {**retained_pages, **pages})
     return tree
 
 def get_image_links_from_js(album_url, html=None, log=lambda msg: None):
@@ -3333,7 +3411,8 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None,
-                             filename_hint=None, stop_flag=None):
+                             filename_hint=None, stop_flag=None,
+                             min_width=0, min_height=0):
     """Try every candidate once, then retry the whole block if all fail.
 
     Parameters
@@ -3364,6 +3443,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         for candidate in list(candidate_urls)
     ]
     _resolved_display_cache = {}
+    rejected_undersized = set()
 
     def _filename_from_headers(default_name: str, headers: dict, content_type: str, filename_hint: str = None) -> str:
         """Best-effort filename inference for endpoints like download.php."""
@@ -3419,7 +3499,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         while queue_index < len(candidate_queue):
             candidate, candidate_ref, display_url = candidate_queue[queue_index]
             queue_index += 1
-            if candidate in attempted_urls:
+            if candidate in attempted_urls or candidate in rejected_undersized:
                 continue
             attempted_urls.add(candidate)
 
@@ -3476,6 +3556,13 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                             total_bytes += len(chunk)
                 if total_bytes == 0:
                     raise requests.RequestException("Media response contained no image/video bytes")
+                if ctype.lower().startswith("image/"):
+                    dims = undersized_image_dimensions(partial_path, min_width, min_height)
+                    if dims is not None:
+                        rejected_undersized.add(candidate)
+                        raise UndersizedImageError(
+                            f"{dims[0]}x{dims[1]} below {min_width}x{min_height} minimum"
+                        )
                 os.replace(partial_path, fpath)
                 partial_path = None
                 elapsed = time.time() - start_time
@@ -3498,7 +3585,10 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
             except PacingCancelled:
                 return False
             except Exception as e:
-                log(f"Error downloading {candidate}: {e}")
+                if isinstance(e, UndersizedImageError):
+                    log(f"Skipping undersized candidate {candidate}: {e}")
+                else:
+                    log(f"Error downloading {candidate}: {e}")
                 if display_url:
                     resolved = _resolved_display_cache.get(display_url)
                     if resolved is None:
@@ -3531,13 +3621,20 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                         os.remove(partial_path)
                     except OSError:
                         pass
+        if rejected_undersized and attempted_urls.issubset(rejected_undersized):
+            break
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
             time.sleep(1.0)
         else:
-            log(f"FAILED to download after {max_attempts} attempts: {candidate_urls}")
-            if album_stats is not None:
-                album_stats['errors'] += 1
+            if not rejected_undersized:
+                log(f"FAILED to download after {max_attempts} attempts: {candidate_urls}")
+                if album_stats is not None:
+                    album_stats['errors'] += 1
+    if rejected_undersized:
+        log("Skipped image: no candidate met the minimum image resolution.")
+        if album_stats is not None:
+            album_stats['skipped_small'] = album_stats.get('skipped_small', 0) + 1
     return False
 
 
@@ -3545,6 +3642,7 @@ def download_4chan_image_oldschool(
     url, output_dir, log, fname=None, index=None, total=None,
     album_stats=None, max_attempts=3, stop_flag=None, polite=None,
     require_original=False, expected=None,
+    min_width=0, min_height=0,
 ):
     """Download 4chan media through urllib, sharing the normal per-host pacer."""
     if fname is None:
@@ -3621,6 +3719,16 @@ def download_4chan_image_oldschool(
                     )
                 if digest is not None and digest.digest() != expected["md5"]:
                     raise IOError("Original media MD5 does not match archive metadata")
+            if os.path.splitext(fname)[1].lower() in IMAGE_EXTS + ('.gif',):
+                dims = undersized_image_dimensions(partial_path, min_width, min_height)
+                if dims is not None:
+                    log(
+                        f"Skipping undersized image {fname}: "
+                        f"{dims[0]}x{dims[1]} below {min_width}x{min_height} minimum"
+                    )
+                    if album_stats is not None:
+                        album_stats['skipped_small'] = album_stats.get('skipped_small', 0) + 1
+                    return False
             if require_original:
                 # Publishing a completed archive file must never overwrite a
                 # file that another running ripper created in the meantime.
@@ -3668,11 +3776,13 @@ def download_4chan_image_oldschool(
 def download_4chan_archive_candidates(
     urls, output_dir, log, fname, index, total, album_stats,
     verification=None, stop_flag=None, polite=None,
+    min_width=0, min_height=0,
 ):
     """Try archived original-media sources, counting a missing file only once."""
     if os.path.exists(os.path.join(output_dir, fname)):
         log(f"Already downloaded: {fname}")
         return False
+    skipped_small = False
     for url in urls:
         if stop_flag is not None and stop_flag.is_set():
             return False
@@ -3682,21 +3792,27 @@ def download_4chan_archive_candidates(
         if download_4chan_image_oldschool(
             url, output_dir, log, fname, index, total, attempt_stats,
             2, stop_flag, polite, require_original=True,
-            expected=verification,
+            expected=verification, min_width=min_width, min_height=min_height,
         ):
             for key in ("total_bytes", "total_time", "downloaded"):
                 album_stats[key] += attempt_stats[key]
             return True
+        if attempt_stats.get("skipped_small"):
+            skipped_small = True
         if os.path.exists(os.path.join(output_dir, fname)):
             log(f"Already downloaded: {fname}")
             return False
     if stop_flag is None or not stop_flag.is_set():
-        album_stats["errors"] += 1
-        log(f"Original unavailable after checking {len(urls)} source(s): {fname}")
+        if skipped_small:
+            album_stats["skipped_small"] = album_stats.get("skipped_small", 0) + 1
+        else:
+            album_stats["errors"] += 1
+            log(f"Original unavailable after checking {len(urls)} source(s): {fname}")
     return False
 
 
-def threaded_download_worker(download_queue, log, stop_flag, polite=False):
+def threaded_download_worker(download_queue, log, stop_flag, polite=False,
+                             min_width=0, min_height=0):
     """Drain queued downloads, even when cancellation or a worker error occurs."""
     while True:
         try:
@@ -3726,6 +3842,7 @@ def threaded_download_worker(download_queue, log, stop_flag, polite=False):
                     total=total_images, album_stats=stats,
                     referer=referer, filename_hint=filename_hint,
                     stop_flag=stop_flag,
+                    min_width=min_width, min_height=min_height,
                 )
         except Exception as exc:
             log(f"Unexpected download worker error: {exc}")
@@ -3736,17 +3853,18 @@ def threaded_download_worker(download_queue, log, stop_flag, polite=False):
             download_queue.task_done()
 
 
-def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None):
+def rip_galleries(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None, min_width=0, min_height=0):
     """Run one download job under its selected request-pacing policy."""
     with session.polite_mode(mimic_human):
         return _rip_galleries_impl(
             selected_albums, output_root, log, root_url,
             quick_scan=quick_scan, mimic_human=mimic_human,
             stop_flag=stop_flag, workers=workers, archive_data=archive_data,
+            min_width=min_width, min_height=min_height,
         )
 
 
-def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None):
+def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=True, mimic_human=False, stop_flag=None, workers=None, archive_data=None, min_width=0, min_height=0):
     """Build and download a gallery queue with independent host scheduling."""
     workers = max(1, min(16, int(DOWNLOAD_WORKERS if workers is None else workers)))
     log(
@@ -3765,6 +3883,7 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 'total_time': 0.0,
                 'downloaded': 0,
                 'errors': 0,
+                'skipped_small': 0,
                 'start_time': time.time(),
             }
             loop = asyncio.get_event_loop()
@@ -3813,7 +3932,10 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                                 stats, 3, stop_flag, mimic_human,
                             )
                             downloader = download_4chan_image_oldschool
-                        await loop.run_in_executor(None, downloader, *args)
+                        await loop.run_in_executor(
+                            None,
+                            lambda: downloader(*args, min_width=min_width, min_height=min_height),
+                        )
 
                 tasks = [
                     asyncio.create_task(worker(idx, fname, urls, verification))
@@ -3827,7 +3949,8 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
             log(
                 f"\nFinished all downloads!\n"
                 f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n"
-                f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
+                f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']} "
+                f"| Undersized skipped: {stats['skipped_small']}"
             )
         asyncio.run(rip_4chan())
         return
@@ -3890,6 +4013,7 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
         'total_time': 0.0,
         'downloaded': 0,
         'errors': 0,
+        'skipped_small': 0,
         'start_time': time.time(),
     }
 
@@ -3905,7 +4029,10 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
 
     threads = []
     for _ in range(workers):
-        t = threading.Thread(target=threaded_download_worker, args=(q, log, stop_flag, mimic_human))
+        t = threading.Thread(
+            target=threaded_download_worker,
+            args=(q, log, stop_flag, mimic_human, min_width, min_height),
+        )
         t.daemon = True
         t.start()
         threads.append(t)
@@ -3920,7 +4047,8 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
     log(
         f"\nFinished all downloads!\n"
         f"  Downloaded {stats['downloaded']} files, {total_mb:.2f} MB in {elapsed:.1f}s\n"
-        f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']}"
+        f"  Avg speed: {avg_speed:.2f} MB/s | Errors: {stats['errors']} "
+        f"| Undersized skipped: {stats['skipped_small']}"
     )
     save_page_cache(root_url, tree, pages)
 # ---------- GUI ----------
@@ -4048,6 +4176,32 @@ class GalleryRipperApp(tb.Window):
         ToolTip(
             self.worker_slider,
             text="Maximum concurrent downloads. Host pacing is shared across workers.",
+        )
+
+        qualityf = ttk.Frame(control_frame)
+        qualityf.pack(fill="x", pady=(4, 0))
+        self.skip_small_var = tk.BooleanVar(
+            value=bool(settings.get("skip_small_images", False))
+        )
+        self.min_width_var = tk.StringVar(
+            value=str(settings.get("min_image_width", 512))
+        )
+        self.min_height_var = tk.StringVar(
+            value=str(settings.get("min_image_height", 512))
+        )
+        quality_chk = ttk.Checkbutton(
+            qualityf, text="Skip undersized images", variable=self.skip_small_var
+        )
+        quality_chk.pack(side="left")
+        ttk.Label(qualityf, text="Minimum width:").pack(side="left", padx=(10, 3))
+        ttk.Entry(qualityf, textvariable=self.min_width_var, width=6).pack(side="left")
+        ttk.Label(qualityf, text="Minimum height:").pack(side="left", padx=(10, 3))
+        ttk.Entry(qualityf, textvariable=self.min_height_var, width=6).pack(side="left")
+        ttk.Label(qualityf, text="pixels").pack(side="left", padx=(5, 0))
+        ToolTip(
+            quality_chk,
+            text="Check the downloaded image's actual dimensions before saving. "
+                 "Videos and already-downloaded files are left unchanged.",
         )
         btf = ttk.Frame(control_frame)
         btf.pack(fill="x", pady=(8, 0))
@@ -4762,7 +4916,13 @@ class GalleryRipperApp(tb.Window):
             if tree_data.get("adapter") == "yandex":
                 self.yandex_results = tree_data.get("yandex_results", [])
                 self.after(0, lambda results=self.yandex_results: self.show_yandex_preview(results))
-            self.after(0, lambda: self.log("Discovery complete! (cached & partial refreshed if needed)"))
+            if tree_data.get("incomplete"):
+                self.after(0, lambda: self.log(
+                    "Discovery INCOMPLETE: unavailable categories are retained. "
+                    "Retry discovery when site access returns; existing results are saved."
+                ))
+            else:
+                self.after(0, lambda: self.log("Discovery complete."))
         except YandexBlockedError as e:
             self.after(0, lambda err=e: self.handle_yandex_blocked(err))
         except archived_moe.ArchiveAccessBlockedError as e:
@@ -4805,11 +4965,13 @@ class GalleryRipperApp(tb.Window):
     def insert_tree_node(self, parent, node, path=None):
         path = path or []
         label = node["name"]
+        if node.get("incomplete"):
+            label += " [incomplete]"
         is_cat = node["type"] == "category"
         node_icon = "\U0001F4C1" if is_cat else "\U0001F4F7"
         node_id = self.tree.insert(parent, "end", text=f"{node_icon} {label}", open=False)
         self.tree.set(node_id, "sel", "\u25A1")
-        node_path = path + [label]
+        node_path = path + [node["name"]]
         if is_cat:
             self.item_to_category[node_id] = (node["name"], node.get("url"), node_path)
 
@@ -4969,6 +5131,34 @@ class GalleryRipperApp(tb.Window):
             messagebox.showwarning("No albums selected", "Select at least one album to download.")
             return
         workers = max(1, min(16, int(self.download_workers_var.get())))
+        skip_small = self.skip_small_var.get() is True
+        try:
+            configured_width = int(self.min_width_var.get().strip())
+            configured_height = int(self.min_height_var.get().strip())
+            if not (1 <= configured_width <= 16384 and 1 <= configured_height <= 16384):
+                raise ValueError("dimensions outside 1..16384")
+        except (ValueError, TypeError, AttributeError):
+            if skip_small:
+                messagebox.showwarning(
+                    "Invalid resolution", "Enter minimum width and height in pixels (1–16384)."
+                )
+                return
+            configured_width, configured_height = 512, 512
+        if skip_small and Image is None:
+            messagebox.showerror(
+                "Pillow missing", "Install Pillow to enable image-resolution filtering."
+            )
+            return
+        if isinstance(self.skip_small_var, tk.BooleanVar):
+            current_settings = load_settings()
+            current_settings.update({
+                "skip_small_images": skip_small,
+                "min_image_width": configured_width,
+                "min_image_height": configured_height,
+            })
+            save_settings(current_settings)
+        min_width = configured_width if skip_small else 0
+        min_height = configured_height if skip_small else 0
         polite = bool(self.mimic_var.get())
         quick_scan = bool(self.quick_scan_var.get())
         root_url = self.url_var.get().strip()
@@ -4977,6 +5167,7 @@ class GalleryRipperApp(tb.Window):
         self.download_thread = threading.Thread(
             target=self.download_worker,
             args=(selected, output_dir, root_url, workers, polite, quick_scan, archive_data),
+            kwargs={"min_width": min_width, "min_height": min_height},
             daemon=True,
         )
         self.download_thread.start()
@@ -4986,7 +5177,8 @@ class GalleryRipperApp(tb.Window):
         self.stop_flag.set()
         self.discovery_stop_flag.set()
 
-    def download_worker(self, selected, output_dir, root_url, workers, polite, quick_scan, archive_data=None):
+    def download_worker(self, selected, output_dir, root_url, workers, polite,
+                        quick_scan, archive_data=None, min_width=0, min_height=0):
         try:
             rip_galleries(
                 selected,
@@ -4998,6 +5190,8 @@ class GalleryRipperApp(tb.Window):
                 stop_flag=self.stop_flag,
                 workers=workers,
                 archive_data=archive_data,
+                min_width=min_width,
+                min_height=min_height,
             )
             self.log("All downloads finished or stopped!")
         except Exception as e:
