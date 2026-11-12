@@ -759,43 +759,115 @@ def fourchan_list_threads(board, log=lambda msg: None):
     return threads
 
 
-def fourchan_thread_images(board, thread_id, log=lambda msg: None):
-    """Return image entries from a specific thread."""
-    board = board.strip().strip("/")
+class FourchanThreadMissingError(RuntimeError):
+    """The live 4chan API returned 404/410 for a specific thread."""
+
+
+def fetch_fourchan_thread(board, thread_id):
+    """Get and validate one live-thread snapshot, preserving HTTP errors."""
+    url = f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
     try:
-        data = fetch_json_simple(
-            f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
-        )
-    except Exception as e:
-        log(f"Error fetching thread /{board}/{thread_id}: {e}")
-        return []
+        data = fetch_json_simple(url)
+    except requests.HTTPError as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) in {404, 410}:
+            raise FourchanThreadMissingError(
+                f"Live thread /{board}/{thread_id} is no longer available"
+            ) from exc
+        raise
+    posts = data.get("posts") if isinstance(data, dict) else None
+    if (
+        not isinstance(posts, list) or not posts or
+        not isinstance(posts[0], dict) or
+        str(posts[0].get("no")) != str(thread_id)
+    ):
+        raise ValueError(f"Unexpected live-thread API response for /{board}/{thread_id}")
+    return data
+
+
+def fourchan_thread_images(board, thread_id, log=lambda msg: None, thread_data=None):
+    """Return original-media entries from one validated live 4chan snapshot."""
+    board = board.strip().strip("/")
+    data = thread_data if thread_data is not None else fetch_fourchan_thread(board, thread_id)
     entries = []
-    for post in data.get("posts", []):
-        if "tim" in post and "ext" in post:
+    for post in data["posts"]:
+        if isinstance(post, dict) and "tim" in post and "ext" in post:
             fname = f"{post.get('filename', str(post['tim']))}{post['ext']}"
             url = f"https://i.4cdn.org/{board}/{post['tim']}{post['ext']}"
             entries.append((fname, [url], None))
     return entries
 
 
-def archived_moe_thread_images(board, thread_id, log=lambda msg: None, archive_data=None):
-    """Load archived OP/replies from the API or browser-saved thread JSON."""
+def fourchan_thread_identity(url):
+    """Recognize a single 4chan thread or supported third-party archive URL."""
+    archived = archived_moe.parse_thread_url(url)
+    if archived:
+        return archived
+    canonical = normalize_fourchan_url(url)
+    match = re.fullmatch(r"4chan:([a-z0-9]+)/([0-9]+)", canonical, re.I)
+    return (match.group(1).lower(), match.group(2)) if match else None
+
+
+def archived_moe_thread_images(
+    board, thread_id, log=lambda msg: None, archive_data=None,
+    preferred_host="archived.moe", return_data=False,
+):
+    """Load FoolFuuka metadata, trying the /b/ alternate archive if necessary.
+
+    Never convert API access denial or missing metadata into a zero-image
+    result. The validated snapshot can be carried through to download to
+    avoid re-requesting the archive API.
+    """
     if archive_data is None:
-        api_url = archived_moe.thread_api_url(board, thread_id)
-        response = _discovery_request("get", api_url, timeout=25, log=log)
-        try:
+        sources = archived_moe.thread_api_candidates(
+            board, thread_id, preferred=preferred_host
+        )
+        denied = None
+        last_failure = None
+        data = None
+        for api_url in sources:
+            log(f"Checking archive metadata: {api_url}")
             try:
-                response.raise_for_status()
+                response = _discovery_request(
+                    "get", api_url, timeout=25, log=log
+                )
+                try:
+                    response.raise_for_status()
+                    candidate = archived_moe.resolve_relative_media_links(
+                        response.json(), board, thread_id,
+                        urlparse(api_url).hostname,
+                    )
+                    # A 200 challenge page or another thread is not recovery.
+                    archived_moe.extract_thread(candidate, board, thread_id)
+                    data = candidate
+                finally:
+                    response.close()
+                log(f"Archived metadata available from {urlparse(api_url).hostname}.")
+                break
             except requests.HTTPError as exc:
-                code = getattr(exc.response, "status_code", None)
-                if code == 403:
-                    raise archived_moe.ArchiveAccessBlockedError(api_url, code) from exc
-                raise
-            data = response.json()
-        finally:
-            response.close()
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                if code in {403, 429} and denied is None:
+                    denied = (api_url, code)
+                last_failure = exc
+                log(f"Archive metadata unavailable: HTTP {code} ({api_url})")
+            except (requests.RequestException, ValueError) as exc:
+                last_failure = exc
+                log(f"Archive metadata unavailable at {api_url}: {exc}")
+        if data is None:
+            if denied:
+                raise archived_moe.ArchiveAccessBlockedError(*denied)
+            if isinstance(last_failure, requests.HTTPError):
+                raise RuntimeError(
+                    f"No archived metadata for /{board}/{thread_id} at "
+                    "the configured archive endpoints."
+                ) from last_failure
+            if last_failure is not None:
+                raise RuntimeError(
+                    f"Archive metadata unavailable for /{board}/{thread_id}: "
+                    f"{last_failure}"
+                ) from last_failure
+            raise RuntimeError(f"Archive metadata unavailable for /{board}/{thread_id}")
     else:
-        log(f"Using browser-saved archived.moe JSON for /{board}/{thread_id}.")
+        log(f"Using saved archive JSON for /{board}/{thread_id}.")
         data = archive_data
     subject, entries, unavailable = archived_moe.extract_thread(
         data, board, thread_id
@@ -805,6 +877,8 @@ def archived_moe_thread_images(board, thread_id, log=lambda msg: None, archive_d
             f"Archived /{board}/{thread_id}: {unavailable} attachment(s) "
             "have no original-media location in the archive metadata."
         )
+    if return_data:
+        return subject, entries, data
     return subject, entries
 
 
@@ -858,23 +932,38 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True, arch
     after_colon = canonical.split(":", 1)[-1]
     if "/" in after_colon:
         board, thread_id = after_colon.split("/", 1)
-        thread_id = thread_id.strip()
-        if archived_moe.parse_thread_url(canonical):
-            subject, info = archived_moe_thread_images(
-                board, thread_id, log=log, archive_data=archive_data
+        board, thread_id = board.strip(), thread_id.strip()
+        is_archive = archived_moe.parse_thread_url(canonical) is not None
+        archive_snapshot = None
+        if is_archive or archive_data is not None:
+            subject, info, archive_snapshot = archived_moe_thread_images(
+                board, thread_id, log=log, archive_data=archive_data,
+                preferred_host=(urlparse(root_url).hostname or "archived.moe").lower(),
+                return_data=True,
             )
+            is_archive = True
         else:
-            info = fourchan_thread_images(board, thread_id, log=log)
-            subject = f"Thread {thread_id}"
             try:
-                data = fetch_json_simple(
-                    f"https://a.4cdn.org/{board}/thread/{thread_id}.json"
+                thread = fetch_fourchan_thread(board, thread_id)
+            except FourchanThreadMissingError:
+                log(
+                    f"Live thread /{board}/{thread_id} has expired (HTTP 404/410); "
+                    "trying third-party archive metadata."
                 )
-                if data.get("posts"):
-                    op = data["posts"][0]
-                    subject = op.get("sub") or re.sub(r"<.*?>", "", op.get("com", ""))[:80] or subject
-            except Exception:
-                pass
+                subject, info, archive_snapshot = archived_moe_thread_images(
+                    board, thread_id, log=log, return_data=True,
+                )
+                is_archive = True
+            else:
+                info = fourchan_thread_images(
+                    board, thread_id, log=log, thread_data=thread
+                )
+                op = thread["posts"][0]
+                subject = (
+                    op.get("sub")
+                    or re.sub(r"<.*?>", "", op.get("com", ""))[:80]
+                    or f"Thread {thread_id}"
+                )
         safe_subj = sanitize_folder_name(subject.strip()) or thread_id
         node = {
             "type": "category",
@@ -886,12 +975,17 @@ def fourchan_discover_tree(root_url, log=lambda msg: None, quick_scan=True, arch
                 {
                     "type": "album",
                     "name": f"{subject} ({thread_id})",
-                    "url": canonical,
+                    "url": (
+                        archived_moe.canonical_thread_url(board, thread_id)
+                        if is_archive else canonical
+                    ),
                     "image_count": len(info),
                     "path": ["4chan", board, f"{safe_subj} ({thread_id})"],
                 }
             ],
         }
+        if archive_snapshot is not None:
+            node["_archive_data"] = archive_snapshot
         return node
 
     board = after_colon.strip()
@@ -2104,10 +2198,18 @@ def get_soup(url, log=lambda msg: None, referer=None):
     return BeautifulSoup(resp.text, "html.parser")
 
 def fetch_json_simple(url: str):
-    """Return parsed JSON from *url* using the requests session."""
-    resp = session.get(url)
-    resp.raise_for_status()
-    return resp.json()
+    """Return JSON while honoring the official 4chan API request-rate rule."""
+    if urlparse(url).hostname == "a.4cdn.org":
+        # 4chan's API documents no more than one metadata request/second.
+        session.pacer.set_host_min_interval(url, 1.0)
+        # The shared session has a LiveJournal Referer for a different adapter.
+        # Suppress it for official 4chan metadata rather than presenting an
+        # unrelated origin to the API. Requests removes headers set to None.
+        response = session.get(url, headers={"Referer": None})
+    else:
+        response = session.get(url)
+    response.raise_for_status()
+    return response.json()
 
 def sanitize_name(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
@@ -3958,9 +4060,11 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 is_archive = archived_moe.parse_thread_url(album_url) is not None
                 if is_archive:
                     # An imported snapshot is valid only for its selected thread.
+                    # A live 4chan URL that expired during discovery may
+                    # already have an archived snapshot. Match by thread ID
+                    # regardless of whether discovery began on the live URL.
                     selected_archive = archive_data if (
-                        archived_moe.parse_thread_url(root_url)
-                        == (board, tid)
+                        fourchan_thread_identity(root_url) == (board, tid)
                     ) else None
                     _, image_entries = archived_moe_thread_images(
                         board, tid, log=log, archive_data=selected_archive
@@ -4162,10 +4266,14 @@ class GalleryRipperApp(tb.Window):
 
         archivef = ttk.Frame(control_frame)
         archivef.pack(fill="x", pady=(5, 0))
-        ttk.Label(archivef, text="Archived.moe:").pack(side="left")
+        ttk.Label(archivef, text="4chan Archives:").pack(side="left")
         ttk.Button(
-            archivef, text="Open thread API in browser",
+            archivef, text="Open archive API",
             command=self.open_archive_api_in_browser,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Button(
+            archivef, text="Open /b/ alternate API",
+            command=self.open_secondary_archive_api_in_browser,
         ).pack(side="left", padx=(5, 0))
         ttk.Button(
             archivef, text="Import saved thread JSON",
@@ -4419,26 +4527,43 @@ class GalleryRipperApp(tb.Window):
         self.discover_albums()
 
     def _archive_data_for_url(self, url):
-        identity = archived_moe.parse_thread_url(url)
+        identity = fourchan_thread_identity(url)
         if self._archive_snapshot and identity == self._archive_snapshot[0]:
             return self._archive_snapshot[1]
         return None
 
     def open_archive_api_in_browser(self):
-        identity = archived_moe.parse_thread_url(self.url_var.get().strip())
+        url = self.url_var.get().strip()
+        identity = fourchan_thread_identity(url)
         if not identity:
             messagebox.showwarning(
-                "Archived.moe", "Paste an archived.moe thread URL first."
+                "4chan archive", "Paste a 4chan or supported archive thread URL first."
             )
             return
-        webbrowser.open(archived_moe.thread_api_url(*identity))
+        preferred = (urlparse(url).hostname or "archived.moe").lower()
+        api_urls = archived_moe.thread_api_candidates(
+            *identity, preferred=preferred
+        )
+        self._archive_import_origin = (identity, urlparse(api_urls[0]).hostname)
+        webbrowser.open(api_urls[0])
+
+    def open_secondary_archive_api_in_browser(self):
+        identity = fourchan_thread_identity(self.url_var.get().strip())
+        if not identity or identity[0] != "b":
+            messagebox.showwarning(
+                "4chan archive", "The alternative archive API is available for /b/ threads."
+            )
+            return
+        urls = archived_moe.thread_api_candidates(*identity)
+        self._archive_import_origin = (identity, urlparse(urls[1]).hostname)
+        webbrowser.open(urls[1])
 
     def import_archived_moe_json(self):
         url = self.url_var.get().strip()
-        identity = archived_moe.parse_thread_url(url)
+        identity = fourchan_thread_identity(url)
         if not identity:
             messagebox.showwarning(
-                "Archived.moe", "Paste an archived.moe thread URL first."
+                "4chan archive", "Paste a 4chan or supported archive thread URL first."
             )
             return
         if (
@@ -4451,15 +4576,27 @@ class GalleryRipperApp(tb.Window):
             )
             return
         path = filedialog.askopenfilename(
-            title="Select browser-saved archived.moe thread API JSON",
+            title="Select browser-saved 4chan archive API JSON",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if not path:
             return
         try:
             data = archived_moe.load_saved_thread_json(path, *identity)
+            source = (urlparse(url).hostname or "archived.moe").lower()
+            if source not in {
+                "archived.moe", "www.archived.moe",
+                "thebarchive.com", "www.thebarchive.com",
+            }:
+                source = "archived.moe"
+            opened = getattr(self, "_archive_import_origin", None)
+            if isinstance(opened, tuple) and len(opened) == 2 and opened[0] == identity:
+                source = opened[1]
+            data = archived_moe.resolve_relative_media_links(
+                data, *identity, source
+            )
         except (OSError, ValueError) as exc:
-            messagebox.showerror("Invalid archived.moe JSON", str(exc))
+            messagebox.showerror("Invalid archive JSON", str(exc))
             return
         # Keep the validated metadata in memory; discovery and downloads use
         # the same snapshot, including if the archive still returns HTTP 403.
@@ -4981,6 +5118,13 @@ class GalleryRipperApp(tb.Window):
                     stop_flag=self.discovery_stop_flag,
                     archive_data=archive_data,
                 )
+            # Retain the successfully retrieved archive snapshot for download.
+            # In particular, a live 4chan 404 that fell back to archived.moe
+            # must not request its metadata API a second time on Start.
+            snapshot = tree_data.pop("_archive_data", None)
+            identity = fourchan_thread_identity(url)
+            if snapshot is not None and identity is not None:
+                self._archive_snapshot = (identity, snapshot)
             self.albums_tree_data = tree_data
             self.after(0, self.insert_tree_root_safe, tree_data)
             if tree_data.get("adapter") == "yandex":
@@ -5003,15 +5147,16 @@ class GalleryRipperApp(tb.Window):
             self.after(0, lambda err=e: self.log(f"Discovery failed: {err}"))
 
     def handle_archived_moe_blocked(self, err):
-        self.log(f"Discovery blocked: {err}")
+        self.log(f"Archive discovery blocked: {err}")
         if messagebox.askyesno(
-            "Archived.moe denied API access",
-            f"Archived.moe returned HTTP {err.status_code} for this thread's API.\n\n"
-            "If the API URL opens in your browser, complete any verification, "
-            "save its JSON response (Ctrl+S), then click 'Import saved thread JSON' "
-            "in Copperminer. Discovery and download will use that saved response "
-            "without contacting the blocked metadata API again.\n\n"
-            "Open the API URL in your browser now?",
+            "4chan archive API access denied",
+            f"Archive metadata returned HTTP {err.status_code}.\n\n"
+            "Both archived.moe and TheBArchive may require browser verification "
+            "or restrict automated requests. No empty album was created.\n\n"
+            "Open an archive API URL in your browser. If it returns valid JSON, "
+            "save that JSON (Ctrl+S) and select 'Import saved thread JSON'. "
+            "The imported snapshot will be reused for discovery and download.\n\n"
+            f"Open {err.api_url} now?",
         ):
             webbrowser.open(err.api_url)
 

@@ -4,6 +4,7 @@ The archive's thumbnail links are intentionally never download candidates.
 """
 import base64
 import binascii
+import copy
 import html
 import json
 import re
@@ -24,9 +25,9 @@ class ArchiveAccessBlockedError(RuntimeError):
         self.api_url = api_url
         self.status_code = status_code
         super().__init__(
-            f"archived.moe thread API returned HTTP {status_code}. "
-            "The server may require browser verification or prohibit API access. "
-            "Open the API URL in your browser and import a saved JSON response."
+            f"Archive metadata API returned HTTP {status_code} at {api_url}. "
+            "The host may require browser verification or prohibit automated API access. "
+            "Open an archive API URL in your browser and import a saved JSON response."
         )
 
 
@@ -77,14 +78,21 @@ def parse_thread_url(url):
     if match:
         return match.group(1).lower(), match.group(2)
     parsed = urlparse(url)
-    if parsed.scheme.lower() not in {"http", "https"} or (
-        parsed.hostname or ""
-    ).lower() not in {"archived.moe", "www.archived.moe"}:
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in {
+        "archived.moe", "www.archived.moe",
+        "thebarchive.com", "www.thebarchive.com",
+    }:
         return None
     match = _ARCHIVE_THREAD.fullmatch(parsed.path)
     if not match:
         return None
-    return match.group(1).lower(), match.group(2)
+    board, thread_id = match.group(1).lower(), match.group(2)
+    if host in {"thebarchive.com", "www.thebarchive.com"} and board != "b":
+        return None
+    return board, thread_id
 
 
 def canonical_thread_url(board, thread_id):
@@ -97,6 +105,62 @@ def thread_api_url(board, thread_id):
     ):
         raise ValueError("Invalid archived.moe board or thread ID")
     return f"https://archived.moe/_/api/chan/thread/?board={board}&num={thread_id}"
+
+
+def thread_api_candidates(board, thread_id, preferred="archived.moe"):
+    """Return supported metadata endpoints; /b/ has a dedicated second archive.
+
+    These are public archive API endpoints, not anti-bot bypasses. A 403 can
+    still occur on both hosts, in which case saved browser JSON is required.
+    """
+    primary = thread_api_url(board, thread_id)
+    if str(board).lower() != "b":
+        return [primary]
+    secondary = (
+        "https://thebarchive.com/_/api/chan/thread/"
+        f"?board=b&num={thread_id}"
+    )
+    if preferred in {"thebarchive.com", "www.thebarchive.com"}:
+        return [secondary, primary]
+    return [primary, secondary]
+
+
+def resolve_relative_media_links(data, board, thread_id, source_host):
+    """Anchor relative original URLs to the archive that supplied metadata.
+
+    A snapshot stays valid after discovery because resolved media links are
+    embedded in a separate copy of its JSON. Only known archive hosts are
+    accepted; no user-provided arbitrary download base is introduced.
+    """
+    host = str(source_host).lower()
+    if host not in {"archived.moe", "www.archived.moe",
+                    "thebarchive.com", "www.thebarchive.com"}:
+        raise ValueError("Unsupported archive origin")
+    if host.startswith("thebarchive") or host.startswith("www.thebarchive"):
+        if board != "b":
+            raise ValueError("TheBArchive is supported for /b/ only")
+    if host in {"archived.moe", "www.archived.moe"}:
+        # Existing extraction already resolves relative links against archived.moe.
+        return data
+    resolved = copy.deepcopy(data)
+    thread = resolved.get(str(thread_id)) if isinstance(resolved, dict) else None
+    if not isinstance(thread, dict):
+        return resolved
+    posts = [thread.get("op")]
+    replies = thread.get("posts") or {}
+    if isinstance(replies, dict):
+        posts.extend(replies.values())
+    elif isinstance(replies, list):
+        posts.extend(replies)
+    for post in posts:
+        media = post.get("media") if isinstance(post, dict) else None
+        if not isinstance(media, dict):
+            continue
+        for key in ("media_link", "remote_media_link"):
+            value = media.get(key)
+            if isinstance(value, str) and value.strip():
+                media[key] = urljoin(f"https://{host}/", value.strip())
+    return resolved
 
 
 def _clean_subject(value):
@@ -141,13 +205,10 @@ def _original_candidates(media, board):
 
     original = media.get("media_orig")
     if isinstance(original, str) and _ORIGINAL_NAME.fullmatch(original):
-        # archived.moe's /b/ redirect targets an independently hosted full-image
-        # archive. Attempt the direct location if the redirect itself is blocked.
-        if board == "b" and any(
-            urlparse(url).hostname in {"archived.moe", "www.archived.moe"}
-            and "/redirect/" in urlparse(url).path
-            for url in urls
-        ):
+        # TheBArchive uses the full_image path for original /b/ media.
+        # Offer this candidate even when the archive record has no redirect
+        # link; availability is still verified by the downloader.
+        if board == "b":
             add(f"https://thebarchive.com/b/full_image/{original}")
         # The /b/ full-image archive also uses '.web' for some WEBM files.
         if board == "b":

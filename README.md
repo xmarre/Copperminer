@@ -12,32 +12,71 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Download progress & log — See what’s happening at every step
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
-- 4chan support — Browse live boards/threads, recover archived.moe original attachments into the corresponding 4chan folders, and import a browser-saved API JSON response if archive discovery is denied
+- 4chan support — Browse live boards/threads and automatically look for expired threads in supported third-party archives. Restore surviving originals into the existing 4chan folder and import browser-saved archive API JSON when automated metadata access is denied
 - IMDb support — Download complete title/person photo galleries, individual media viewer photos, and combined title/person/image-type selections at original resolution
 - Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, download the original/highest-resolution candidate URLs Yandex exposes, and import saved Yandex HTML when direct requests hit a CAPTCHA
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
-- Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans use HEAD requests so only changed pages are re-scraped.
+- Smart caching engine — Saves each page and image list with ETag/Last-Modified info. Quick scans reuse fresh pages and revalidate stale entries using a conditional GET.
 - History dropdown — Quickly reopen recently scanned galleries from cache
 - Polite request pacing — Optional per-host pacing for discovery and downloads; atomic scheduling across workers, with adaptive cooldown after throttling
 - Windows double-click support — via `start_gallery_ripper.bat`
 - One-click self-update from Git — pull new commits and restart automatically
 - Compatible with Python 3.10+
 
-### 4chan and archived.moe Usage
+### 4chan and archived threads
 
-Enter `4chan` by itself to browse live boards, or paste a live 4chan board/thread URL. Double-click a board to open it; use **Back** to navigate. Threads show a checkmark when fully downloaded or `[+n]` for new files. Selecting a thread saves attached media (images, webms, mp4s) under `4chan/<board>/<sanitized subject> <thread ID>` (Copperminer removes parentheses when sanitizing folder names).
+Enter `4chan` to browse live boards, or paste a direct 4chan thread URL,
+for example `https://boards.4chan.org/b/thread/956335738`. Each live thread
+is requested **once** for both its subject and attachments. A live API 404/410
+indicates that a thread is no longer available from 4chan; Copperminer then
+automatically requests metadata from archived.moe and, for `/b/`, tries
+TheBArchive if the first archive is unavailable. Live 403/429 responses and
+other errors are reported rather than mistaken for expiration.
 
-To recover a thread that has disappeared from 4chan, paste an archived.moe **thread** link into **Gallery Root URL**, for example `https://archived.moe/b/thread/956262976/#956262976`. Click **Discover Galleries**, select the archived thread, then **Start Download**. Copperminer reads the archived FoolFuuka thread metadata and attempts every available original-media URL. If the matching `4chan/<board>/... (<thread id>)` folder already exists, new files go into that folder even if the archived subject differs. Existing files with matching original filenames are left untouched; if the thread has never been downloaded, Copperminer creates the normal 4chan folder.
+You can also paste an archive thread URL directly:
+`https://archived.moe/b/thread/956262976/#956262976` or
+`https://thebarchive.com/b/thread/956262976/`. Successful archive discovery
+shows the available original-media candidates and keeps the retrieved
+metadata in memory for downloads. It does **not** contact the same metadata
+API a second time when you press **Start Download**.
 
-**If archived.moe blocks API access with HTTP 403:** The thread URL is recognized, but automated metadata discovery is denied by the archive's server. Copperminer shows the blocked API URL and offers to open it in your normal browser. With the archived thread URL still in **Gallery Root URL**:
+Metadata media links are resolved relative to the archive host that supplied
+them, so TheBArchive paths are not incorrectly treated as archived.moe URLs.
+When importing JSON saved using **Open /b/ alternate API**, the application
+remembers which host supplied that file. The official 4chan metadata API is
+also paced to at most one request per second, as required by its
+[API rules](https://github.com/4chan/4chan-API). Official 4chan API
+requests do not inherit the unrelated LiveJournal Referer header used
+elsewhere in the application.
 
-1. Click **Open thread API in browser**, and complete any verification the website requires. Confirm that the browser displays a JSON object containing the thread ID, not an HTML challenge/error page. If the browser itself cannot obtain JSON, this fallback cannot work.
-2. Save the displayed API response as a `.json` file (Ctrl+S in browsers that support saving JSON; choose the original JSON text rather than rendered HTML).
-3. Click **Import saved thread JSON** and select that file. Copperminer checks that it contains the specified thread, discovers its attachments without another metadata API call, and retains that snapshot for **Start Download**. This is an explicit one-time import for the current app session, not a persistent credential or cookie.
+Files are saved under `4chan/<board>/<sanitized subject> <thread ID>`.
+When exactly one existing folder with the same board and thread ID exists,
+archive recovery adds files to it even if the subject has changed. Existing
+original filenames are skipped, and missing originals are never replaced
+by thumbnails. When multiple folders match, Copperminer does not arbitrarily
+choose one.
 
-Imported data supplies **original-media URLs and integrity metadata**, not the media bytes. Media downloads may still fail if the archive or linked hosting service denies access. Copperminer logs these failures and continues through the remaining original candidates. It never treats a saved challenge page as valid JSON or silently substitutes thumbnails.
+**If both archive APIs deny automated requests:** These sites may enforce
+Cloudflare verification or disable API access for automated clients. A
+HTTP 403 is not a zero-image result and Copperminer will report the block.
+With the *live or archived thread URL* still in **Gallery Root URL**:
 
-Archived.moe does **not** preserve every full-size original. Its metadata can contain thumbnails without a recoverable original, and some linked source URLs may return HTTP errors or anti-bot challenges. Copperminer does not use thumbnails as substitutes for originals, verifies file size and MD5 when archived metadata supplies them, logs unavailable files, and does not bypass access restrictions. The reported count reflects attachments with at least one candidate original URL, not guaranteed successful downloads. Recovery is available for individual archived.moe thread URLs; archived board browsing/search is not supported.
+1. Click **Open archive API**. For `/b/`, the **Open /b/ alternate API** button
+   opens TheBArchive's metadata endpoint if archived.moe is unavailable.
+2. If your browser displays valid JSON (not a verification page or HTML),
+   save the JSON response locally.
+3. Click **Import saved thread JSON**. Copperminer verifies the thread ID and
+   board metadata where supplied, then uses that snapshot for both discovery
+   and download without retrying the blocked metadata endpoints.
+
+The manual import does not bypass a site's restrictions; if neither archive
+will provide valid metadata even in a browser, retrieval remains unavailable.
+A successful metadata lookup also does not guarantee that full-size files
+still exist. Copperminer attempts original-media URLs (including linked
+full-image hosts), validates sizes and MD5 checksums when available, and
+does not silently substitute thumbnails or HTML error pages. Archive
+support applies to individual threads; it does not index archived board
+catalogs.
 
 ### Yandex Images Usage
 

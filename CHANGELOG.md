@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.4 — 2026-11-12
+
+### Fixed
+
+- Distinguish an expired 4chan thread (HTTP 404/410) from a successful thread with no attachments. Expired live-thread URLs now initiate archive recovery instead of presenting a misleading completed empty album.
+- Fetch each live thread's API JSON once for both its subject and media metadata. Live access errors other than 404/410 propagate instead of being suppressed.
+- Automatically try the archived.moe FoolFuuka thread API, followed by TheBArchive's /b/ API when needed. Missing or blocked archive metadata surfaces as an explicit failure rather than a fabricated zero-image result.
+- Preserve a validated archive metadata snapshot from discovery through the download step; do not request the same archive API again when the user starts downloading an expired thread.
+- Accept live 4chan thread URLs in the archive JSON browser import and archive API helper buttons. Accept direct /b/ links from TheBArchive while retaining the existing 4chan folder-matching and original-media verification behavior.
+- Clarify when a server-side block prevents archive recovery and expose the alternative /b/ API for browser-assisted imports.
+- Resolve relative media links against the successful archive provider, including imported TheBArchive browser JSON, and preserve the resolved URLs in the in-memory snapshot.
+- Enforce 4chan's documented minimum one-second spacing between requests to the official metadata API and prevent those requests from inheriting a LiveJournal Referer header. Add regression tests for provider-relative original URLs and missing redirect metadata.
+
+### Validation and limitations
+
+- Regression coverage checks one-fetch live discovery, expired-thread fallback, alternate archive response handling, snapshot reuse across discovery/download, URL routing and archive imports.
+- A live HTTP 404/410 does not establish that the thread is archived. Third-party metadata and original-media availability are independent. HTTP 403 access restrictions and Cloudflare challenges cannot be bypassed by this change. Real-site archive access and Windows GUI behavior require independent testing.
+
 ## 0.4.3 — 2026-11-12
 
 ### Fixed
