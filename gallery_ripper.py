@@ -25,10 +25,11 @@ from ttkbootstrap.constants import *
 import re
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageFile
 except Exception:  # Pillow is optional at import time; thumbnails degrade to text.
     Image = None
     ImageTk = None
+    ImageFile = None
 import json
 import time
 import hashlib
@@ -2163,7 +2164,7 @@ CACHE_DIR = ".coppermine_cache"
 # Version 4 drops trees that incorrectly persisted breadcrumb/backlink
 # placeholders as incomplete categories. Page HTML remains reusable.
 TREE_CACHE_VERSION = 4
-IMAGE_EXTRACTOR_VERSION = 4
+IMAGE_EXTRACTOR_VERSION = 5
 DOWNLOAD_WORKERS = 4
 
 
@@ -2185,6 +2186,144 @@ def undersized_image_dimensions(path, min_width=0, min_height=0):
 
 class UndersizedImageError(Exception):
     """An image candidate is below the requested minimum resolution."""
+
+
+def _coppermine_image_key(url):
+    """Stable asset key shared by original, normal, and thumbnail variants.
+
+    Normalize encoded spaces without changing the query or decoding reserved
+    URL separators. This key is for Coppermine image identity only.
+    """
+    parsed = urlparse(str(url).split("#", 1)[0])
+    parts = [p for p in re.sub(r"(?i)%20", " ", parsed.path).split("/")
+             if p and p != "thumbs"]
+    if not parts:
+        return None
+    name = parts[-1]
+    for prefix in ("normal_", "thumb_", "full_", "orig_"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    stem, ext = os.path.splitext(name)
+    for suffix in ("-normal", "_normal", "-thumb", "_thumb"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    path = "/" + "/".join(parts[:-1] + [stem + ext])
+    return (parsed.scheme.lower(), parsed.netloc.lower(), path.lower())
+
+
+_ORIGINAL_DIMENSIONS_RE = re.compile(
+    r"\b(?:dimensions?|resolution|original.size)\s*[:=]\s*"
+    r"(\d{2,6})\s*[x×]\s*(\d{2,6})",
+    re.I,
+)
+
+
+def _coppermine_listing_dimensions(anchor):
+    """Find *original* dimensions explicitly provided by the thumbnail UI.
+
+    Never use an img element's width/height attributes: those describe the
+    rendered thumbnail, not the original JPEG. Limit nearby markup to a single
+    linked image so neighboring thumbnails cannot supply each other's size.
+    """
+    nodes = [anchor]
+    nodes.extend(anchor.find_all(["img", "span"], limit=12))
+    cell = anchor.find_parent(["td", "li", "article"])
+    if cell is not None and len(cell.find_all(
+        "a", href=lambda href: href and "displayimage.php" in href
+    )) == 1:
+        nodes.append(cell)
+        nodes.extend(cell.find_all(
+            class_=lambda value: value and "thumb_dimensions" in (
+                value if isinstance(value, list) else str(value).split()
+            )
+        ))
+    for node in nodes:
+        values = []
+        for name in ("title", "onmouseover", "data-tooltip", "data-original-size",
+                     "data-dimensions", "data-content"):
+            value = node.get(name)
+            if isinstance(value, str):
+                values.append(value)
+        if "thumb_dimensions" in node.get("class", []):
+            values.append("Dimensions: " + node.get_text(" ", strip=True))
+        for value in values:
+            match = _ORIGINAL_DIMENSIONS_RE.search(value)
+            if match:
+                width, height = map(int, match.groups())
+                if width > 0 and height > 0:
+                    return width, height
+    return None
+
+
+def _coppermine_image_dimensions_on_page(soup, album_url):
+    """Map known full-size asset URLs to original sizes with zero extra I/O."""
+    dimensions = {}
+    for anchor in soup.find_all("a", href=True):
+        if "displayimage.php" not in anchor["href"]:
+            continue
+        size = _coppermine_listing_dimensions(anchor)
+        if size is None:
+            continue
+        img = anchor.find("img", src=True)
+        if img is None:
+            continue
+        thumb = urljoin(album_url, img["src"])
+        variants = coppermine_url_variants(thumb)
+        if not variants:
+            continue
+        key = _coppermine_image_key(variants[0])
+        if key is not None:
+            dimensions["|".join(key)] = list(size)
+    return dimensions
+
+
+def _coppermine_filter_listed_images(
+    entries, page_cache, album_pages, min_width, min_height, log,
+    skipped_stats=None,
+):
+    if not min_width and not min_height:
+        return entries
+    sizes = {}
+    for page in album_pages:
+        sizes.update((page_cache.get(page) or {}).get("image_dimensions", {}))
+    filtered, count = [], 0
+    for entry in entries:
+        key = _coppermine_image_key(_decode_candidate_metadata(entry[1][0])[0])
+        size = sizes.get("|".join(key)) if key is not None else None
+        if size is not None and (size[0] < min_width or size[1] < min_height):
+            count += 1
+        else:
+            filtered.append(entry)
+    if count:
+        log(
+            f"Prefiltered {count} undersized image(s) using original dimensions "
+            "already present in Coppermine album pages (no image requests)."
+        )
+        if skipped_stats is not None:
+            skipped_stats["skipped_small"] = skipped_stats.get("skipped_small", 0) + count
+    return filtered
+
+
+def _thumbnail_candidate(url):
+    """Recognize generated Coppermine thumbnails, not arbitrary image URLs."""
+    path = urlparse(url).path.lower()
+    basename = path.rsplit("/", 1)[-1]
+    return (
+        basename.startswith("thumb_") or "/thumbs/" in path
+        or basename.endswith("_thumb.jpg") or basename.endswith("-thumb.jpg")
+        or basename.endswith("_thumb.png") or basename.endswith("-thumb.png")
+    )
+
+
+def _request_url_key(url):
+    """Treat literal spaces and percent-encoded spaces as the same request."""
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(
+        path=re.sub(r"(?i)%20", " ", parsed.path),
+        fragment="",
+    ))
 
 
 def get_soup(url, log=lambda msg: None, referer=None):
@@ -3181,7 +3320,7 @@ def _decode_candidate_metadata(value, default_referer=None):
     return base, referer, display_url
 
 
-def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True, _implicit_first_page=None):
+def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited=None, page_cache=None, quick_scan=True, _implicit_first_page=None, min_width=0, min_height=0, skipped_stats=None):
     """Return all candidate image URLs from an album.
 
     The return value is a list of tuples ``(display_title, [url1, url2, ...], referer)``
@@ -3203,11 +3342,24 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
     if quick_scan and not changed and entry.get("images"):
         if entry.get("images_v") == IMAGE_EXTRACTOR_VERSION:
             log(f"[DEBUG] Using cached image list for {album_url}")
-            return entry["images"]
+            album_id = parse_qs(urlparse(album_url).query).get("album")
+            album_pages = [
+                key for key in page_cache
+                if parse_qs(urlparse(key).query).get("album") == album_id
+                and urlparse(key).path.lower().endswith("thumbnails.php")
+            ]
+            return _coppermine_filter_listed_images(
+                entry["images"], page_cache, album_pages, min_width, min_height,
+                log, skipped_stats,
+            )
         log(f"[DEBUG] Cached image list version mismatch; recomputing for {album_url}")
 
     soup = BeautifulSoup(html, "html.parser")
     log = log or (lambda msg: None)
+    if album_url in page_cache:
+        page_cache[album_url]["image_dimensions"] = (
+            _coppermine_image_dimensions_on_page(soup, album_url)
+        )
     image_entries = []
     unique_urls = set()
 
@@ -3476,27 +3628,7 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
 
     # --- Consolidate variants (prefer originals over normal/thumb) ---
     def _canon_key(u: str):
-        try:
-            pu = urlparse(u)
-            path = pu.path
-            parts = [p for p in path.split("/") if p and p != "thumbs"]
-            base = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
-            name = parts[-1] if parts else ""
-            # strip common prefixes
-            for pref in ("normal_", "thumb_", "full_", "orig_"):
-                if name.startswith(pref):
-                    name = name[len(pref):]
-                    break
-            # strip common suffixes before extension
-            stem, ext = os.path.splitext(name)
-            for suf in ("-normal", "_normal", "-thumb", "_thumb"):
-                if stem.endswith(suf):
-                    stem = stem[: -len(suf)]
-                    break
-            norm_path = ppath.join(base, stem + ext)
-            return (pu.scheme, pu.netloc, norm_path.lower())
-        except Exception:
-            return ("", "", u)
+        return _coppermine_image_key(_decode_candidate_metadata(u)[0])
 
     def _quality_rank(u: str) -> int:
         s = u.lower()
@@ -3564,7 +3696,10 @@ def get_all_candidate_images_from_album(album_url, log=lambda msg: None, visited
         page_cache[album_url]["image_hash"] = img_hash
         page_cache[album_url]["images_v"] = IMAGE_EXTRACTOR_VERSION
 
-    return filtered_entries
+    return _coppermine_filter_listed_images(
+        filtered_entries, page_cache, visited, min_width, min_height,
+        log, skipped_stats,
+    )
 
 def download_image_candidates(candidate_urls, output_dir, log, index=None, total=None,
                              album_stats=None, max_attempts=3, referer=None,
@@ -3657,9 +3792,16 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
         while queue_index < len(candidate_queue):
             candidate, candidate_ref, display_url = candidate_queue[queue_index]
             queue_index += 1
-            if candidate in attempted_urls or candidate in rejected_undersized:
+            candidate_key = _request_url_key(candidate)
+            if candidate_key in attempted_urls or candidate_key in rejected_undersized:
                 continue
-            attempted_urls.add(candidate)
+            if (min_width or min_height) and _thumbnail_candidate(candidate):
+                # Generated Coppermine thumbs are intentionally excluded from
+                # a minimum-original-resolution download. Their HTML width/
+                # height attributes are not evidence of original dimensions.
+                rejected_undersized.add(candidate_key)
+                continue
+            attempted_urls.add(candidate_key)
 
             # Use the URL path name as a default; some Coppermine endpoints are PHP
             # but still return images (we'll fix the extension after headers).
@@ -3711,21 +3853,52 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     return False
                 total_bytes = 0
                 start_time = time.time()
+                probe = (
+                    ImageFile.Parser()
+                    if (min_width or min_height) and ctype.lower().startswith("image/")
+                    and ImageFile is not None else None
+                )
+                probe_bytes = 0
                 with tempfile.NamedTemporaryFile(
                     mode="wb", dir=output_dir, prefix=".copperminer-",
                     suffix=".part", delete=False,
                 ) as f:
                     partial_path = f.name
                     for chunk in r.iter_content(1024 * 16):
-                        if chunk:
-                            f.write(chunk)
-                            total_bytes += len(chunk)
+                        if not chunk:
+                            continue
+                        if probe is not None:
+                            try:
+                                probe.feed(chunk)
+                                probe_bytes += len(chunk)
+                                header_image = probe.image
+                                if header_image is not None:
+                                    width, height = header_image.size
+                                    if width < min_width or height < min_height:
+                                        rejected_undersized.add(candidate_key)
+                                        raise UndersizedImageError(
+                                            f"{width}x{height} below "
+                                            f"{min_width}x{min_height} minimum "
+                                            "(detected from image header)"
+                                        )
+                                    probe = None
+                                elif probe_bytes >= 262144:
+                                    # Some formats have large metadata before
+                                    # their dimensions. Preserve the existing
+                                    # full-file Pillow check for these images.
+                                    probe = None
+                            except UndersizedImageError:
+                                raise
+                            except (OSError, ValueError, SyntaxError):
+                                probe = None
+                        f.write(chunk)
+                        total_bytes += len(chunk)
                 if total_bytes == 0:
                     raise requests.RequestException("Media response contained no image/video bytes")
                 if ctype.lower().startswith("image/"):
                     dims = undersized_image_dimensions(partial_path, min_width, min_height)
                     if dims is not None:
-                        rejected_undersized.add(candidate)
+                        rejected_undersized.add(candidate_key)
                         raise UndersizedImageError(
                             f"{dims[0]}x{dims[1]} below {min_width}x{min_height} minimum"
                         )
@@ -3755,7 +3928,17 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                     log(f"Skipping undersized candidate {candidate}: {e}")
                 else:
                     log(f"Error downloading {candidate}: {e}")
-                if display_url:
+                # The unprefixed file derived from Coppermine's thumb_
+                # filename is its actual original. If its decoded header
+                # proves it undersized, revisiting displayimage.php can only
+                # repeat the same original and generate extra host requests.
+                original_name = os.path.basename(urlparse(candidate).path).lower()
+                known_small_original = (
+                    isinstance(e, UndersizedImageError) and display_url
+                    and not _thumbnail_candidate(candidate)
+                    and not original_name.startswith(("normal_", "thumb_"))
+                )
+                if display_url and not known_small_original:
                     resolved = _resolved_display_cache.get(display_url)
                     if resolved is None:
                         resolved = extract_all_displayimage_candidates(
@@ -3772,7 +3955,7 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                                 resolved_url,
                                 display_url,
                             )
-                            if clean_resolved in attempted_urls:
+                            if _request_url_key(clean_resolved) in attempted_urls:
                                 continue
                             fallback_pairs.append(
                                 (clean_resolved, display_url, None)
@@ -3787,7 +3970,9 @@ def download_image_candidates(candidate_urls, output_dir, log, index=None, total
                         os.remove(partial_path)
                     except OSError:
                         pass
-        if rejected_undersized and attempted_urls.issubset(rejected_undersized):
+        if rejected_undersized and (
+            not attempted_urls or attempted_urls.issubset(rejected_undersized)
+        ):
             break
         if block_attempt < max_attempts:
             log(f"All candidate URLs failed for this image (attempt {block_attempt}/{max_attempts}), retrying all methods.")
@@ -4140,6 +4325,7 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
     pages, tree = load_page_cache(root_url)
     rules = select_universal_rules(root_url) if site_type == "universal" else None
     download_queue = []
+    metadata_stats = {"skipped_small": 0}
     for album_name, album_url, album_path in selected_albums:
         if stop_flag and stop_flag.is_set():
             log("Download stopped by user.")
@@ -4159,7 +4345,9 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                 )
             else:
                 image_entries = get_all_candidate_images_from_album(
-                    album_url, log=log, page_cache=pages, quick_scan=quick_scan
+                    album_url, log=log, page_cache=pages, quick_scan=quick_scan,
+                    min_width=min_width, min_height=min_height,
+                    skipped_stats=metadata_stats,
                 )
         except imdb_gallery.IMDbError as exc:
             if stop_flag and stop_flag.is_set():
@@ -4193,7 +4381,14 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
 
     total_images = len(download_queue)
     if total_images == 0:
-        log("No images to download.")
+        if metadata_stats["skipped_small"]:
+            log(
+                f"No eligible images to download; skipped "
+                f"{metadata_stats['skipped_small']} below the metadata resolution threshold."
+            )
+        else:
+            log("No images to download.")
+        save_page_cache(root_url, tree, pages)
         return
 
     stats = {
@@ -4201,7 +4396,7 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
         'total_time': 0.0,
         'downloaded': 0,
         'errors': 0,
-        'skipped_small': 0,
+        'skipped_small': metadata_stats["skipped_small"],
         'start_time': time.time(),
     }
 

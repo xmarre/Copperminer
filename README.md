@@ -117,12 +117,28 @@ Enable **Skip undersized images** and configure **Minimum width** and
 **Minimum height** (pixels) before starting a download. The default thresholds
 are 512 × 512 pixels and the filter is disabled until selected. An image must
 meet **both** thresholds. For example, 419 × 594 fails the default minimum
-because its width is below 512. Copperminer checks the *actual decoded image
-dimensions after download*, before saving the file, and tries alternative
-candidates when available. A candidate rejected for size is removed without
-leaving a partial file. Resolution filtering applies to new image downloads
-across the supported adapters, including 4chan archives; videos are not
-filtered. Existing downloaded files are never removed or replaced.
+because its width is below 512. On Coppermine galleries, Copperminer
+first reads explicit **original-image dimensions** supplied in album thumbnail
+tooltips/captions, when available. Photos that fail either threshold are
+excluded from the download queue **without any additional image request**.
+The filter never mistakes the displayed thumbnail's HTML width/height
+attributes for the original image resolution. The same cached album can be
+reused with different thresholds without permanently dropping candidates.
+
+For images lacking reliable page metadata, Copperminer inspects image
+headers while streaming and closes the connection early when the resolution
+fails, instead of transferring the entire file. Some formats put metadata
+later in the stream; the final decoded-file check remains the fallback.
+Literal-space and percent-encoded-space URL aliases are deduplicated. Generated
+Coppermine thumbnail URLs are skipped when a minimum resolution is active,
+and a confirmed undersized full-size original does not trigger a redundant
+display-page retry. Distinct higher-resolution candidates can still be
+retried when the first original is missing.
+
+A candidate rejected for size is removed without leaving a partial file.
+Resolution filtering applies to new image downloads across supported
+adapters, including 4chan archives; videos are not filtered. Existing
+downloaded files are never removed or replaced.
 
 Pixel dimensions do not measure sharpness, compression artifacts, lighting or
 aesthetic quality. A separate manual review is still needed for curated datasets.

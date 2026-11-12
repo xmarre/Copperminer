@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.6 — 2026-11-13
+
+### Improved
+
+- Pre-filter undersized Coppermine photos using explicitly labeled **original dimensions** in existing album thumbnail markup. No image transfer or display-page fetch is required when metadata proves an image fails either minimum. Do not infer original size from thumbnail HTML width/height.
+- Re-apply configurable thresholds to unfiltered cached album entries; changing a threshold does not require redownloading or invalidate valid image candidates. Raise the album image-extractor cache version to retain original dimension metadata.
+- Inspect image dimensions incrementally in the first streamed bytes of JPEG/PNG/WebP and other Pillow-supported formats, closing the download before the full body arrives when the header proves a file undersized. Retain post-download verification for formats with delayed headers and for nonstandard responses.
+- Deduplicate URL candidates differing only in URL-encoded versus literal spaces, avoid generated thumbnail downloads under a resolution filter, and skip redundant display-page probes when the original Coppermine image has already failed the size requirement.
+- Retain normal download behavior when filtering is disabled; continue checking distinct high-resolution candidates when the original is missing or otherwise unavailable.
+
+### Validation
+
+- Targeted regression tests for tooltip-based prefiltering, cache re-evaluation, unknown metadata, per-image association, early streaming termination, equivalent URLs, original-missing fallback, and complete large-image downloads.
+- Browser rendering and behavior on sites without usable thumbnail metadata require live validation. Early header termination reduces transferred bytes but cannot remove the initial HTTP request when the source page does not expose original dimensions.
+
 ## 0.4.5 — 2026-11-13
 
 ### Fixed
