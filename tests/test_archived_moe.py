@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import tempfile
+import requests
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -56,6 +57,18 @@ class ArchiveMetadataTests(unittest.TestCase):
         self.assertEqual(gr.select_adapter_for_url(CANONICAL), "4chan")
         self.assertEqual(gr.normalize_fourchan_url(ARCHIVE_URL), CANONICAL)
         self.assertEqual(gr.normalize_fourchan_url(CANONICAL), CANONICAL)
+        self.assertEqual(
+            am.parse_thread_url(f"https://thebarchive.com/b/thread/{THREAD_ID}/"),
+            ("b", THREAD_ID),
+        )
+        self.assertEqual(
+            gr.normalize_fourchan_url(f"https://thebarchive.com/b/thread/{THREAD_ID}/"),
+            CANONICAL,
+        )
+        self.assertEqual(
+            gr.fourchan_thread_identity(f"https://boards.4chan.org/b/thread/{THREAD_ID}"),
+            ("b", THREAD_ID),
+        )
         self.assertEqual(
             gr.normalize_fourchan_url(f"https://boards.4chan.org/b/thread/{THREAD_ID}"),
             f"4chan:b/{THREAD_ID}",
@@ -315,7 +328,7 @@ class ArchiveBrowserFallbackTests(unittest.TestCase):
                 gr.fourchan_discover_tree(ARCHIVE_URL)
         self.assertEqual(raised.exception.status_code, 403)
         self.assertEqual(raised.exception.api_url, api_url)
-        denied.close.assert_called_once()
+        self.assertEqual(denied.close.call_count, 2)
 
     def test_json_file_import_validates_thread_and_board(self):
         data = make_thread()
@@ -424,6 +437,234 @@ class ArchiveBrowserFallbackTests(unittest.TestCase):
             gr.GalleryRipperApp.handle_archived_moe_blocked(app, error)
         browser.assert_called_once_with(am.thread_api_url("b", THREAD_ID))
         self.assertIn("Import saved thread JSON", dialog.call_args.args[1])
+
+    def test_archive_import_accepts_original_live_4chan_url(self):
+        data = make_thread()
+        app = Mock()
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        app.url_var.get.return_value = live_url
+        app.discovery_thread = None
+        app.download_thread = None
+        app._archive_snapshot = None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "archive.json")
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(gr.filedialog, "askopenfilename", return_value=str(path)):
+                gr.GalleryRipperApp.import_archived_moe_json(app)
+        self.assertEqual(app._archive_snapshot, (("b", THREAD_ID), data))
+        self.assertEqual(
+            gr.GalleryRipperApp._archive_data_for_url(app, live_url), data
+        )
+        app.discover_albums.assert_called_once()
+
+    def test_archive_buttons_accept_live_thread_and_select_provider(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        app = Mock()
+        app.url_var.get.return_value = live_url
+        urls = am.thread_api_candidates("b", THREAD_ID)
+        with patch.object(gr.webbrowser, "open") as browser:
+            gr.GalleryRipperApp.open_archive_api_in_browser(app)
+            gr.GalleryRipperApp.open_secondary_archive_api_in_browser(app)
+        self.assertEqual(
+            [call.args[0] for call in browser.call_args_list], urls
+        )
+
+    def test_thebarchive_thread_url_prioritizes_its_own_api(self):
+        url = f"https://thebarchive.com/b/thread/{THREAD_ID}/"
+        data = make_thread()
+        response = Mock(status_code=200)
+        response.json.return_value = data
+        with patch.object(gr, "_discovery_request", return_value=response) as fetch:
+            tree = gr.fourchan_discover_tree(url)
+        self.assertEqual(tree["albums"][0]["url"], CANONICAL)
+        self.assertEqual(tree["albums"][0]["image_count"], 2)
+        self.assertEqual(
+            fetch.call_args.args[1],
+            am.thread_api_candidates("b", THREAD_ID, preferred="thebarchive.com")[0],
+        )
+
+    def test_live_thread_is_only_fetched_once(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        live_data = {
+            "posts": [
+                {"no": int(THREAD_ID), "sub": "Live subject", "filename": "a", "tim": 123, "ext": ".jpg"},
+                {"no": int(THREAD_ID) + 1, "filename": "b", "tim": 124, "ext": ".png"},
+            ],
+        }
+        with patch.object(gr, "fetch_json_simple", return_value=live_data) as live, patch.object(
+            gr, "_discovery_request"
+        ) as archive:
+            tree = gr.fourchan_discover_tree(live_url)
+        live.assert_called_once_with(f"https://a.4cdn.org/b/thread/{THREAD_ID}.json")
+        archive.assert_not_called()
+        self.assertEqual(tree["albums"][0]["image_count"], 2)
+        self.assertEqual(tree["albums"][0]["url"], f"4chan:b/{THREAD_ID}")
+        self.assertNotIn("_archive_data", tree)
+
+    def test_live_404_recovers_archive_and_keeps_snapshot_for_download(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        official_api = f"https://a.4cdn.org/b/thread/{THREAD_ID}.json"
+        expired = Mock(status_code=404, url=official_api)
+        error = requests.HTTPError("404 Not Found", response=expired)
+        archive_response = Mock(status_code=200)
+        data = make_thread()
+        archive_response.json.return_value = data
+        messages = []
+        with patch.object(gr, "fetch_json_simple", side_effect=error) as live, patch.object(
+            gr, "_discovery_request", return_value=archive_response
+        ) as archive:
+            tree = gr.fourchan_discover_tree(live_url, log=messages.append)
+            self.assertEqual(tree["albums"][0]["url"], CANONICAL)
+            self.assertEqual(tree["albums"][0]["image_count"], 2)
+            self.assertIs(tree["_archive_data"], data)
+            self.assertTrue(any("expired" in line for line in messages))
+            with tempfile.TemporaryDirectory() as folder, patch.object(
+                gr, "download_4chan_image_oldschool", return_value=False
+            ):
+                gr._rip_galleries_impl(
+                    [(
+                        tree["albums"][0]["name"],
+                        tree["albums"][0]["url"],
+                        tree["albums"][0]["path"],
+                    )],
+                    folder, messages.append, live_url, workers=1, archive_data=tree["_archive_data"],
+                )
+        live.assert_called_once()
+        archive.assert_called_once()
+        self.assertEqual(archive_response.close.call_count, 1)
+
+    def test_live_403_does_not_masquerade_as_expired_thread(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        denied = Mock(status_code=403)
+        with patch.object(
+            gr, "fetch_json_simple",
+            side_effect=requests.HTTPError("403 Forbidden", response=denied)
+        ), patch.object(gr, "_discovery_request") as archive:
+            with self.assertRaises(requests.HTTPError):
+                gr.fourchan_discover_tree(live_url)
+        archive.assert_not_called()
+
+    def test_both_archives_missing_is_an_error_not_empty_album(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        expired = Mock(status_code=404)
+        response = Mock(status_code=404)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "404 Not Found", response=response
+        )
+        with patch.object(
+            gr, "fetch_json_simple",
+            side_effect=requests.HTTPError("404 Not Found", response=expired)
+        ), patch.object(gr, "_discovery_request", return_value=response) as archive:
+            with self.assertRaisesRegex(RuntimeError, "No archived metadata"):
+                gr.fourchan_discover_tree(live_url)
+        self.assertEqual(archive.call_count, 2)
+
+    def test_archived_moe_403_tries_thebarchive_successfully(self):
+        denied = Mock(status_code=403)
+        denied.raise_for_status.side_effect = requests.HTTPError(
+            "403 Forbidden", response=denied
+        )
+        recovered = Mock(status_code=200)
+        recovered.json.return_value = make_thread()
+        with patch.object(gr, "_discovery_request", side_effect=[denied, recovered]) as fetch:
+            tree = gr.fourchan_discover_tree(ARCHIVE_URL)
+        self.assertEqual(tree["albums"][0]["image_count"], 2)
+        self.assertEqual(
+            [call.args[1] for call in fetch.call_args_list],
+            am.thread_api_candidates("b", THREAD_ID),
+        )
+        denied.close.assert_called_once()
+        recovered.close.assert_called_once()
+
+    def test_4chan_live_discovery_stores_recovered_snapshot_in_gui(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        app = Mock()
+        app._archive_snapshot = None
+        app.discovery_stop_flag = None
+        tree = {
+            "type": "category", "name": "/b/", "url": "4chan:b",
+            "albums": [{"name": "Recovered", "url": CANONICAL}],
+            "children": [], "_archive_data": make_thread(),
+        }
+        with patch.object(gr, "discover_or_load_gallery_tree", return_value=tree):
+            gr.GalleryRipperApp.do_discover(app, live_url, True)
+        self.assertEqual(app._archive_snapshot, (("b", THREAD_ID), make_thread()))
+        self.assertNotIn("_archive_data", tree)
+        self.assertEqual(app.albums_tree_data["albums"][0]["url"], CANONICAL)
+
+    def test_thebarchive_relative_media_links_keep_the_source_domain(self):
+        thread_url = f"https://thebarchive.com/b/thread/{THREAD_ID}/"
+        source = make_thread()
+        source[THREAD_ID]["op"]["media"]["media_link"] = "/b/redirect/1000000000001.jpg"
+        response = Mock(status_code=200)
+        response.json.return_value = source
+        with patch.object(gr, "_discovery_request", return_value=response):
+            tree = gr.fourchan_discover_tree(thread_url)
+        snapshot = tree["_archive_data"]
+        self.assertEqual(
+            snapshot[THREAD_ID]["op"]["media"]["media_link"],
+            "https://thebarchive.com/b/redirect/1000000000001.jpg",
+        )
+        self.assertEqual(
+            source[THREAD_ID]["op"]["media"]["media_link"],
+            "/b/redirect/1000000000001.jpg",
+        )
+        _, entries, _ = am.extract_thread(snapshot, "b", THREAD_ID)
+        self.assertEqual(
+            entries[0][1][0],
+            "https://thebarchive.com/b/redirect/1000000000001.jpg",
+        )
+
+    def test_alternate_browser_import_preserves_relative_host_through_snapshot(self):
+        live_url = f"https://boards.4chan.org/b/thread/{THREAD_ID}"
+        source = make_thread()
+        source[THREAD_ID]["op"]["media"]["media_link"] = "/b/redirect/1000000000001.jpg"
+        app = Mock()
+        app.url_var.get.return_value = live_url
+        app.discovery_thread = None
+        app.download_thread = None
+        app._archive_snapshot = None
+        app._archive_import_origin = (("b", THREAD_ID), "thebarchive.com")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "saved.json")
+            path.write_text(json.dumps(source), encoding="utf-8")
+            with patch.object(gr.filedialog, "askopenfilename", return_value=str(path)):
+                gr.GalleryRipperApp.import_archived_moe_json(app)
+        data = app._archive_snapshot[1]
+        self.assertEqual(
+            data[THREAD_ID]["op"]["media"]["media_link"],
+            "https://thebarchive.com/b/redirect/1000000000001.jpg",
+        )
+        self.assertEqual(
+            gr.GalleryRipperApp._archive_data_for_url(app, live_url), data
+        )
+
+    def test_b_original_without_redirect_has_full_image_archive_candidate(self):
+        data = make_thread()
+        op_media = data[THREAD_ID]["op"]["media"]
+        op_media.pop("media_link")
+        _, entries, _ = am.extract_thread(data, "b", THREAD_ID)
+        self.assertEqual(
+            entries[0][1],
+            [
+                "https://thebarchive.com/b/full_image/1000000000001.jpg",
+                "https://i.4cdn.org/b/1000000000001.jpg",
+            ],
+        )
+
+    def test_4chan_api_requests_enable_documented_minimum_spacing(self):
+        response = Mock()
+        response.json.return_value = {"posts": []}
+        with patch.object(gr.session, "get", return_value=response) as get, patch.object(
+            gr.session.pacer, "set_host_min_interval"
+        ) as rate_limit:
+            result = gr.fetch_json_simple("https://a.4cdn.org/b/catalog.json")
+        self.assertEqual(result, {"posts": []})
+        rate_limit.assert_called_once_with(
+            "https://a.4cdn.org/b/catalog.json", 1.0
+        )
+        get.assert_called_once()
+        self.assertIsNone(get.call_args.kwargs["headers"]["Referer"])
 
     def test_snapshot_for_download_is_captured_before_worker_starts(self):
         app = Mock()
