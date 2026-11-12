@@ -99,6 +99,14 @@ An incomplete discovery is explicitly reported in the log and is not treated
 as a fully refreshed cache. Subsequent discoveries retry incomplete branches.
 A successful future crawl replaces stale placeholders with real albums.
 
+Coppermine navigation menus and breadcrumbs can link to ancestor or already
+visited categories. These links are ignored as navigation rather than being
+inserted as duplicate or `[incomplete]` descendants. Only genuinely
+unavailable category pages or other interrupted fetches make the discovery
+incomplete. Old category-tree caches from versions that misclassified
+navigation links are discarded automatically; their cached HTML pages remain
+available for revalidation.
+
 This does not bypass a site's access policy or reveal albums that could not be
 retrieved. If access has already been denied, do not repeatedly rerun discovery.
 Wait for the restriction to expire or contact the site's administrator.

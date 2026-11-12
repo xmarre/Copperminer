@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.5 — 2026-11-13
+
+### Fixed
+
+- Coppermine category links to previously explored ancestors or siblings are treated as navigation, not unavailable child categories. Circular breadcrumbs no longer create spurious `[incomplete]` placeholders or a false incomplete-discovery message.
+- Reused quick-scan subtrees register their descendants as visited, preventing later navigation links from duplicating those categories.
+- Invalidate the prior category-tree cache version to clear incorrectly persisted breadcrumb placeholders while preserving cached page HTML and image metadata.
+- Preserve incomplete markers for actual inaccessible category pages, including HTTP failures, instead of suppressing genuine partial scans.
+
+### Validation
+
+- Regression tests cover the ancestor-breadcrumb hierarchy, previously visited siblings, cached descendant reuse, legacy cache invalidation, and genuine fetch failures.
+- No live requests to third-party gallery servers are needed for the fix. Runtime site-specific behavior and Windows GUI display remain unverified until exercised on an affected gallery.
+
 ## 0.4.4 — 2026-11-12
 
 ### Fixed
