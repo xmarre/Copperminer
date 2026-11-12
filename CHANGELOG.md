@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.2 — 2026-11-12
+
+### Fixed
+
+- Coppermine discovery keeps previously crawled categories and albums when category requests fail. Unavailable category links remain as visible incomplete placeholders instead of disappearing from the tree.
+- Discovery stops attempting additional pages on the blocked host after HTTP 403/429, marks partially refreshed trees as incomplete, and revisits those branches on subsequent discovery. Prior successful page-cache entries survive interrupted forced refreshes.
+- A new tree-cache schema invalidates legacy trees that could incorrectly represent incomplete scans as complete.
+
+### Added
+
+- Opt-in image-resolution filter with configurable minimum width and height, remembered in settings. Inspect actual image dimensions before publishing downloaded files and try remaining candidates when one is too small.
+- Apply resolution filtering to Coppermine, rule-based galleries, IMDb, Yandex and 4chan/archive image downloads; preserve videos and already downloaded files.
+- Regression tests for access-denied recovery, cached subtree retention, incomplete-cache traversal and undersized candidate handling.
+
+### Limitations
+
+A blocked site does not expose missing album data; incomplete placeholders are resolved only after access returns. The filter measures pixel dimensions, not blur or compression quality. Tests use mocked server responses and sample images; live site behavior and Windows GUI usability still require verification.
+
 ## 0.4.1 — 2026-11-11
 
 ### Fixed

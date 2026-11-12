@@ -49,6 +49,38 @@ The **Probe sizes** button sends HEAD requests for visible cards that do not exp
 
 If Yandex redirects automated requests to a CAPTCHA page, Copperminer now treats that as a blocked search instead of a fake zero-result discovery. It retries alternate Yandex hosts by default. If you explicitly enable **Reuse Yandex browser cookies**, and `browser-cookie3` is installed, Copperminer can also make a best-effort retry with local Yandex cookies from Chrome, Edge, Firefox, Brave, Chromium, or Opera. If Yandex still blocks the request, open the logged request URL in your browser, solve the challenge, save the result page as HTML, then use **Yandex HTML** to import that saved page. The imported page uses the same parser, preview grid, sorting, and download pipeline.
 
+### Coppermine discovery interrupted by access restrictions
+
+Some galleries deny requests after a crawl has begun. If a Coppermine category
+returns HTTP 403 or 429, Copperminer stops requesting further pages from that
+host during the same discovery. Previously found categories and albums are
+retained; categories visible in their parent listing but not yet accessible are
+kept as **[incomplete]** placeholders, rather than silently disappearing.
+An incomplete discovery is explicitly reported in the log and is not treated
+as a fully refreshed cache. Subsequent discoveries retry incomplete branches.
+A successful future crawl replaces stale placeholders with real albums.
+
+This does not bypass a site's access policy or reveal albums that could not be
+retrieved. Give the site time to recover and use **Polite request pacing**
+before attempting another discovery. Lower worker counts also help avoid
+excessive concurrent image downloads.
+
+### Minimum image resolution
+
+Enable **Skip undersized images** and configure **Minimum width** and
+**Minimum height** (pixels) before starting a download. The default thresholds
+are 512 × 512 pixels and the filter is disabled until selected. An image must
+meet **both** thresholds. For example, 419 × 594 fails the default minimum
+because its width is below 512. Copperminer checks the *actual decoded image
+dimensions after download*, before saving the file, and tries alternative
+candidates when available. A candidate rejected for size is removed without
+leaving a partial file. Resolution filtering applies to new image downloads
+across the supported adapters, including 4chan archives; videos are not
+filtered. Existing downloaded files are never removed or replaced.
+
+Pixel dimensions do not measure sharpness, compression artifacts, lighting or
+aesthetic quality. A separate manual review is still needed for curated datasets.
+
 ### Request pacing
 
 **Polite request pacing** is optional and is off by default. When enabled, Copperminer

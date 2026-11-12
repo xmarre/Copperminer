@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import io
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 
@@ -749,8 +750,215 @@ class CoppermineDiscoveryTests(unittest.TestCase):
                 quick_scan=False,
             )
 
-        self.assertEqual([node["url"] for node in tree["children"]], [good])
-        self.assertTrue(any("Skipping unavailable subcategory: Broken" in line for line in logs))
+        self.assertEqual([node["url"] for node in tree["children"]], [bad, good])
+        self.assertTrue(tree["incomplete"])
+        self.assertTrue(tree["children"][0]["incomplete"])
+        self.assertFalse(tree["children"][1]["incomplete"])
+        self.assertTrue(any("Unavailable subcategory: Broken" in line for line in logs))
+
+
+class CoppermineRecoveryTests(unittest.TestCase):
+    _response = staticmethod(CoppermineDiscoveryTests._response)
+    _http_error = staticmethod(CoppermineDiscoveryTests._http_error)
+
+    def setUp(self):
+        gr._page_request_state.clear()
+
+    def test_http_403_is_not_retried(self):
+        response = self._response(403)
+        with patch.object(gr.session, "get", return_value=response) as get, patch.object(
+            gr.time, "sleep"
+        ) as sleep:
+            result = gr._discovery_request("get", "https://blocked.test/photos/index.php")
+        self.assertIs(result, response)
+        get.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_first_block_keeps_sibling_categories_without_requesting_them(self):
+        root = "https://blocked.test/photos/"
+        first = "https://blocked.test/photos/index.php?cat=2"
+        second = "https://blocked.test/photos/index.php?cat=3"
+        html = (
+            '<html><title>Home</title>'
+            '<a href="index.php?cat=2">Movies</a>'
+            '<a href="index.php?cat=3">Photoshoots</a></html>'
+        )
+        requests_seen = []
+
+        def fake_fetch(url, pages, **_kwargs):
+            requests_seen.append(url)
+            if url != root:
+                raise self._http_error(403, url)
+            pages[url] = {"final_url": url}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(root, quick_scan=False, page_cache={})
+        self.assertEqual(requests_seen, [root, first])
+        self.assertEqual([n["name"] for n in tree["children"]], ["Movies", "Photoshoots"])
+        self.assertTrue(all(n["incomplete"] for n in tree["children"]))
+        self.assertTrue(tree["incomplete"])
+
+    def test_blocked_child_preserves_previous_albums(self):
+        root = "https://blocked.test/photos/"
+        first = "https://blocked.test/photos/index.php?cat=2"
+        html = '<html><title>Home</title><a href="index.php?cat=2">Movies</a></html>'
+        old_child = {
+            "type": "category", "url": first, "name": "Movies",
+            "children": [], "specials": [], "albums": [
+                {"type": "album", "name": "Screen Captures",
+                 "url": "https://blocked.test/photos/thumbnails.php?album=8"}
+            ],
+        }
+
+        def fake_fetch(url, pages, **_kwargs):
+            if url == first:
+                raise self._http_error(403, url)
+            pages[url] = {"final_url": url}
+            return html, True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(
+                root, page_cache={}, quick_scan=False, cached_nodes={first: old_child}
+            )
+        self.assertEqual(tree["children"][0]["albums"], old_child["albums"])
+        self.assertTrue(tree["children"][0]["incomplete"])
+        self.assertNotIn("incomplete", old_child)
+
+    def test_incomplete_cache_cannot_skip_descendant_refresh(self):
+        root = "https://gallery.test/photos/"
+        child = "https://gallery.test/photos/index.php?cat=2"
+        html = '<html><title>Home</title><a href="index.php?cat=2">Movies</a></html>'
+        old_root = {
+            "name": "Home", "url": root, "type": "category",
+            "child_hash": gr.compute_child_hash([("Movies", child)], []),
+            "incomplete": True, "children": [], "specials": [], "albums": [],
+        }
+        calls = []
+
+        def fake_fetch(url, pages, **_kwargs):
+            calls.append(url)
+            pages[url] = {"final_url": url}
+            return (html if url == root else "<html><title>Movies</title></html>"), True
+
+        with patch.object(gr, "fetch_html_cached", side_effect=fake_fetch):
+            tree = gr.discover_tree(
+                root, page_cache={}, quick_scan=True, cached_nodes={root: old_root}
+            )
+        self.assertIn(child, calls)
+        self.assertFalse(tree["incomplete"])
+        self.assertEqual([n["name"] for n in tree["children"]], ["Movies"])
+
+
+class ImageQualityFilterTests(unittest.TestCase):
+    @staticmethod
+    def png(width, height):
+        assert gr.Image is not None
+        output = io.BytesIO()
+        gr.Image.new("RGB", (width, height)).save(output, format="PNG")
+        return output.getvalue()
+
+    @staticmethod
+    def image_response(payload):
+        response = Mock()
+        response.headers = {"Content-Type": "image/png"}
+        response.status_code = 200
+        response.iter_content.return_value = [payload]
+        return response
+
+    def test_undersized_candidate_uses_larger_fallback(self):
+        small = self.image_response(self.png(419, 594))
+        large = self.image_response(self.png(1024, 768))
+        stats = {"downloaded": 0, "errors": 0, "total_bytes": 0, "total_time": 0.0}
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", side_effect=[small, large]
+        ) as get:
+            result = gr.download_image_candidates(
+                ["https://gallery.test/014.png", "https://gallery.test/original.png"],
+                folder, lambda _line: None, album_stats=stats,
+                min_width=512, min_height=512,
+            )
+            self.assertTrue(result)
+            self.assertFalse(Path(folder, "014.png").exists())
+            self.assertTrue(Path(folder, "original.png").exists())
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), ["original.png"])
+            self.assertEqual(get.call_count, 2)
+        self.assertEqual(stats["downloaded"], 1)
+        self.assertEqual(stats.get("skipped_small", 0), 0)
+
+    def test_only_small_image_skips_without_retry_or_partial_file(self):
+        small = self.image_response(self.png(419, 594))
+        stats = {"downloaded": 0, "errors": 0, "total_bytes": 0, "total_time": 0.0}
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", return_value=small
+        ) as get:
+            result = gr.download_image_candidates(
+                ["https://gallery.test/014.png"], folder, lambda _line: None,
+                album_stats=stats, min_width=512, min_height=512,
+            )
+            self.assertFalse(result)
+            self.assertEqual(list(Path(folder).iterdir()), [])
+            get.assert_called_once()
+        self.assertEqual(stats["downloaded"], 0)
+        self.assertEqual(stats["skipped_small"], 1)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_filter_off_preserves_existing_behavior(self):
+        small = self.image_response(self.png(419, 594))
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session, "get", return_value=small
+        ):
+            result = gr.download_image_candidates(
+                ["https://gallery.test/014.png"], folder, lambda _line: None
+            )
+            self.assertTrue(result)
+            self.assertTrue(Path(folder, "014.png").exists())
+
+    def test_4chan_undersized_image_does_not_publish_file(self):
+        payload = self.png(419, 594)
+        response = Mock(status=200, headers={"Content-Type": "image/png"})
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.side_effect = [payload, b""]
+        stats = {"errors": 0, "downloaded": 0}
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            gr.session.pacer, "wait"
+        ), patch.object(
+            gr.session.pacer, "record_response"
+        ), patch.object(
+            gr.urllib.request, "urlopen", return_value=response
+        ):
+            self.assertFalse(gr.download_4chan_image_oldschool(
+                "https://i.4cdn.org/b/14.png", folder, lambda _line: None,
+                album_stats=stats, min_width=512, min_height=512,
+            ))
+            self.assertEqual(list(Path(folder).iterdir()), [])
+        self.assertEqual(stats.get("skipped_small"), 1)
+        self.assertEqual(stats["errors"], 0)
+
+
+class CoppermineUITests(unittest.TestCase):
+    def test_incomplete_label_does_not_change_download_folder(self):
+        app = Mock()
+        app.item_to_category = {}
+        app.item_to_album = {}
+        app.album_url_to_item = {}
+        app.show_specials_var.get.return_value = False
+        app.tree.insert.side_effect = ["cat-id", "album-id"]
+        node = {
+            "type": "category", "name": "Movies", "url": "https://site.test/index.php?cat=2",
+            "incomplete": True, "specials": [], "children": [],
+            "albums": [{
+                "type": "album", "name": "Stills", "image_count": "?",
+                "url": "https://site.test/thumbnails.php?album=9",
+            }],
+        }
+
+        gr.GalleryRipperApp.insert_tree_node(app, "", node, [])
+
+        self.assertIn("[incomplete]", app.tree.insert.call_args_list[0].kwargs["text"])
+        self.assertEqual(app.item_to_category["cat-id"][2], ["Movies"])
+        self.assertEqual(app.item_to_album["album-id"][2], ["Movies", "Stills"])
 
 
 if __name__ == "__main__":
