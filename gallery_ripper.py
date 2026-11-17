@@ -4,6 +4,7 @@ import asyncio
 import requests
 import imdb_gallery
 import archived_moe
+import fourchan_links
 from request_pacing import PacedSession, PacingCancelled, retry_after_seconds
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote, parse_qs, urlencode
@@ -795,7 +796,7 @@ def fourchan_thread_images(board, thread_id, log=lambda msg: None, thread_data=N
             fname = f"{post.get('filename', str(post['tim']))}{post['ext']}"
             url = f"https://i.4cdn.org/{board}/{post['tim']}{post['ext']}"
             entries.append((fname, [url], None))
-    return entries
+    return fourchan_links.with_linked_files(data["posts"], entries)
 
 
 def fourchan_thread_identity(url):
@@ -873,6 +874,12 @@ def archived_moe_thread_images(
     subject, entries, unavailable = archived_moe.extract_thread(
         data, board, thread_id
     )
+    archive_thread = data[str(thread_id)]
+    replies = archive_thread.get("posts") or {}
+    posts = [archive_thread["op"]] + (
+        list(replies.values()) if isinstance(replies, dict) else list(replies)
+    )
+    entries = fourchan_links.with_linked_files(posts, entries)
     if unavailable:
         log(
             f"Archived /{board}/{thread_id}: {unavailable} attachment(s) "
@@ -3993,7 +4000,7 @@ def download_4chan_image_oldschool(
     url, output_dir, log, fname=None, index=None, total=None,
     album_stats=None, max_attempts=3, stop_flag=None, polite=None,
     require_original=False, expected=None,
-    min_width=0, min_height=0,
+    min_width=0, min_height=0, linked_media=False,
 ):
     """Download 4chan media through urllib, sharing the normal per-host pacer."""
     if fname is None:
@@ -4003,7 +4010,10 @@ def download_4chan_image_oldschool(
         log(f"Already downloaded: {fname}")
         return False
 
-    kind = "video" if os.path.splitext(urlparse(url).path)[1].lower() in MEDIA_EXTS else "download"
+    extension = os.path.splitext(urlparse(url).path)[1].lower()
+    kind = "video" if extension in MEDIA_EXTS or (
+        linked_media and extension in fourchan_links.DIRECT_VIDEO_EXTENSIONS
+    ) else "download"
     for attempt in range(1, max_attempts + 1):
         partial_path = None
         if stop_flag is not None and stop_flag.is_set():
@@ -4015,8 +4025,17 @@ def download_4chan_image_oldschool(
             )
             session.pacer.wait(url, kind=kind, stop_event=stop_flag, polite=polite)
             start_time = time.time()
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            # External post links are untrusted: validate redirects before
+            # following them, including HTTPS-to-HTTP/local-network attempts.
+            open_request = (
+                urllib.request.build_opener(
+                    fourchan_links.PublicMediaRedirectHandler()
+                ).open if linked_media else urllib.request.urlopen
+            )
+            with open_request(req, timeout=60) as resp:
                 session.pacer.record_response(url, resp.status, resp.headers)
+                if linked_media and not fourchan_links.public_https_url(resp.geturl()):
+                    raise IOError("External media redirected to an unsafe URL")
                 if require_original:
                     content_type = (
                         (resp.headers.get("Content-Type", "") or "")
@@ -4024,9 +4043,15 @@ def download_4chan_image_oldschool(
                     )
                     permitted = (
                         content_type.startswith(("image/", "video/"))
+                        or (linked_media and content_type.startswith("audio/"))
                         or content_type in {
                             "application/octet-stream", "application/pdf",
                             "application/x-shockwave-flash",
+                            *({
+                                "application/zip", "application/x-zip-compressed",
+                                "application/vnd.rar", "application/x-rar-compressed",
+                                "application/x-7z-compressed",
+                            } if linked_media else set()),
                         }
                     )
                     if content_type and not permitted:
@@ -4070,7 +4095,8 @@ def download_4chan_image_oldschool(
                     )
                 if digest is not None and digest.digest() != expected["md5"]:
                     raise IOError("Original media MD5 does not match archive metadata")
-            if os.path.splitext(fname)[1].lower() in IMAGE_EXTS + ('.gif',):
+            if (os.path.splitext(fname)[1].lower() in IMAGE_EXTS + ('.gif',)
+                    or (linked_media and os.path.splitext(fname)[1].lower() in ('.tif', '.tiff'))):
                 dims = undersized_image_dimensions(partial_path, min_width, min_height)
                 if dims is not None:
                     log(
@@ -4275,7 +4301,7 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
                     )
                 else:
                     image_entries = fourchan_thread_images(board, tid, log=log)
-                log(f"  Found {len(image_entries)} media attachments in {album_name}.")
+                log(f"  Found {len(image_entries)} media files (attachments and direct links) in {album_name}.")
                 outdir = fourchan_output_directory(
                     output_root, album_url, album_path
                 )
@@ -4284,30 +4310,37 @@ def _rip_galleries_impl(selected_albums, output_root, log, root_url, quick_scan=
 
                 sem = asyncio.Semaphore(workers)
 
-                async def worker(idx, fname, urls, verification):
+                async def worker(idx, fname, urls, verification, linked):
                     if stop_flag and stop_flag.is_set():
                         return
                     async with sem:
-                        if is_archive:
+                        if is_archive and not linked:
                             args = (
                                 urls, outdir, log, fname, idx, total_images,
                                 stats, verification, stop_flag, mimic_human,
                             )
                             downloader = download_4chan_archive_candidates
+                            extra = {}
                         else:
                             args = (
                                 urls[0], outdir, log, fname, idx, total_images,
                                 stats, 3, stop_flag, mimic_human,
                             )
                             downloader = download_4chan_image_oldschool
+                            extra = {"require_original": True, "linked_media": True} if linked else {}
                         await loop.run_in_executor(
                             None,
-                            lambda: downloader(*args, min_width=min_width, min_height=min_height),
+                            lambda: downloader(
+                                *args, min_width=min_width, min_height=min_height, **extra
+                            ),
                         )
 
                 tasks = [
-                    asyncio.create_task(worker(idx, fname, urls, verification))
-                    for idx, (fname, urls, verification) in enumerate(image_entries, 1)
+                    asyncio.create_task(worker(
+                        idx, entry[0], entry[1], entry[2],
+                        len(entry) == 4 and entry[3],
+                    ))
+                    for idx, entry in enumerate(image_entries, 1)
                 ]
                 await asyncio.gather(*tasks)
 
