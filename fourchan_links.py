@@ -23,8 +23,8 @@ DIRECT_FILE_EXTENSIONS = frozenset({
     ".mp3", ".m4a", ".ogg", ".flac", ".wav",
     ".pdf", ".zip", ".rar", ".7z",
 })
-_PLAIN_URL_RE = re.compile(r"https?://[^\\s<>\"']+", re.I)
-_PUBLIC_HOST_RE = re.compile(r"[a-z0-9-]+(?:\\.[a-z0-9-]+)+", re.I)
+_PLAIN_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+_PUBLIC_HOST_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
 _BLOCKED_TOP_LEVEL = {"localhost", "local", "internal", "test", "invalid", "example", "onion"}
 
 
