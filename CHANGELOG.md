@@ -1,3 +1,9 @@
+## 0.4.7
+
+- Download directly linked HTTPS media files from live 4chan post comments and available archived-thread comments, including Catbox video links.
+- Deduplicate repeated links, avoid filename collisions, reject non-file URLs and unsafe redirects, and validate response content before saving linked media.
+- Count linked files during discovery, retain the existing thread-folder layout and support re-runs without redownloading existing files.
+
 # Changelog
 
 ## 0.4.6 — 2026-11-13

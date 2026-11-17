@@ -12,7 +12,7 @@ A hassle-free GUI tool to recursively download full-size images from any Copperm
 - Download progress & log — See what’s happening at every step
 - Select/Unselect all and Stop buttons — Quickly manage or cancel downloads
 - Resizable log panel — Drag to change how much space the log uses
-- 4chan support — Browse live boards/threads and automatically look for expired threads in supported third-party archives. Restore surviving originals into the existing 4chan folder and import browser-saved archive API JSON when automated metadata access is denied
+- 4chan support — Browse live boards/threads, download native attachments and direct media-file links in post comments (including Catbox videos), and automatically look for expired threads in supported third-party archives. Restore surviving originals into the existing 4chan folder and import browser-saved archive API JSON when automated metadata access is denied
 - IMDb support — Download complete title/person photo galleries, individual media viewer photos, and combined title/person/image-type selections at original resolution
 - Yandex Images support — Paste a keyword/search phrase, an image URL, or a Yandex Images search URL; preview thumbnail results, sort by resolution/size/domain/title, follow similar-image searches, download the original/highest-resolution candidate URLs Yandex exposes, and import saved Yandex HTML when direct requests hit a CAPTCHA
 - Adaptive scraping engine — Handles custom Coppermine themes, multi-page albums, custom anti-hotlinking, and referer requirements
@@ -48,6 +48,19 @@ also paced to at most one request per second, as required by its
 [API rules](https://github.com/4chan/4chan-API). Official 4chan API
 requests do not inherit the unrelated LiveJournal Referer header used
 elsewhere in the application.
+
+In addition to attached media, Copperminer scans the comment text and link
+anchors of **every post** for direct HTTPS file URLs. For example,
+`https://files.catbox.moe/cc1p6m.mp4` downloads alongside the native
+attachments; repeated links are queued once, and conflicting filenames receive
+a deterministic URL-based suffix. Supported file types include common images,
+videos, audio, PDF and archives (ZIP/RAR/7z). Web pages, indirect hosting
+pages, executables, and non-HTTPS/local-network URLs are not downloaded.
+Downloads follow the same pacing and stop controls, reject non-media HTML
+responses and unsafe redirects, and apply minimum image-resolution filtering
+to recognized images. Archive JSON comment fields are scanned when available;
+an archive cannot recover links omitted from its saved metadata. File URLs
+must still be accessible from the current network.
 
 Files are saved under `4chan/<board>/<sanitized subject> <thread ID>`.
 When exactly one existing folder with the same board and thread ID exists,
