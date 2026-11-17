@@ -48,9 +48,12 @@ class ExtractLinkedFilesTests(unittest.TestCase):
         invalid = [
             "http://files.catbox.moe/c.mp4",
             "https://127.0.0.1/c.mp4",
+            "https://127.1/c.mp4",
+            "https://10.0/c.mp4",
             "https://[::1]/c.mp4",
             "https://localhost/c.mp4",
             "https://host.internal/c.mp4",
+            "https://router.lan/c.mp4",
             "https://user:pass@files.catbox.moe/c.mp4",
             "https://files.catbox.moe:8443/c.mp4",
             "https://example.org/watch?v=c.mp4",

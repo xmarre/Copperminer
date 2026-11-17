@@ -17,6 +17,9 @@ from bs4 import BeautifulSoup
 import archived_moe
 
 
+DIRECT_VIDEO_EXTENSIONS = frozenset({
+    ".webm", ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".mpg", ".mpeg",
+})
 DIRECT_FILE_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff",
     ".webm", ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".mpg", ".mpeg",
@@ -25,7 +28,7 @@ DIRECT_FILE_EXTENSIONS = frozenset({
 })
 _PLAIN_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 _PUBLIC_HOST_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
-_BLOCKED_TOP_LEVEL = {"localhost", "local", "internal", "test", "invalid", "example", "onion"}
+_BLOCKED_TOP_LEVEL = {"localhost", "local", "lan", "home", "corp", "internal", "test", "invalid", "example", "onion"}
 
 
 def public_https_url(url):
@@ -41,7 +44,10 @@ def public_https_url(url):
         if any(len(label) > 63 or label.startswith("-") or label.endswith("-")
                for label in host.split(".")):
             return False
-        if host.rsplit(".", 1)[-1] in _BLOCKED_TOP_LEVEL:
+        tld = host.rsplit(".", 1)[-1]
+        # 127.1 and other shortened numeric IPv4 spellings can resolve to
+        # loopback even though ipaddress.ip_address() rejects their syntax.
+        if tld.isdigit() or tld in _BLOCKED_TOP_LEVEL:
             return False
         try:
             ipaddress.ip_address(host)

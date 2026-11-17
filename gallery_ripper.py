@@ -4010,7 +4010,10 @@ def download_4chan_image_oldschool(
         log(f"Already downloaded: {fname}")
         return False
 
-    kind = "video" if os.path.splitext(urlparse(url).path)[1].lower() in MEDIA_EXTS else "download"
+    extension = os.path.splitext(urlparse(url).path)[1].lower()
+    kind = "video" if extension in MEDIA_EXTS or (
+        linked_media and extension in fourchan_links.DIRECT_VIDEO_EXTENSIONS
+    ) else "download"
     for attempt in range(1, max_attempts + 1):
         partial_path = None
         if stop_flag is not None and stop_flag.is_set():
@@ -4092,7 +4095,8 @@ def download_4chan_image_oldschool(
                     )
                 if digest is not None and digest.digest() != expected["md5"]:
                     raise IOError("Original media MD5 does not match archive metadata")
-            if os.path.splitext(fname)[1].lower() in IMAGE_EXTS + ('.gif',):
+            if (os.path.splitext(fname)[1].lower() in IMAGE_EXTS + ('.gif',)
+                    or (linked_media and os.path.splitext(fname)[1].lower() in ('.tif', '.tiff'))):
                 dims = undersized_image_dimensions(partial_path, min_width, min_height)
                 if dims is not None:
                     log(
